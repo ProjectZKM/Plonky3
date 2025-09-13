@@ -51,6 +51,10 @@ impl<MP: MontyParameters> MontyField31<MP> {
         }
     }
 
+    pub const fn value(&self) -> u32 {
+        self.value
+    }
+
     /// Produce a u32 in range [0, P) from a field element corresponding to the true value.
     #[inline(always)]
     pub(crate) fn to_u32(elem: &Self) -> u32 {
