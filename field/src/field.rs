@@ -85,6 +85,26 @@ pub trait FieldAlgebra:
     /// If the field has characteristic 2 this is equal to ONE.
     const NEG_ONE: Self;
 
+    fn zero() -> Self {
+        Self::ZERO
+    }
+
+    fn one() -> Self {
+        Self::ONE
+    }
+
+    fn two() -> Self {
+        Self::TWO
+    }
+
+    fn neg_one() -> Self {
+        Self::NEG_ONE
+    }
+
+    fn generator() -> Self {
+        Self::from_f(Self::F::GENERATOR)
+    }
+
     /// Interpret a field element as a commutative algebra element.
     ///
     /// Mathematically speaking, this map is a ring homomorphism from the base field
@@ -210,7 +230,7 @@ pub trait FieldAlgebra:
     /// Construct an iterator which returns powers of `self: self^0, self^1, self^2, ...`.
     #[must_use]
     fn powers(&self) -> Powers<Self> {
-        self.shifted_powers(Self::ONE)
+        self.shifted_powers(Self::one())
     }
 
     /// Construct an iterator which returns powers of `self` shifted by `start: start, start*self^1, start*self^2, ...`.
@@ -284,6 +304,11 @@ pub trait Field:
 
     /// A generator of this field's entire multiplicative group.
     const GENERATOR: Self;
+
+    /// A generator of this field's entire multiplicative group.
+    fn generator() -> Self {
+        Self::GENERATOR
+    }
 
     fn is_zero(&self) -> bool {
         *self == Self::ZERO
