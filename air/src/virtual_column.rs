@@ -115,7 +115,7 @@ impl<F: Field> VirtualPairCol<F> {
     {
         let mut result = self.constant.into();
         for (column, weight) in self.column_weights.iter() {
-            result = result +  column.get(preprocessed, main).into() * *weight;
+            result = result + column.get(preprocessed, main).into() * *weight;
         }
         result
     }
