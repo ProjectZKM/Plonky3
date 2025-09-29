@@ -85,22 +85,27 @@ pub trait FieldAlgebra:
     /// If the field has characteristic 2 this is equal to ONE.
     const NEG_ONE: Self;
 
+    #[inline(always)]
     fn zero() -> Self {
         Self::ZERO
     }
 
+    #[inline(always)]
     fn one() -> Self {
         Self::ONE
     }
 
+    #[inline(always)]
     fn two() -> Self {
         Self::TWO
     }
 
+    #[inline(always)]
     fn neg_one() -> Self {
         Self::NEG_ONE
     }
 
+    #[inline(always)]
     fn generator() -> Self {
         Self::from_f(Self::F::GENERATOR)
     }
@@ -306,6 +311,7 @@ pub trait Field:
     const GENERATOR: Self;
 
     /// A generator of this field's entire multiplicative group.
+    #[inline(always)]
     fn generator() -> Self {
         Self::GENERATOR
     }
