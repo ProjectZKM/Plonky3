@@ -568,7 +568,7 @@ impl<FA: FieldAlgebra> Iterator for Powers<FA> {
 
     fn next(&mut self) -> Option<FA> {
         let result = self.current.clone();
-        self.current *= self.base.clone();
+        self.current = self.current.clone() * self.base.clone();
         Some(result)
     }
 }
