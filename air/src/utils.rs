@@ -47,7 +47,7 @@ pub fn xor3<FA: FieldAlgebra>(x: FA, y: FA, z: FA) -> FA {
 /// For boolean inputs `(!x) & y = (1 - x)y`
 #[inline(always)]
 pub fn andn<FA: FieldAlgebra>(x: FA, y: FA) -> FA {
-    (FA::ONE - x) * y
+    (FA::one() - x) * y
 }
 
 /// Compute `xor` on a list of boolean field elements.

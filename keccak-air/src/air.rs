@@ -32,7 +32,7 @@ impl<AB: AirBuilder> Air<AB> for KeccakAir {
 
         let first_step = local.step_flags[0];
         let final_step = local.step_flags[NUM_ROUNDS - 1];
-        let not_final_step = AB::Expr::ONE - final_step;
+        let not_final_step = AB::Expr::one() - final_step;
 
         // If this is the first step, the input A must match the preimage.
         for y in 0..5 {
@@ -98,7 +98,7 @@ impl<AB: AirBuilder> Air<AB> for KeccakAir {
                     let a_limb = local.a[y][x][limb];
                     let computed_limb = (limb * BITS_PER_LIMB..(limb + 1) * BITS_PER_LIMB)
                         .rev()
-                        .fold(AB::Expr::ZERO, |acc, z| {
+                        .fold(AB::Expr::zero(), |acc, z| {
                             builder.assert_bool(local.a_prime[y][x][z]);
                             acc.double() + get_bit(z)
                         });
@@ -115,7 +115,7 @@ impl<AB: AirBuilder> Air<AB> for KeccakAir {
                 let sum: AB::Expr = (0..5).map(|y| local.a_prime[y][x][z].into()).sum();
                 let diff = sum - local.c_prime[x][z];
                 let four = AB::Expr::from_canonical_u8(4);
-                builder.assert_zero(diff.clone() * (diff.clone() - AB::Expr::TWO) * (diff - four));
+                builder.assert_zero(diff.clone() * (diff.clone() - AB::Expr::two()) * (diff - four));
             }
         }
 
@@ -133,7 +133,7 @@ impl<AB: AirBuilder> Air<AB> for KeccakAir {
                 for limb in 0..U64_LIMBS {
                     let computed_limb = (limb * BITS_PER_LIMB..(limb + 1) * BITS_PER_LIMB)
                         .rev()
-                        .fold(AB::Expr::ZERO, |acc, z| acc.double() + get_bit(z));
+                        .fold(AB::Expr::zero(), |acc, z| acc.double() + get_bit(z));
                     builder.assert_eq(computed_limb, local.a_prime_prime[y][x][limb]);
                 }
             }
@@ -144,7 +144,7 @@ impl<AB: AirBuilder> Air<AB> for KeccakAir {
             let computed_a_prime_prime_0_0_limb = (limb * BITS_PER_LIMB
                 ..(limb + 1) * BITS_PER_LIMB)
                 .rev()
-                .fold(AB::Expr::ZERO, |acc, z| {
+                .fold(AB::Expr::zero(), |acc, z| {
                     builder.assert_bool(local.a_prime_prime_0_0_bits[z]);
                     acc.double() + local.a_prime_prime_0_0_bits[z]
                 });
@@ -153,11 +153,11 @@ impl<AB: AirBuilder> Air<AB> for KeccakAir {
         }
 
         let get_xored_bit = |i| {
-            let mut rc_bit_i = AB::Expr::ZERO;
+            let mut rc_bit_i = AB::Expr::zero();
             for r in 0..NUM_ROUNDS {
                 let this_round = local.step_flags[r];
                 let this_round_constant = AB::Expr::from_canonical_u8(rc_value_bit(r, i));
-                rc_bit_i += this_round * this_round_constant;
+                rc_bit_i = rc_bit_i + this_round * this_round_constant;
             }
 
             xor::<AB::Expr>(local.a_prime_prime_0_0_bits[i].into(), rc_bit_i)
@@ -168,7 +168,7 @@ impl<AB: AirBuilder> Air<AB> for KeccakAir {
             let computed_a_prime_prime_prime_0_0_limb = (limb * BITS_PER_LIMB
                 ..(limb + 1) * BITS_PER_LIMB)
                 .rev()
-                .fold(AB::Expr::ZERO, |acc, z| acc.double() + get_xored_bit(z));
+                .fold(AB::Expr::zero(), |acc, z| acc.double() + get_xored_bit(z));
             builder.assert_eq(
                 computed_a_prime_prime_prime_0_0_limb,
                 a_prime_prime_prime_0_0_limb,

@@ -7,8 +7,8 @@ use p3_field::{Field, FieldAlgebra};
 /// An affine function over columns in a PAIR.
 #[derive(Clone, Debug)]
 pub struct VirtualPairCol<F: Field> {
-    column_weights: Vec<(PairCol, F)>,
-    constant: F,
+    pub column_weights: Vec<(PairCol, F)>,
+    pub constant: F,
 }
 
 /// A column in a PAIR, i.e. either a preprocessed column or a main trace column.
@@ -115,7 +115,11 @@ impl<F: Field> VirtualPairCol<F> {
     {
         let mut result = self.constant.into();
         for (column, weight) in self.column_weights.iter() {
-            result += column.get(preprocessed, main).into() * *weight;
+            if *weight != F::ONE {
+                result = result + column.get(preprocessed, main).into() * *weight;
+            } else {
+                result = result + column.get(preprocessed, main).into();
+            }
         }
         result
     }
