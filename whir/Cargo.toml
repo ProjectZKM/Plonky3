@@ -27,13 +27,20 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+clap.workspace = true
 p3-baby-bear = { path = "../baby-bear" }
 p3-koala-bear = { path = "../koala-bear" }
 proptest.workspace = true
 rand.workspace = true
+tracing-forest = { workspace = true, features = ["ansi", "smallvec"] }
+tracing-subscriber = { workspace = true, features = ["std", "env-filter"] }
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
+
+[[example]]
+name = "whir"
+required-features = []
 
 [lints]
 workspace = true
