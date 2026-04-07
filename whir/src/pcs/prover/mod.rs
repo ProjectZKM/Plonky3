@@ -76,6 +76,9 @@ where
     {
         assert!(self.validate_parameters(), "Invalid prover parameters");
 
+        // Create ExtensionMmcs once and reuse across all rounds.
+        let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
+
         // Initialize the round state with the committed polynomial.
         let mut round_state = RoundState::initialize_first_round_state(
             &mut proof.initial_sumcheck,
@@ -88,7 +91,7 @@ where
 
         // Run each WHIR folding round.
         for round in 0..=self.n_rounds() {
-            self.round(dft, round, proof, challenger, &mut round_state)?;
+            self.round(dft, &extension_mmcs, round, proof, challenger, &mut round_state)?;
         }
 
         Ok(())
@@ -100,6 +103,7 @@ where
     fn round<Dft: TwoAdicSubgroupDft<F>>(
         &self,
         dft: &Dft,
+        extension_mmcs: &ExtensionMmcs<F, EF, MT>,
         round_index: usize,
         proof: &mut WhirProof<F, EF, MT>,
         challenger: &mut Challenger,
@@ -119,7 +123,7 @@ where
 
         // Final round: send polynomial in the clear.
         if round_index == self.n_rounds() {
-            return self.final_round(round_index, proof, challenger, round_state);
+            return self.final_round(extension_mmcs, round_index, proof, challenger, round_state);
         }
 
         let round_params = &self.round_parameters[round_index];
@@ -143,7 +147,6 @@ where
         let folded_matrix = info_span!("dft", height = padded.height(), width = padded.width())
             .in_scope(|| dft.dft_algebra_batch(padded).to_row_major_matrix());
 
-        let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
         let (root, prover_data) =
             info_span!("commit matrix").in_scope(|| extension_mmcs.commit_matrix(folded_matrix));
 
@@ -188,45 +191,40 @@ where
         let mut stir_statement = SelectStatement::initialize(num_variables);
         let mut queries = Vec::with_capacity(stir_challenges_indexes.len());
 
-        // Collect Merkle proofs for STIR queries.
+        // Collect Merkle proofs for STIR queries and evaluate constraints.
+        // Merged into a single pass to avoid redundant clones.
         match &round_state.merkle_prover_data {
             None => {
-                let mut answers = Vec::with_capacity(stir_challenges_indexes.len());
-                for challenge in &stir_challenges_indexes {
+                for (&challenge, var) in stir_challenges_indexes.iter().zip(stir_vars.into_iter()) {
                     let commitment = self
                         .mmcs
-                        .open_batch(*challenge, &round_state.commitment_merkle_prover_data);
+                        .open_batch(challenge, &round_state.commitment_merkle_prover_data);
                     let answer = commitment.opened_values[0].clone();
-                    answers.push(answer.clone());
 
-                    queries.push(QueryOpening::Base {
-                        values: answer.clone(),
-                        proof: commitment.opening_proof,
-                    });
-                }
-
-                for (answer, var) in answers.iter().zip(stir_vars.into_iter()) {
+                    // Evaluate constraint before moving answer into proof.
                     let evals = Poly::new(answer.clone());
                     let eval = evals.eval_base(&round_state.folding_randomness);
                     stir_statement.add_constraint(var, eval);
-                }
-            }
-            Some(data) => {
-                let mut answers = Vec::with_capacity(stir_challenges_indexes.len());
-                for challenge in &stir_challenges_indexes {
-                    let commitment = extension_mmcs.open_batch(*challenge, data);
-                    let answer = commitment.opened_values[0].clone();
-                    answers.push(answer.clone());
-                    queries.push(QueryOpening::Extension {
-                        values: answer.clone(),
+
+                    queries.push(QueryOpening::Base {
+                        values: answer,
                         proof: commitment.opening_proof,
                     });
                 }
+            }
+            Some(data) => {
+                for (&challenge, var) in stir_challenges_indexes.iter().zip(stir_vars.into_iter()) {
+                    let commitment = extension_mmcs.open_batch(challenge, data);
+                    let answer = commitment.opened_values[0].clone();
 
-                for (answer, var) in answers.iter().zip(stir_vars.into_iter()) {
                     let evals = Poly::new(answer.clone());
                     let eval = evals.eval_ext::<F>(&round_state.folding_randomness);
                     stir_statement.add_constraint(var, eval);
+
+                    queries.push(QueryOpening::Extension {
+                        values: answer,
+                        proof: commitment.opening_proof,
+                    });
                 }
             }
         }
@@ -261,6 +259,7 @@ where
     #[allow(clippy::type_complexity)]
     fn final_round(
         &self,
+        extension_mmcs: &ExtensionMmcs<F, EF, MT>,
         round_index: usize,
         proof: &mut WhirProof<F, EF, MT>,
         challenger: &mut Challenger,
@@ -290,7 +289,6 @@ where {
         )?;
 
         // Open Merkle proofs at the queried positions.
-        let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
         match &round_state.merkle_prover_data {
             None => {
                 for challenge in final_challenge_indexes {
