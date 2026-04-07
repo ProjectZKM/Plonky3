@@ -44,16 +44,5 @@ parallel = ["p3-maybe-rayon/parallel"]
 name = "whir"
 required-features = []
 
-[dev-dependencies.clap]
-workspace = true
-
-[dev-dependencies.tracing-forest]
-workspace = true
-features = ["ansi", "smallvec"]
-
-[dev-dependencies.tracing-subscriber]
-workspace = true
-features = ["std", "env-filter"]
-
 [lints]
 workspace = true
