@@ -13,6 +13,27 @@ use p3_multilinear_util::poly::Poly;
 use round_state::RoundState;
 use tracing::{info_span, instrument};
 
+/// Evaluate a multilinear polynomial (base field coefficients) at a point,
+/// without constructing a Poly (avoids clone).
+#[inline]
+fn eval_multilinear_base_from_slice<F: Field, EF: ExtensionField<F>>(
+    evals: &[F],
+    point: &Point<EF>,
+) -> EF {
+    // Use the same recursive evaluator that Poly::eval_base uses.
+    Poly::new(evals.to_vec()).eval_base(point)
+}
+
+/// Evaluate a multilinear polynomial (extension field coefficients) at a point,
+/// without constructing a Poly from a clone.
+#[inline]
+fn eval_multilinear_ext_from_slice<F: Field, EF: ExtensionField<F>>(
+    evals: &[EF],
+    point: &Point<EF>,
+) -> EF {
+    Poly::new(evals.to_vec()).eval_ext::<F>(point)
+}
+
 use crate::constraints::Constraint;
 use crate::constraints::statement::initial::InitialStatement;
 use crate::constraints::statement::{EqStatement, SelectStatement};
@@ -199,31 +220,40 @@ where
                     let commitment = self
                         .mmcs
                         .open_batch(challenge, &round_state.commitment_merkle_prover_data);
-                    let answer = commitment.opened_values[0].clone();
+                    // Take ownership via unpack — eliminates 1 clone per query.
+                    let (mut opened_values, opening_proof) = commitment.unpack();
+                    let answer = opened_values.swap_remove(0);
 
-                    // Evaluate constraint before moving answer into proof.
-                    let evals = Poly::new(answer.clone());
-                    let eval = evals.eval_base(&round_state.folding_randomness);
+                    // Evaluate from borrowed slice to avoid cloning.
+                    let eval = eval_multilinear_base_from_slice::<F, EF>(
+                        &answer,
+                        &round_state.folding_randomness,
+                    );
                     stir_statement.add_constraint(var, eval);
 
                     queries.push(QueryOpening::Base {
                         values: answer,
-                        proof: commitment.opening_proof,
+                        proof: opening_proof,
                     });
                 }
             }
             Some(data) => {
                 for (&challenge, var) in stir_challenges_indexes.iter().zip(stir_vars.into_iter()) {
                     let commitment = extension_mmcs.open_batch(challenge, data);
-                    let answer = commitment.opened_values[0].clone();
+                    // Take ownership via unpack — eliminates 1 clone per query.
+                    let (mut opened_values, opening_proof) = commitment.unpack();
+                    let answer = opened_values.swap_remove(0);
 
-                    let evals = Poly::new(answer.clone());
-                    let eval = evals.eval_ext::<F>(&round_state.folding_randomness);
+                    // Evaluate from borrowed slice to avoid cloning.
+                    let eval = eval_multilinear_ext_from_slice::<F, EF>(
+                        &answer,
+                        &round_state.folding_randomness,
+                    );
                     stir_statement.add_constraint(var, eval);
 
                     queries.push(QueryOpening::Extension {
                         values: answer,
-                        proof: commitment.opening_proof,
+                        proof: opening_proof,
                     });
                 }
             }

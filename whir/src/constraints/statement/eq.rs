@@ -233,6 +233,7 @@ impl<F: Field> EqStatement<F> {
     /// The `INITIALIZED` const generic controls whether the accumulator
     /// is added to (true) or overwritten (false).
     #[instrument(skip_all, fields(num_constraints = self.len(), num_variables = self.num_variables()))]
+    #[inline]
     pub fn combine_hypercube<Base, const INITIALIZED: bool>(
         &self,
         acc_weights: &mut Poly<F>,
@@ -289,6 +290,7 @@ impl<F: Field> EqStatement<F> {
     /// 4. Parallel dot product: for each right-half row, dot all
     ///    left-half rows weighted by the scalar eq values.
     #[instrument(skip_all, fields(num_constraints = self.len(), num_variables = self.num_variables()))]
+    #[inline]
     pub fn combine_hypercube_packed<Base, const INITIALIZED: bool>(
         &self,
         weights: &mut Poly<F::ExtensionPacking>,
@@ -361,6 +363,7 @@ impl<F: Field> EqStatement<F> {
     /// # Arguments
     /// - `claimed_eval`: Mutable reference to the total accumulated claimed eval so far. Updated in place.
     /// - `gamma`: A random extension field element used to weight the evals.
+    #[inline]
     pub fn combine_evals(&self, claimed_eval: &mut F, gamma: F) {
         *claimed_eval += dot_product(self.evaluations.iter().copied(), gamma.powers());
     }

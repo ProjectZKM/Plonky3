@@ -357,6 +357,7 @@ impl<F: Field, EF: ExtensionField<F>> SelectStatement<F, EF> {
     /// 3. **Challenge combination**: Dot each row of the select matrix
     ///    with the challenge power vector to produce the weight polynomial.
     #[instrument(skip_all, fields(num_constraints = self.len(), num_variables = self.num_variables()))]
+    #[inline]
     pub fn combine(
         &self,
         acc_weights: &mut Poly<EF>,
@@ -469,6 +470,7 @@ impl<F: Field, EF: ExtensionField<F>> SelectStatement<F, EF> {
     /// 4. For each pair of rows (left packed, right scalar), compute the
     ///    weighted dot product with the challenge powers.
     #[instrument(skip_all, fields(num_constraints = self.len(), num_variables = self.num_variables()))]
+    #[inline]
     pub fn combine_packed(
         &self,
         weights: &mut Poly<EF::ExtensionPacking>,
@@ -568,6 +570,7 @@ impl<F: Field, EF: ExtensionField<F>> SelectStatement<F, EF> {
     /// - `challenge`: Random challenge `γ ∈ EF` used for batching.
     ///
     /// - `shift`: Power offset. Constraint `i` uses weight `γ^{i+shift}`.
+    #[inline]
     pub fn combine_evals(&self, claimed_eval: &mut EF, challenge: EF, shift: usize) {
         // Compute: Σ_i γ^{i+shift} · s_i
         // This is equivalent to dot_product(evaluations, [γ^shift, γ^{shift+1}, ...])

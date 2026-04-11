@@ -154,6 +154,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
     /// The equality statement uses challenge powers `γ^0, γ^1, ...`
     /// The select statement continues with powers `γ^{n_eq}, γ^{n_eq+1}, ...`
     /// to ensure distinct weights for all constraints.
+    #[inline]
     pub fn combine_evals(&self, eval: &mut EF) {
         // Accumulate equality constraint evaluations weighted by γ^i.
         //
@@ -193,6 +194,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
     /// ```text
     /// eval += Σ_i γ^i · s_eq_i + Σ_j γ^{n_eq+j} · s_sel_j
     /// ```
+    #[inline]
     pub fn combine(&self, combined: &mut Poly<EF>, eval: &mut EF) {
         // Combine equality constraints with accumulation enabled (INITIALIZED=true).
         // This adds the equality portion of W(X) to the existing values in `combined`.
@@ -230,6 +232,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
     /// ```text
     /// eval += Σ_i γ^i · s_eq_i + Σ_j γ^{n_eq+j} · s_sel_j
     /// ```
+    #[inline]
     pub fn combine_packed(&self, combined: &mut Poly<EF::ExtensionPacking>, eval: &mut EF) {
         // Combine equality constraints with accumulation enabled (INITIALIZED=true).
         // This adds the equality portion of W(X) to the existing values in `combined`.
@@ -257,6 +260,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
     ///
     /// Use this method when starting a new constraint combination.
     /// Use [`combine`](Self::combine) when accumulating multiple constraints.
+    #[inline]
     pub fn combine_new(&self) -> (Poly<EF>, EF) {
         // Initialize fresh accumulators for the weight polynomial and expected evaluation.
         // The weight polynomial needs 2^k entries for the full Boolean hypercube.
@@ -296,6 +300,7 @@ impl<F: Field, EF: ExtensionField<F>> Constraint<F, EF> {
     ///
     /// Use this method when starting a new constraint combination.
     /// Use [`combine_packed`](Self::combine_packed) when accumulating multiple constraints.
+    #[inline]
     pub fn combine_new_packed(&self) -> (Poly<EF::ExtensionPacking>, EF) {
         let k_pack = log2_strict_usize(F::Packing::WIDTH);
         let k = self.num_variables();
