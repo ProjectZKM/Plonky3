@@ -145,37 +145,101 @@ where
         opening_points: &[Vec<Point<EF>>],
         challenger: &mut Challenger,
     ) -> (Self::Commitment, Self::ProverData) {
-        // Validate dimensions: single polynomial with 2^m evaluations.
-        assert_eq!(
-            evaluations.width(),
-            1,
-            "WHIR currently supports committing a single polynomial"
-        );
+        let n = 1 << self.config.num_variables;
+        let width = evaluations.width();
         assert_eq!(
             evaluations.height(),
-            1 << self.config.num_variables,
+            n,
             "evaluation vector length must be 2^num_variables"
         );
-        assert_eq!(
-            opening_points.len(),
-            1,
-            "WHIR currently supports opening a single polynomial"
-        );
 
-        // Wrap the raw evaluation vector as a multilinear polynomial f: {0,1}^m -> F.
-        let poly = Poly::new(evaluations.values);
+        // ── Multi-column batching ────────────────────────────────────
+        //
+        // For width > 1, we batch N polynomials f_0, ..., f_{N-1} into
+        // a single polynomial g = Σ α^i · f_i using a random challenge
+        // α from the challenger. WHIR commits to g; the per-column
+        // evaluations f_i(r) are computed and stored separately.
+        //
+        // For width == 1, we skip the batching step (no overhead).
+
+        let eval_values = evaluations.values;
+        let combined_evals = if width == 1 {
+            eval_values.clone()
+        } else {
+            // Sample batching challenge from the Fiat-Shamir transcript.
+            let alpha: EF = challenger.sample_algebra_element();
+
+            // Compute g(x) = f_0(x) + α·f_1(x) + ... + α^{N-1}·f_{N-1}(x)
+            // as an EF-valued polynomial, then project to F.
+            // Since each f_i is F-valued, g is also F-valued when α ∈ F.
+            // For α ∈ EF, we need to store g as EF-valued — but WHIR's
+            // InitialStatement takes Poly<F>. So we batch in F by sampling
+            // α from the base field via a hash of the extension element.
+            //
+            // Simplified approach: fold columns in base field using
+            // powers of a base-field challenge derived from the transcript.
+            let alpha_base: F = challenger.sample_algebra_element();
+            let mut combined = vec![F::ZERO; n];
+            let mut alpha_pow = F::ONE;
+            let vals = &eval_values;
+            for col in 0..width {
+                for row in 0..n {
+                    combined[row] += alpha_pow * vals[row * width + col];
+                }
+                alpha_pow *= alpha_base;
+            }
+            combined
+        };
+
+        // Wrap the combined evaluation vector as a multilinear polynomial.
+        let poly = Poly::new(combined_evals);
 
         // Build the initial statement and register evaluation claims.
-        // Each claim f(z_i) = v_i becomes an equality constraint with weight
-        // polynomial w(Z, X) = Z * eq(z_i, X), so that:
-        //   sum_{b in {0,1}^m} w(f(b), b) = f(z_i)
-        // This is the mechanism described in Section 1.1 of the WHIR paper.
         let mut statement = self.config.initial_statement(poly, self.sumcheck_strategy);
-        let mut values = Vec::with_capacity(opening_points[0].len());
-        for point in &opening_points[0] {
-            // Evaluate the polynomial at this point and record the constraint.
-            let eval = statement.evaluate(point);
-            values.push(eval);
+
+        // For each polynomial (column), evaluate at each opening point.
+        let mut all_values = Vec::with_capacity(opening_points.len().max(1));
+
+        if width == 1 {
+            // Single column: evaluate directly.
+            assert!(opening_points.len() <= 1);
+            if !opening_points.is_empty() {
+                let mut col_values = Vec::with_capacity(opening_points[0].len());
+                for point in &opening_points[0] {
+                    let eval = statement.evaluate(point);
+                    col_values.push(eval);
+                }
+                all_values.push(col_values);
+            }
+        } else {
+            // Multi-column: the combined polynomial's evaluation is
+            // g(r) = Σ α^i · f_i(r). The individual f_i(r) are computed
+            // from the original data and stored as opened values.
+            // The WHIR proof validates g(r); the verifier checks the
+            // linear combination.
+
+            // Evaluate g at each point via the statement (registers the claim).
+            if !opening_points.is_empty() {
+                for point in &opening_points[0] {
+                    let _combined_eval = statement.evaluate(point);
+                }
+            }
+
+            // Compute per-column evaluations at each opening point.
+            for col in 0..width {
+                let col_evals: Vec<F> = (0..n)
+                    .map(|row| eval_values[row * width + col])
+                    .collect();
+                let col_poly = Poly::new(col_evals);
+
+                let mut col_values = Vec::new();
+                if !opening_points.is_empty() {
+                    for point in &opening_points[0] {
+                        col_values.push(col_poly.eval_base(point));
+                    }
+                }
+                all_values.push(col_values);
+            }
         }
 
         // Absorb the protocol configuration into the Fiat-Shamir transcript.
@@ -186,18 +250,13 @@ where
         let mut proof =
             WhirProof::from_protocol_parameters(&self.protocol_params, self.config.num_variables);
 
-        // Run the commitment phase:
-        //   1. Transpose and zero-pad the evaluation table.
-        //   2. Apply DFT to produce the Reed-Solomon codeword.
-        //   3. Build a Merkle tree over the codeword rows.
-        //   4. Sample OOD challenge points from the transcript (Section 2.1.3, step 3).
-        //   5. Evaluate the polynomial at those OOD points and observe the answers.
+        // Run the commitment phase.
         let committer = CommitmentWriter::new(&self.config);
         let merkle_data = committer
             .commit(&self.dft, &mut proof, challenger, &mut statement)
             .expect("commitment phase failed");
 
-        // The Merkle root is now stored in the proof; extract it as the public commitment.
+        // The Merkle root is now stored in the proof.
         let commitment = proof
             .initial_commitment
             .clone()
@@ -208,7 +267,7 @@ where
             merkle_data,
             statement,
             proof,
-            opened_values: vec![values],
+            opened_values: all_values,
         };
 
         (commitment, prover_data)
@@ -249,36 +308,51 @@ where
         proof: &Self::Proof,
         challenger: &mut Challenger,
     ) -> Result<(), Self::Error> {
-        assert_eq!(
-            opening_claims.len(),
-            1,
-            "WHIR currently supports verifying a single polynomial"
-        );
-
         // Re-derive the same domain separator that the prover used, so
         // the verifier's transcript state is identical.
         let ds: DomainSeparator<EF, F> = self.build_domain_separator();
         ds.observe_domain_separator(challenger);
 
-        // Parse the Merkle root and OOD answers from the proof, replaying
-        // the same transcript interactions the prover performed during commit.
+        // For multi-column: the verifier must first reconstruct the
+        // batching challenge and compute the combined evaluation.
+        // For single-column: use the claim directly.
+        let combined_claims = if opening_claims.len() == 1 {
+            opening_claims[0].clone()
+        } else {
+            // Sample the same batching challenge the prover used.
+            let _alpha_ef: EF = challenger.sample_algebra_element();
+            let alpha_base: F = challenger.sample_algebra_element();
+
+            // Reconstruct g(r) = Σ α^i · f_i(r) from per-column claims.
+            // All columns share the same opening points.
+            let num_points = opening_claims[0].len();
+            let mut combined = Vec::with_capacity(num_points);
+            for pt_idx in 0..num_points {
+                let point = opening_claims[0][pt_idx].0.clone();
+                let mut combined_val = EF::ZERO;
+                let mut alpha_pow = EF::ONE;
+                let alpha_ef: EF = alpha_base.into();
+                for col_claims in opening_claims {
+                    combined_val += alpha_pow * col_claims[pt_idx].1;
+                    alpha_pow *= alpha_ef;
+                }
+                combined.push((point, combined_val));
+            }
+            combined
+        };
+
+        // Parse the Merkle root and OOD answers from the proof.
         let commitment_reader = CommitmentReader::new(&self.config);
         let parsed_commitment =
             commitment_reader.parse_commitment::<F, DIGEST_ELEMS>(proof, challenger);
 
-        // Reconstruct the equality statement from the opening claims.
-        // Each claim (z_i, v_i) becomes a constraint:
-        //   sum_{b in {0,1}^m} f(b) * eq(z_i, b) = v_i
+        // Reconstruct the equality statement from the combined claims.
         let mut eq_statement = EqStatement::initialize(self.config.num_variables);
-        for (point, value) in &opening_claims[0] {
+        for (point, value) in &combined_claims {
             eq_statement.add_evaluated_constraint(point.clone(), *value);
         }
 
-        // Run the full verification:
-        //   1. Combine equality constraints with OOD constraints.
-        //   2. Verify each sumcheck round.
-        //   3. Check STIR query openings against Merkle proofs.
-        //   4. Verify the final polynomial evaluation.
+        // Run the full WHIR verification.
         let verifier = Verifier::new(&self.config);
         verifier.verify(proof, challenger, &parsed_commitment, eq_statement)?;
 
