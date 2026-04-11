@@ -1,4 +1,54 @@
 //! Adapter implementing the multilinear PCS trait for the WHIR protocol.
+//!
+//! # Protocol Overview (WHIR, Construction 5.1, ePrint 2024/1586)
+//!
+//! WHIR is an IOP of proximity for Reed-Solomon codes that achieves
+//! super-fast verification. Given a multilinear polynomial
+//! f: {0,1}^m → F with 2^m evaluations, the protocol proves that
+//! f evaluates to claimed values at specified points.
+//!
+//! ## Single-column protocol
+//!
+//! 1. **Commit**: Encode f as a Reed-Solomon codeword via DFT.
+//!    Commit the codeword rows in a Merkle tree.
+//!    Register evaluation claims f(z_i) = v_i as equality constraints:
+//!      sum_{b ∈ {0,1}^m} f(b) · eq(z_i, b) = v_i
+//!    where eq(a, b) = ∏_j (a_j · b_j + (1 - a_j)(1 - b_j))
+//!
+//! 2. **Prove**: For each round i = 0..M-1:
+//!    a. Run k_i sumcheck rounds to reduce the constraint claim
+//!    b. Fold: f_{i+1}(X) = f_i(α, X) where α is a Fiat-Shamir challenge
+//!    c. Commit the folded RS codeword
+//!    d. Sample OOD points, verify consistency, grind for PoW
+//!    e. Open Merkle paths at STIR query positions
+//!    Final round: send polynomial coefficients in the clear.
+//!
+//! 3. **Verify**: Replay Fiat-Shamir, check sumcheck rounds, verify
+//!    Merkle proofs, check final polynomial evaluation.
+//!
+//! ## Multi-column batch extension
+//!
+//! For N polynomials f_0, ..., f_{N-1} (columns of a trace matrix):
+//!
+//! 1. Absorb opening points into the Fiat-Shamir transcript
+//! 2. Sample batching challenge α ∈ F
+//! 3. Compute combined polynomial:
+//!      g(x) = Σ_{j=0}^{N-1} α^j · f_j(x)
+//! 4. Run single-column WHIR on g
+//! 5. Provide per-column evaluations f_j(r) as opened values
+//! 6. Verifier checks: g(r) = Σ α^j · f_j(r)
+//!
+//! Security: α must be sampled AFTER opening points are absorbed
+//! (Fiat-Shamir binding). Column width N must also be absorbed.
+//!
+//! ## Soundness (Theorem 5.2)
+//!
+//! ε_WHIR ≤ ε_RS-proximity + ε_sumcheck + ε_OOD + 2^(-pow_bits)
+//!
+//! Under Johnson Bound (JBR) with extension degree D=5:
+//!   ε_RS-proximity ≤ (1 - δ_JBR)^num_queries per round
+//!   ε_sumcheck = d · N / |F^D| per round (negligible)
+//!   ε_OOD = num_ood_samples / |F^D| per round (negligible)
 
 use alloc::vec;
 use alloc::vec::Vec;
