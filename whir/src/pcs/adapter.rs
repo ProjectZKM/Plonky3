@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
 use p3_commit::{Mmcs, MultilinearOpenedValues, MultilinearPcs};
 use p3_dft::TwoAdicSubgroupDft;
-use p3_field::{ExtensionField, Field, TwoAdicField};
+use p3_field::{BasedVectorSpace, ExtensionField, Field, TwoAdicField};
 use p3_matrix::Matrix;
 use p3_matrix::dense::{DenseMatrix, RowMajorMatrix};
 use p3_multilinear_util::point::Point;
@@ -153,31 +153,44 @@ where
             "evaluation vector length must be 2^num_variables"
         );
 
+        // ── Fiat-Shamir binding ────────────────────────────────────
+        //
+        // SECURITY: Absorb opening points into the transcript BEFORE
+        // sampling any challenges. This prevents a malicious prover from
+        // choosing opening points after seeing the batching challenge.
+
+        // Absorb domain separator first (binds protocol parameters).
+        let ds = self.build_domain_separator();
+        ds.observe_domain_separator(challenger);
+
+        // Absorb all opening points into the transcript.
+        // Points are EF-valued; decompose into base field elements for the challenger.
+        for point_set in opening_points {
+            for point in point_set {
+                for &coord in point.as_slice() {
+                    challenger.observe_algebra_element(coord);
+                }
+            }
+        }
+
+        // Absorb the number of columns (binds the batching structure).
+        // Absorb width as field elements to bind batching structure.
+        for _ in 0..width {
+            challenger.observe(F::ONE);
+        }
+
         // ── Multi-column batching ────────────────────────────────────
         //
         // For width > 1, we batch N polynomials f_0, ..., f_{N-1} into
         // a single polynomial g = Σ α^i · f_i using a random challenge
-        // α from the challenger. WHIR commits to g; the per-column
-        // evaluations f_i(r) are computed and stored separately.
-        //
-        // For width == 1, we skip the batching step (no overhead).
+        // α sampled AFTER opening points are bound to the transcript.
 
         let eval_values = evaluations.values;
         let combined_evals = if width == 1 {
             eval_values.clone()
         } else {
-            // Sample batching challenge from the Fiat-Shamir transcript.
-            let alpha: EF = challenger.sample_algebra_element();
-
-            // Compute g(x) = f_0(x) + α·f_1(x) + ... + α^{N-1}·f_{N-1}(x)
-            // as an EF-valued polynomial, then project to F.
-            // Since each f_i is F-valued, g is also F-valued when α ∈ F.
-            // For α ∈ EF, we need to store g as EF-valued — but WHIR's
-            // InitialStatement takes Poly<F>. So we batch in F by sampling
-            // α from the base field via a hash of the extension element.
-            //
-            // Simplified approach: fold columns in base field using
-            // powers of a base-field challenge derived from the transcript.
+            // Sample batching challenge α ∈ F from the transcript.
+            // Sampled AFTER opening points are absorbed (Fiat-Shamir binding).
             let alpha_base: F = challenger.sample_algebra_element();
             let mut combined = vec![F::ZERO; n];
             let mut alpha_pow = F::ONE;
@@ -212,13 +225,7 @@ where
                 all_values.push(col_values);
             }
         } else {
-            // Multi-column: the combined polynomial's evaluation is
-            // g(r) = Σ α^i · f_i(r). The individual f_i(r) are computed
-            // from the original data and stored as opened values.
-            // The WHIR proof validates g(r); the verifier checks the
-            // linear combination.
-
-            // Evaluate g at each point via the statement (registers the claim).
+            // Multi-column: evaluate g at each point (registers the claim).
             if !opening_points.is_empty() {
                 for point in &opening_points[0] {
                     let _combined_eval = statement.evaluate(point);
@@ -241,10 +248,6 @@ where
                 all_values.push(col_values);
             }
         }
-
-        // Absorb the protocol configuration into the Fiat-Shamir transcript.
-        let ds = self.build_domain_separator();
-        ds.observe_domain_separator(challenger);
 
         // Allocate the proof structure with pre-sized vectors for each round.
         let mut proof =
@@ -308,23 +311,38 @@ where
         proof: &Self::Proof,
         challenger: &mut Challenger,
     ) -> Result<(), Self::Error> {
-        // Re-derive the same domain separator that the prover used, so
-        // the verifier's transcript state is identical.
+        // ── Fiat-Shamir binding (must match prover order exactly) ──
+        //
+        // SECURITY: Domain separator → opening points → width → α → proof.
+
+        // 1. Domain separator (binds protocol parameters).
         let ds: DomainSeparator<EF, F> = self.build_domain_separator();
         ds.observe_domain_separator(challenger);
 
-        // For multi-column: the verifier must first reconstruct the
-        // batching challenge and compute the combined evaluation.
-        // For single-column: use the claim directly.
-        let combined_claims = if opening_claims.len() == 1 {
+        // 2. Absorb opening points from claims (same as prover).
+        for col_claims in opening_claims {
+            for (point, _) in col_claims {
+                for &coord in point.as_slice() {
+                    challenger.observe_algebra_element(coord);
+                }
+            }
+        }
+
+        // 3. Absorb width (number of columns).
+        let width = opening_claims.len();
+        // Absorb width as field elements to bind batching structure.
+        for _ in 0..width {
+            challenger.observe(F::ONE);
+        }
+
+        // 4. Reconstruct batching challenge and combined claims.
+        let combined_claims = if width == 1 {
             opening_claims[0].clone()
         } else {
-            // Sample the same batching challenge the prover used.
-            let _alpha_ef: EF = challenger.sample_algebra_element();
+            // Sample the same batching challenge α the prover used.
             let alpha_base: F = challenger.sample_algebra_element();
 
             // Reconstruct g(r) = Σ α^i · f_i(r) from per-column claims.
-            // All columns share the same opening points.
             let num_points = opening_claims[0].len();
             let mut combined = Vec::with_capacity(num_points);
             for pt_idx in 0..num_points {
@@ -341,7 +359,7 @@ where
             combined
         };
 
-        // Parse the Merkle root and OOD answers from the proof.
+        // 5. Parse the Merkle root and OOD answers from the proof.
         let commitment_reader = CommitmentReader::new(&self.config);
         let parsed_commitment =
             commitment_reader.parse_commitment::<F, DIGEST_ELEMS>(proof, challenger);
