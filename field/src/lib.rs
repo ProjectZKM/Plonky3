@@ -21,3 +21,7 @@ pub use dup::Dup;
 pub use field::*;
 pub use helpers::*;
 pub use packed::*;
+
+// Backward-compatible aliases for the old Plonky3 API names.
+pub use PrimeCharacteristicRing as FieldAlgebra;
+pub use BasedVectorSpace as FieldExtensionAlgebra;

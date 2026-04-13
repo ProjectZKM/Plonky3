@@ -33,6 +33,12 @@ macro_rules! from_integer_types {
             fn [<from_ $type>](int: $type) -> Self {
                 Self::from_prime_subfield(Self::PrimeSubfield::from_int(int))
             }
+
+            /// Backward-compatible alias for `from_<type>`.
+            #[inline(always)]
+            fn [<from_canonical_ $type>](int: $type) -> Self {
+                Self:: [<from_ $type>](int)
+            }
         }
         )*
     };

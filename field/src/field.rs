@@ -128,6 +128,34 @@ pub trait PrimeCharacteristicRing:
         u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
     );
 
+    /// Backward-compatible alias for `Self::ZERO`.
+    #[must_use]
+    #[inline(always)]
+    fn zero() -> Self {
+        Self::ZERO
+    }
+
+    /// Backward-compatible alias for `Self::ONE`.
+    #[must_use]
+    #[inline(always)]
+    fn one() -> Self {
+        Self::ONE
+    }
+
+    /// Backward-compatible alias for `Self::TWO`.
+    #[must_use]
+    #[inline(always)]
+    fn two() -> Self {
+        Self::TWO
+    }
+
+    /// Backward-compatible alias for `Self::NEG_ONE`.
+    #[must_use]
+    #[inline(always)]
+    fn neg_one() -> Self {
+        Self::NEG_ONE
+    }
+
     /// The elementary function `double(a) = 2*a`.
     ///
     /// This function should be preferred over calling `a + a` or `TWO * a` as a faster implementation may be available for some rings.
