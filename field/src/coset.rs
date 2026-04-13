@@ -52,8 +52,7 @@ use crate::{BoundedPowers, TwoAdicField};
 /// );
 /// ```
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(bound(serialize = "F: serde::Serialize"))]
-#[serde(bound(deserialize = "F: serde::Deserialize<'de>"))]
+#[serde(bound = "")]
 pub struct TwoAdicMultiplicativeCoset<F: TwoAdicField> {
     // Letting s = shift, and g = generator (of order 2^log_size), the coset in
     // question is
