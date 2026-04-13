@@ -9,3 +9,6 @@ mod poseidon2;
 
 pub use bn254::*;
 pub use poseidon2::Poseidon2Bn254;
+
+/// Backward-compatible alias: main branch uses `Bn254Fr` for the scalar field type.
+pub type Bn254Fr = Bn254;
