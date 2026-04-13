@@ -51,7 +51,7 @@ use crate::{BoundedPowers, TwoAdicField};
 ///     coset.shift().exp_power_of_2(2),
 /// );
 /// ```
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TwoAdicMultiplicativeCoset<F: TwoAdicField> {
     // Letting s = shift, and g = generator (of order 2^log_size), the coset in
     // question is

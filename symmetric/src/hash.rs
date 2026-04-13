@@ -85,6 +85,16 @@ impl<F, W, const N: usize> From<Hash<F, W, N>> for MerkleCap<F, [W; N]> {
     }
 }
 
+impl<F, W, const N: usize> From<MerkleCap<F, [W; N]>> for [[W; N]; 1]
+where
+    W: Copy + Default,
+{
+    fn from(cap: MerkleCap<F, [W; N]>) -> Self {
+        assert_eq!(cap.cap.len(), 1, "MerkleCap must have exactly 1 element for this conversion");
+        [cap.cap[0]]
+    }
+}
+
 impl<F, Digest> Borrow<[Digest]> for MerkleCap<F, Digest> {
     fn borrow(&self) -> &[Digest] {
         &self.cap
