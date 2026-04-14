@@ -537,8 +537,7 @@ where
                                     )
                                 });
 
-                                // NOTE: do NOT observe ys here — faa24ca doesn't,
-                                // and the recursion circuit doesn't either.
+                                challenger.observe_algebra_slice(&ys);
                                 ys
                             })
                             .collect_vec()
@@ -677,10 +676,15 @@ where
         proof: &Self::Proof,
         challenger: &mut Challenger,
     ) -> Result<(), Self::Error> {
-        // NOTE: faa24ca's PCS does NOT observe opened values here.
-        // The recursion circuit also does not observe them.
-        // Observing them would break transcript alignment between
-        // the native verifier and the recursion circuit verifier.
+        // Write all evaluations to challenger.
+        // Must match the recursion circuit's observation order.
+        for (_, round) in &commitments_with_opening_points {
+            for (_, mat) in round {
+                for (_, point) in mat {
+                    challenger.observe_algebra_slice(point);
+                }
+            }
+        }
 
         let folding: TwoAdicFriFoldingForMmcs<Val, InputMmcs> = TwoAdicFriFolding(PhantomData);
 
