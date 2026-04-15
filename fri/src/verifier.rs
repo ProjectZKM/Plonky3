@@ -230,7 +230,10 @@ where
         });
     }
 
-    // Skip log_arity observations to match faa24ca protocol.
+    // Bind the variable-arity schedule into the transcript before query grinding.
+    for &log_arity in &log_arities {
+        challenger.observe(Val::from_usize(log_arity));
+    }
 
     // Check PoW.
     if !challenger.check_witness(params.query_proof_of_work_bits, proof.query_pow_witness) {
