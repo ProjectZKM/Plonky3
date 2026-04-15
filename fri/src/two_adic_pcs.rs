@@ -537,7 +537,7 @@ where
                                     )
                                 });
 
-                                challenger.observe_algebra_slice(&ys);
+                                // Skip observation to match faa24ca protocol.
                                 ys
                             })
                             .collect_vec()
@@ -676,15 +676,7 @@ where
         proof: &Self::Proof,
         challenger: &mut Challenger,
     ) -> Result<(), Self::Error> {
-        // Write all evaluations to challenger.
-        // Must match the recursion circuit's observation order.
-        for (_, round) in &commitments_with_opening_points {
-            for (_, mat) in round {
-                for (_, point) in mat {
-                    challenger.observe_algebra_slice(point);
-                }
-            }
-        }
+        // Skip opened values observation to match faa24ca protocol.
 
         let folding: TwoAdicFriFoldingForMmcs<Val, InputMmcs> = TwoAdicFriFolding(PhantomData);
 
