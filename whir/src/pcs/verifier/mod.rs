@@ -275,52 +275,58 @@ where
                 .queries
         };
 
-        let mut results = Vec::with_capacity(indices.len());
-
-        for (&index, query) in indices.iter().zip(queries.iter()) {
-            let values_ef = match query {
-                QueryOpening::Base { values, proof } => {
-                    self.mmcs
-                        .verify_batch(
-                            root,
-                            dimensions,
-                            index,
-                            BatchOpeningRef {
-                                opened_values: from_ref(values),
-                                opening_proof: proof,
-                            },
-                        )
-                        .map_err(|_| VerifierError::MerkleProofInvalid {
-                            position: index,
-                            reason: "Base field Merkle proof verification failed".to_string(),
-                        })?;
-
-                    values.iter().map(|&f| f.into()).collect()
+        // Parallelize merkle-path verification across STIR queries.
+        // Each query is independent (no transcript dependency); the
+        // bottleneck is Poseidon2 hashing along the path.  par_iter
+        // gives ~Ncores speedup on workloads with many queries.
+        use p3_maybe_rayon::prelude::*;
+        let results: Result<Vec<Vec<EF>>, VerifierError> = indices
+            .par_iter()
+            .zip(queries.par_iter())
+            .map(|(&index, query)| -> Result<Vec<EF>, VerifierError> {
+                match query {
+                    QueryOpening::Base { values, proof } => {
+                        self.mmcs
+                            .verify_batch(
+                                root,
+                                dimensions,
+                                index,
+                                BatchOpeningRef {
+                                    opened_values: from_ref(values),
+                                    opening_proof: proof,
+                                },
+                            )
+                            .map_err(|_| VerifierError::MerkleProofInvalid {
+                                position: index,
+                                reason:
+                                    "Base field Merkle proof verification failed".to_string(),
+                            })?;
+                        Ok(values.iter().map(|&f| f.into()).collect())
+                    }
+                    QueryOpening::Extension { values, proof } => {
+                        extension_mmcs
+                            .verify_batch(
+                                root,
+                                dimensions,
+                                index,
+                                BatchOpeningRef {
+                                    opened_values: from_ref(values),
+                                    opening_proof: proof,
+                                },
+                            )
+                            .map_err(|_| VerifierError::MerkleProofInvalid {
+                                position: index,
+                                reason:
+                                    "Extension field Merkle proof verification failed"
+                                        .to_string(),
+                            })?;
+                        Ok(values.clone())
+                    }
                 }
-                QueryOpening::Extension { values, proof } => {
-                    extension_mmcs
-                        .verify_batch(
-                            root,
-                            dimensions,
-                            index,
-                            BatchOpeningRef {
-                                opened_values: from_ref(values),
-                                opening_proof: proof,
-                            },
-                        )
-                        .map_err(|_| VerifierError::MerkleProofInvalid {
-                            position: index,
-                            reason: "Extension field Merkle proof verification failed".to_string(),
-                        })?;
+            })
+            .collect();
 
-                    values.clone()
-                }
-            };
-
-            results.push(values_ef);
-        }
-
-        Ok(results)
+        results
     }
 }
 
