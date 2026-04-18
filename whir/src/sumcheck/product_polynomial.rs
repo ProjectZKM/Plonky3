@@ -40,26 +40,28 @@ use crate::sumcheck::{SumcheckData, extrapolate_012};
 /// Returns (h(0), h(2)):
 /// - h(0) = sum_{b} evals(0, b) * weights(0, b)
 /// - h(2) = sum_{b} evals(2, b) * weights(2, b) where evals(2, b) = 2*evals(1,b) - evals(0,b)
-fn sumcheck_coefficients<T: PrimeCharacteristicRing + Copy>(
+fn sumcheck_coefficients<T: PrimeCharacteristicRing + Copy + Send + Sync>(
     evals: &Poly<T>,
     weights: &Poly<T>,
 ) -> (T, T) {
+    use p3_maybe_rayon::prelude::*;
     assert_eq!(evals.num_evals(), weights.num_evals());
     let half = evals.num_evals() / 2;
     let (e_lo, e_hi) = evals.as_slice().split_at(half);
     let (w_lo, w_hi) = weights.as_slice().split_at(half);
 
-    let mut c0 = T::ZERO;
-    let mut c2 = T::ZERO;
-
-    for i in 0..half {
-        c0 += e_lo[i] * w_lo[i];
-        let e2 = e_hi[i].double() - e_lo[i];
-        let w2 = w_hi[i].double() - w_lo[i];
-        c2 += e2 * w2;
-    }
-
-    (c0, c2)
+    // Parallel reduce: each lane computes (c0_i, c2_i) and we sum.
+    // The sequential loop dominated WHIR open cost on large shards.
+    (0..half)
+        .into_par_iter()
+        .map(|i| {
+            let c0_i = e_lo[i] * w_lo[i];
+            let e2 = e_hi[i].double() - e_lo[i];
+            let w2 = w_hi[i].double() - w_lo[i];
+            let c2_i = e2 * w2;
+            (c0_i, c2_i)
+        })
+        .reduce(|| (T::ZERO, T::ZERO), |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2))
 }
 
 /// Cross-type variant of sumcheck coefficients where the evaluation polynomial
@@ -67,25 +69,25 @@ fn sumcheck_coefficients<T: PrimeCharacteristicRing + Copy>(
 /// that contains `B` (e.g., base field evals with extension field weights).
 pub fn sumcheck_coefficients_cross<B, A>(evals: &Poly<B>, weights: &Poly<A>) -> (A, A)
 where
-    B: PrimeCharacteristicRing + Copy,
-    A: PrimeCharacteristicRing + Copy + p3_field::Algebra<B>,
+    B: PrimeCharacteristicRing + Copy + Send + Sync,
+    A: PrimeCharacteristicRing + Copy + p3_field::Algebra<B> + Send + Sync,
 {
+    use p3_maybe_rayon::prelude::*;
     assert_eq!(evals.num_evals(), weights.num_evals());
     let half = evals.num_evals() / 2;
     let (e_lo, e_hi) = evals.as_slice().split_at(half);
     let (w_lo, w_hi) = weights.as_slice().split_at(half);
 
-    let mut c0 = A::ZERO;
-    let mut c2 = A::ZERO;
-
-    for i in 0..half {
-        c0 += A::from(e_lo[i]) * w_lo[i];
-        let e2 = e_hi[i].double() - e_lo[i];
-        let w2 = w_hi[i].double() - w_lo[i];
-        c2 += A::from(e2) * w2;
-    }
-
-    (c0, c2)
+    (0..half)
+        .into_par_iter()
+        .map(|i| {
+            let c0_i = A::from(e_lo[i]) * w_lo[i];
+            let e2 = e_hi[i].double() - e_lo[i];
+            let w2 = w_hi[i].double() - w_lo[i];
+            let c2_i = A::from(e2) * w2;
+            (c0_i, c2_i)
+        })
+        .reduce(|| (A::ZERO, A::ZERO), |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2))
 }
 
 /// A paired representation of evaluation and weight polynomials for quadratic sumcheck.
