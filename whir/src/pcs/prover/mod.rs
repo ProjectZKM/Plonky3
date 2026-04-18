@@ -214,68 +214,49 @@ where
 
         // Collect Merkle proofs for STIR queries and evaluate constraints.
         // Merged into a single pass to avoid redundant clones.
-        // Parallelize STIR query opening + multilinear evaluation.
-        // Per-query work has no transcript dependency (challenges
-        // sampled above); each query independently:
-        //   1. opens the merkle path at its codeword index
-        //   2. evaluates the multilinear at the folding randomness
-        //   3. yields (var, eval) for the stir_statement and a
-        //      QueryOpening for the proof
-        // Constraint additions to `stir_statement` happen after the
-        // parallel pass to preserve a deterministic order matching
-        // the verifier's expected `var` sequence.
-        use p3_maybe_rayon::prelude::*;
-        let constraints_and_queries: Vec<(_, EF, QueryOpening<F, EF, MT::Proof>)> =
-            match &round_state.merkle_prover_data {
-                None => stir_challenges_indexes
-                    .par_iter()
-                    .zip(stir_vars.par_iter())
-                    .map(|(&challenge, &var)| {
-                        let commitment = self
-                            .mmcs
-                            .open_batch(challenge, &round_state.commitment_merkle_prover_data);
-                        let (mut opened_values, opening_proof) = commitment.unpack();
-                        let answer = opened_values.swap_remove(0);
-                        let eval = eval_multilinear_base_from_slice::<F, EF>(
-                            &answer,
-                            &round_state.folding_randomness,
-                        );
-                        (
-                            var,
-                            eval,
-                            QueryOpening::Base {
-                                values: answer,
-                                proof: opening_proof,
-                            },
-                        )
-                    })
-                    .collect(),
-                Some(data) => stir_challenges_indexes
-                    .par_iter()
-                    .zip(stir_vars.par_iter())
-                    .map(|(&challenge, &var)| {
-                        let commitment = extension_mmcs.open_batch(challenge, data);
-                        let (mut opened_values, opening_proof) = commitment.unpack();
-                        let answer = opened_values.swap_remove(0);
-                        let eval = eval_multilinear_ext_from_slice::<F, EF>(
-                            &answer,
-                            &round_state.folding_randomness,
-                        );
-                        (
-                            var,
-                            eval,
-                            QueryOpening::Extension {
-                                values: answer,
-                                proof: opening_proof,
-                            },
-                        )
-                    })
-                    .collect(),
-            };
+        // Sequential STIR query loop.  (Tried par_iter but
+        // MT::Proof: !Send blocks the parallelization at this layer.
+        // Adding Send + Sync bounds to MT::Proof would propagate
+        // through the trait hierarchy.  Deferred.)
+        match &round_state.merkle_prover_data {
+            None => {
+                for (&challenge, var) in stir_challenges_indexes.iter().zip(stir_vars.into_iter()) {
+                    let commitment = self
+                        .mmcs
+                        .open_batch(challenge, &round_state.commitment_merkle_prover_data);
+                    let (mut opened_values, opening_proof) = commitment.unpack();
+                    let answer = opened_values.swap_remove(0);
 
-        for (var, eval, q) in constraints_and_queries {
-            stir_statement.add_constraint(var, eval);
-            queries.push(q);
+                    let eval = eval_multilinear_base_from_slice::<F, EF>(
+                        &answer,
+                        &round_state.folding_randomness,
+                    );
+                    stir_statement.add_constraint(var, eval);
+
+                    queries.push(QueryOpening::Base {
+                        values: answer,
+                        proof: opening_proof,
+                    });
+                }
+            }
+            Some(data) => {
+                for (&challenge, var) in stir_challenges_indexes.iter().zip(stir_vars.into_iter()) {
+                    let commitment = extension_mmcs.open_batch(challenge, data);
+                    let (mut opened_values, opening_proof) = commitment.unpack();
+                    let answer = opened_values.swap_remove(0);
+
+                    let eval = eval_multilinear_ext_from_slice::<F, EF>(
+                        &answer,
+                        &round_state.folding_randomness,
+                    );
+                    stir_statement.add_constraint(var, eval);
+
+                    queries.push(QueryOpening::Extension {
+                        values: answer,
+                        proof: opening_proof,
+                    });
+                }
+            }
         }
 
         proof.rounds[round_index].queries = queries;
