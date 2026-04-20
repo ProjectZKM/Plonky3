@@ -130,6 +130,20 @@ impl<F: Field> VirtualPairCol<F> {
         }
     }
 
+    /// Returns the column-weight pairs backing this virtual column.
+    ///
+    /// This accessor exists so downstream GPU/proving code that feeds the
+    /// lookup layout into device kernels can read the structure without
+    /// reaching into private fields.
+    pub fn column_weights(&self) -> &[(PairCol, F)] {
+        &self.column_weights
+    }
+
+    /// Returns the constant term of this virtual column.
+    pub const fn constant_term(&self) -> F {
+        self.constant
+    }
+
     /// Creates a virtual column as a linear combination of preprocessed columns.
     ///
     /// # Arguments
