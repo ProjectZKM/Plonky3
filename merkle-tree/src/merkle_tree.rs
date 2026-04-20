@@ -218,6 +218,45 @@ impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGES
     pub const fn num_layers(&self) -> usize {
         self.digest_layers.len()
     }
+
+    /// Construct a `MerkleTree` from already-computed leaves, digest layers,
+    /// and arity schedule.
+    ///
+    /// This is an "escape hatch" constructor for callers that have produced
+    /// the tree data out-of-band (for example, on a GPU) and need to wrap it
+    /// in the `MerkleTree` type for serialization or CPU-side fallback.
+    /// Ordinary callers should use [`new`](Self::new).
+    ///
+    /// The caller is responsible for ensuring the supplied data is internally
+    /// consistent.  No verification is performed.
+    #[must_use]
+    pub fn from_parts(
+        leaves: Vec<M>,
+        digest_layers: Vec<Vec<[W; DIGEST_ELEMS]>>,
+        arity_schedule: Vec<usize>,
+    ) -> Self {
+        Self {
+            leaves,
+            digest_layers,
+            arity_schedule,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Access the committed leaf matrices.
+    pub fn leaves(&self) -> &[M] {
+        &self.leaves
+    }
+
+    /// Access all digest layers (leaves-adjacent first, single root last).
+    pub fn digest_layers(&self) -> &[Vec<[W; DIGEST_ELEMS]>] {
+        &self.digest_layers
+    }
+
+    /// Access the per-layer arity schedule.
+    pub fn arity_schedule(&self) -> &[usize] {
+        &self.arity_schedule
+    }
 }
 
 /// Select the compression arity for the current layer.
