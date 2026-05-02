@@ -80,9 +80,15 @@ use p3_field::{Field, PrimeCharacteristicRing};
 #[derive(Clone, Debug)]
 pub struct VirtualPairCol<F: Field> {
     /// Linear combination coefficients: pairs of (column, weight).
-    column_weights: Vec<(PairCol, F)>,
+    ///
+    /// Exposed as `pub` so downstream GPU/codegen consumers (e.g. ziren-gpu's
+    /// symbolic walker) can read the affine layout directly without having to
+    /// reconstruct it via `apply::<F, F>` one-hot probing.
+    pub column_weights: Vec<(PairCol, F)>,
     /// Constant term added to the linear combination.
-    constant: F,
+    ///
+    /// Exposed as `pub` for the same reason as `column_weights` above.
+    pub constant: F,
 }
 
 /// A reference to a column in a PAIR (Preprocessed AIR).
