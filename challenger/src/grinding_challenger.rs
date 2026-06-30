@@ -166,7 +166,7 @@ where
         // - A single permutation evaluates multiple candidates in parallel
         let witness = (0..num_batches)
             .into_par_iter()
-            .find_map_any(|batch| {
+            .find_map_first(|batch| {
                 // Compute the starting candidate for this batch.
                 //
                 // Each batch processes `F::Packing::WIDTH` candidates:
@@ -272,7 +272,7 @@ where
                 // This is safe as i is always in range.
                 F::from_canonical_unchecked(i)
             })
-            .find_any(|&witness| check_fn(&mut self.clone(), witness))
+            .find_first(|&witness| check_fn(&mut self.clone(), witness))
             .expect("failed to find proof-of-work witness");
         // Run the check one last time on the *original* challenger to update its state
         // and confirm the witness is valid.
@@ -300,7 +300,7 @@ where
                 // i < F::ORDER_U32 by construction so this is safe.
                 F::from_canonical_unchecked(i)
             })
-            .find_any(|witness| self.clone().check_witness(bits, *witness))
+            .find_first(|witness| self.clone().check_witness(bits, *witness))
             .expect("failed to find witness");
         assert!(self.check_witness(bits, witness));
         witness

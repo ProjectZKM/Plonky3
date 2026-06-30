@@ -185,7 +185,7 @@ where
                 // i < F::ORDER_U32 by construction so this is safe.
                 F::from_canonical_unchecked(i)
             })
-            .find_any(|witness| self.clone().check_witness(bits, *witness))
+            .find_first(|witness| self.clone().check_witness(bits, *witness))
             .expect("failed to find witness");
         assert!(self.check_witness(bits, witness));
         witness
@@ -342,7 +342,7 @@ where
                 // i < F::ORDER_U64 by construction so this is safe.
                 F::from_canonical_unchecked(i)
             })
-            .find_any(|witness| self.clone().check_witness(bits, *witness))
+            .find_first(|witness| self.clone().check_witness(bits, *witness))
             .expect("failed to find witness");
         assert!(self.check_witness(bits, witness));
         witness
