@@ -147,6 +147,14 @@ pub trait ParIterExt: Iterator {
     where
         P: Fn(Self::Item) -> Option<R> + Sync + Send;
 
+    fn find_first<P>(self, predicate: P) -> Option<Self::Item>
+    where
+        P: Fn(&Self::Item) -> bool + Sync + Send;
+
+    fn find_map_first<P, R>(self, predicate: P) -> Option<R>
+    where
+        P: Fn(Self::Item) -> Option<R> + Sync + Send;
+
     fn flat_map_iter<U, F>(self, map_op: F) -> FlatMap<Self, U, F>
     where
         Self: Sized,
@@ -169,6 +177,23 @@ impl<I: Iterator> ParIterExt for I {
     }
 
     fn find_map_any<P, R>(mut self, predicate: P) -> Option<R>
+    where
+        P: Fn(Self::Item) -> Option<R> + Sync + Send,
+    {
+        self.find_map(predicate)
+    }
+
+    // Sequential (no-rayon) build: a single-threaded iterator already returns
+    // the first match, so `find_first`/`find_map_first` (the deterministic rayon
+    // methods #117 switched to) map to plain `find`/`find_map`.
+    fn find_first<P>(mut self, predicate: P) -> Option<Self::Item>
+    where
+        P: Fn(&Self::Item) -> bool + Sync + Send,
+    {
+        self.find(predicate)
+    }
+
+    fn find_map_first<P, R>(mut self, predicate: P) -> Option<R>
     where
         P: Fn(Self::Item) -> Option<R> + Sync + Send,
     {
