@@ -184,6 +184,15 @@ impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGES
         self.digest_layers.last().unwrap()[0].into()
     }
 
+    /// Borrow every digest layer, index 0 being the first layer above the
+    /// leaves.  A LEAFLESS tree (built by `from_parts` with no leaf
+    /// matrices) still carries these, so an opener that re-derives leaf
+    /// rows elsewhere can walk sibling paths from them.
+    #[must_use]
+    pub fn digest_layers(&self) -> &[Vec<[W; DIGEST_ELEMS]>] {
+        &self.digest_layers
+    }
+
     /// Return the Merkle cap at the specified height from the root.
     ///
     /// A cap height of 0 returns just the root (1 element).
