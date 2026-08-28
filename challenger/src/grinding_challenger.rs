@@ -164,7 +164,11 @@ where
         // - Each SIMD lane corresponds to a distinct candidate witness
         // - All lanes share the same transcript prefix
         // - A single permutation evaluates multiple candidates in parallel
-        let witness = (0..num_batches)
+        // A DEDICATED pool: the grind is on the transcript's critical path
+        // and its compute is tiny, so queueing it into the global pool
+        // behind long parallel sections costs far more than the search.
+        let witness = p3_maybe_rayon::pool::dedicated_install(8, || {
+            (0..num_batches)
             .into_par_iter()
             .find_map_first(|batch| {
                 // Compute the starting candidate for this batch.
@@ -218,7 +222,8 @@ where
                     })
                     .map(|(_, &witness)| witness)
             })
-            .expect("failed to find proof-of-work witness");
+            .expect("failed to find proof-of-work witness")
+        });
 
         // Double-check the witness using the standard verifier logic and update the challenger state.
         assert!(self.check_witness(bits, witness));

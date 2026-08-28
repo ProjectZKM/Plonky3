@@ -1,7 +1,41 @@
 #![no_std]
 
+#[cfg(feature = "parallel")]
+extern crate std;
+
 #[cfg(not(feature = "parallel"))]
 mod serial;
+
+/// A small DEDICATED thread pool for latency-sensitive parallel sections.
+///
+/// A parallel search launched into the GLOBAL pool queues behind whatever
+/// long-running parallel sections the process already has in flight, so its
+/// latency scales with process load rather than with its own work (measured:
+/// a proof-of-work grind whose compute is sub-millisecond spending ~40 ms
+/// waiting for pool slots).  `dedicated_install` runs the closure on a
+/// lazily-built private pool when `parallel` is on, and inline when it is
+/// off.
+pub mod pool {
+    #[cfg(feature = "parallel")]
+    pub fn dedicated_install<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
+        use std::sync::OnceLock;
+        static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+        POOL.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| std::format!("p3-dedicated-{i}"))
+                .build()
+                .expect("dedicated pool")
+        })
+        .install(f)
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    pub fn dedicated_install<R>(threads: usize, f: impl FnOnce() -> R) -> R {
+        let _ = threads;
+        f()
+    }
+}
 
 pub mod prelude {
     #[cfg(not(feature = "parallel"))]
