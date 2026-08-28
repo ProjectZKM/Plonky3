@@ -167,8 +167,23 @@ where
         // A DEDICATED pool: the grind is on the transcript's critical path
         // and its compute is tiny, so queueing it into the global pool
         // behind long parallel sections costs far more than the search.
+        //
+        // WINDOWED scan: a bare find_map_first over the whole field range
+        // hands the first worker a huge leftmost split, and the ordered
+        // search must wait for that one thread to scan up to the witness -
+        // effectively serial (measured ~40 ms per 16-bit grind).  Scanning
+        // fixed windows keeps every leaf task small, so the low range - where
+        // the witness lives after ~2^bits candidates - actually spreads
+        // across the pool.
         let witness = p3_maybe_rayon::pool::dedicated_install(8, || {
-            (0..num_batches)
+            // 2^11 batches per window: ~2^15 candidates at width 16, a bit
+            // under the 2^bits expectation, so most grinds finish in the
+            // first or second window while each leaf stays ~256 batches.
+            let window: u64 = 1 << 11;
+            let mut start: u64 = 0;
+            loop {
+                let end = (start + window).min(num_batches);
+                let found = (start..end)
             .into_par_iter()
             .find_map_first(|batch| {
                 // Compute the starting candidate for this batch.
@@ -221,8 +236,13 @@ where
                         (sample.as_canonical_u64() & mask) == 0
                     })
                     .map(|(_, &witness)| witness)
-            })
-            .expect("failed to find proof-of-work witness")
+            });
+                if let Some(w) = found {
+                    break w;
+                }
+                assert!(end < num_batches, "failed to find proof-of-work witness");
+                start = end;
+            }
         });
 
         // Double-check the witness using the standard verifier logic and update the challenger state.
