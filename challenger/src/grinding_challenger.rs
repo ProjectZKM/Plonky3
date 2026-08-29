@@ -117,6 +117,32 @@ where
             return F::ZERO;
         }
 
+        // Device accelerator, when one is installed (see `grind_hook`):
+        // hand it the canonical pre-permutation state and take the smallest
+        // passing witness back.  `check_witness` re-verifies and applies the
+        // transcript mutation exactly as the host path would, so a wrong
+        // hook asserts loudly rather than corrupting a transcript, and a
+        // declining hook just falls through to the windowed host scan.
+        if let Some(hook) = crate::grind_hook::get() {
+            let widx = self.input_buffer.len();
+            let state_canonical: alloc::vec::Vec<u64> = (0..WIDTH)
+                .map(|i| {
+                    if i < widx {
+                        self.input_buffer[i].as_canonical_u64()
+                    } else {
+                        self.sponge_state[i].as_canonical_u64()
+                    }
+                })
+                .collect();
+            if let Some(w) = hook(&state_canonical, widx, RATE, bits) {
+                assert!(w < F::ORDER_U64, "grind hook returned a non-canonical witness");
+                // SAFETY: bounds-checked against the field order above.
+                let witness = unsafe { F::from_canonical_unchecked(w) };
+                assert!(self.check_witness(bits, witness));
+                return witness;
+            }
+        }
+
         // SIMD width: number of field elements processed in parallel.
         // Each SIMD lane corresponds to one candidate witness.
         let lanes = F::Packing::WIDTH;
