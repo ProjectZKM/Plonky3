@@ -28,13 +28,17 @@ use alloc::boxed::Box;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-/// The hook: `(state_canonical, witness_idx, rate, bits) -> Option<witness>`.
+/// The hook: `(sponge_state, input_buffer, output_buffer, bits) ->
+/// Option<witness>`.
 ///
-/// `state_canonical` is the WIDTH-element pre-permutation state with the
-/// buffered inputs already overwriting the low elements and an arbitrary
-/// placeholder at `witness_idx` (the hook writes each candidate there).
+/// The three slices are the challenger's own duplex buffers in canonical
+/// form, exactly as `DuplexChallenger` holds them at the call — the hook
+/// replays `observe(candidate)` + `sample_bits(bits)` itself, so it needs
+/// them separately rather than pre-merged.  It must NOT advance anything:
+/// `grind` applies the transcript mutation through `check_witness` on the
+/// value the hook returns.
 pub type GrindHookFn =
-    dyn Fn(&[u64], usize, usize, usize) -> Option<u64> + Send + Sync + 'static;
+    dyn Fn(&[u64], &[u64], &[u64], usize) -> Option<u64> + Send + Sync + 'static;
 
 static HOOK: AtomicPtr<Box<GrindHookFn>> = AtomicPtr::new(ptr::null_mut());
 
