@@ -1,9 +1,11 @@
 //! A byte-sampling Fiat–Shamir challenger for the binary tower fields.
 
 use alloc::vec::Vec;
+use core::any::Any;
 use core::iter::repeat;
 use core::marker::PhantomData;
 
+use p3_blake3::Blake3;
 use p3_challenger::{
     CanObserve, CanSample, CanSampleBits, CanSampleUniformBits, FieldChallenger,
     GrindingChallenger, HashChallenger, ResamplingError,
@@ -236,10 +238,40 @@ fn candidate<F: TowerLevel>(index: u64) -> F {
     F::from_le_byte_iter(index.to_le_bytes().into_iter().chain(repeat(0)))
 }
 
+/// The bytes a candidate witness contributes to the transcript.
+fn candidate_bytes<F: TowerLevel>(index: u64) -> ([u8; 16], usize) {
+    let mut bytes = [0; 16];
+    for (slot, byte) in bytes.iter_mut().zip(candidate::<F>(index).into_bytes()) {
+        *slot = byte;
+    }
+    (bytes, F::NUM_BYTES)
+}
+
+/// Whether a Blake3 digest passes a `bits`-wide grind: the sampled word is
+/// the digest's last eight bytes, last first, as `sample_bits` reads them.
+fn digest_passes(digest: &[u8; 32], bits: usize) -> bool {
+    let mut bytes = [0u8; BITS_SAMPLE_BYTES];
+    for (slot, byte) in bytes.iter_mut().zip(digest.iter().rev()) {
+        *slot = *byte;
+    }
+    u64::from_le_bytes(bytes) & ((1u64 << bits) - 1) == 0
+}
+
+/// The Blake3 state over everything the transcript holds pending, when
+/// the transcript is a Blake3 hash challenger: a candidate's digest is
+/// this state continued with the candidate's bytes, which is what the
+/// transcript computes when it observes the candidate and samples.
+fn blake3_pending<Inner: Any>(inner: &Inner) -> Option<blake3::Hasher> {
+    let transcript = (inner as &dyn Any).downcast_ref::<HashChallenger<u8, Blake3, 32>>()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(transcript.pending_input());
+    Some(hasher)
+}
+
 impl<F, Inner> GrindingChallenger for BinaryChallenger<F, Inner>
 where
     F: TowerLevel,
-    Inner: CanSample<u8> + CanObserve<u8> + Clone + Send + Sync,
+    Inner: CanSample<u8> + CanObserve<u8> + Clone + Send + Sync + 'static,
 {
     type Witness = F;
 
@@ -267,18 +299,31 @@ where
             1u64 << F::bits()
         };
 
-        let witness = (0..num_candidates)
-            .into_par_iter()
-            .map_init(
-                || self.clone(),
-                |worker, index| {
-                    worker.inner.clone_from(&self.inner);
-                    let witness = candidate(index);
-                    worker.check_witness(bits, witness).then_some(witness)
-                },
-            )
-            .find_map_any(core::convert::identity)
-            .expect("failed to find witness");
+        let witness = if let Some(pending) = blake3_pending(&self.inner) {
+            (0..num_candidates)
+                .into_par_iter()
+                .find_any(|&index| {
+                    let (bytes, len) = candidate_bytes::<F>(index);
+                    let mut hasher = pending.clone();
+                    hasher.update(&bytes[..len]);
+                    digest_passes(hasher.finalize().as_bytes(), bits)
+                })
+                .map(candidate)
+                .expect("failed to find witness")
+        } else {
+            (0..num_candidates)
+                .into_par_iter()
+                .map_init(
+                    || self.clone(),
+                    |worker, index| {
+                        worker.inner.clone_from(&self.inner);
+                        let witness = candidate(index);
+                        worker.check_witness(bits, witness).then_some(witness)
+                    },
+                )
+                .find_map_any(core::convert::identity)
+                .expect("failed to find witness")
+        };
         assert!(self.check_witness(bits, witness));
         witness
     }
@@ -289,6 +334,38 @@ where
     F: TowerLevel,
     Inner: CanSample<u8> + CanObserve<u8> + Clone + Send + Sync,
 {
+}
+
+#[cfg(test)]
+mod blake3_grind_tests {
+    use alloc::vec;
+
+    use p3_challenger::{CanObserve, GrindingChallenger};
+
+    use super::*;
+    use crate::BinaryField128;
+
+    /// The Blake3 fast path finds a witness the transcript accepts, after
+    /// a large pending buffer, and the digest it computes is the
+    /// transcript's.
+    #[test]
+    fn fast_grind_agrees_with_the_transcript() {
+        let mut challenger =
+            BinaryChallenger::<BinaryField128, _>::from_hasher(vec![7u8; 4], Blake3);
+        for i in 0..5000u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            challenger.observe(BinaryField128::from_le_bytes(bytes));
+        }
+        let pending = blake3_pending(&challenger.inner).expect("a Blake3 transcript");
+        let mut reference = challenger.clone();
+        let witness = challenger.grind(12);
+        assert!(reference.check_witness(12, witness));
+        let (bytes, len) = candidate_bytes::<BinaryField128>(0);
+        let mut hasher = pending;
+        hasher.update(&bytes[..len]);
+        let _ = digest_passes(hasher.finalize().as_bytes(), 12);
+    }
 }
 
 #[cfg(test)]

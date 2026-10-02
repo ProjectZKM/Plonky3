@@ -17,7 +17,9 @@ criterion.workspace = true
 parallel = ["p3-maybe-rayon/parallel"]
 
 [dependencies]
+p3-blake3.workspace = true
 p3-challenger.workspace = true
+blake3.workspace = true
 p3-field.workspace = true
 p3-maybe-rayon.workspace = true
 p3-symmetric.workspace = true
