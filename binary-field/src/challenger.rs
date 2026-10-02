@@ -278,7 +278,7 @@ where
     /// # Panics
     /// Panics unless `bits + GRIND_MARGIN_BITS <= min(F::bits(), 64)`. See the per-level
     /// ceiling tabulated on [`BinaryChallenger`].
-    #[instrument(name = "grind for proof-of-work witness", skip_all)]
+    #[instrument(name = "grind for proof-of-work witness", skip_all, fields(bits))]
     fn grind(&mut self, bits: usize) -> Self::Witness {
         // Trivial case: 0 bits mean no PoW is required and any witness is valid.
         if bits == 0 {
@@ -338,12 +338,44 @@ where
 
 #[cfg(test)]
 mod blake3_grind_tests {
+    extern crate std;
+
     use alloc::vec;
 
     use p3_challenger::{CanObserve, GrindingChallenger};
 
     use super::*;
     use crate::BinaryField128;
+
+    /// A twenty-bit grind over a large pending buffer, timed on both paths.
+    #[test]
+    #[ignore]
+    fn grind_timing_over_a_large_buffer() {
+        let mut challenger =
+            BinaryChallenger::<BinaryField128, _>::from_hasher(vec![7u8; 4], Blake3);
+        for i in 0..40_000u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            challenger.observe(BinaryField128::from_le_bytes(bytes));
+        }
+        let pending = blake3_pending(&challenger.inner).expect("a Blake3 transcript");
+        let started = std::time::Instant::now();
+        let found = (0..u64::MAX)
+            .into_par_iter()
+            .find_any(|&index| {
+                let (bytes, len) = candidate_bytes::<BinaryField128>(index);
+                let mut hasher = pending.clone();
+                hasher.update(&bytes[..len]);
+                digest_passes(hasher.finalize().as_bytes(), 20)
+            })
+            .expect("found");
+        std::println!("fast path: {:?} (index {found})", started.elapsed());
+        let started = std::time::Instant::now();
+        let mut reference = challenger.clone();
+        let witness = reference.grind(20);
+        std::println!("grind(): {:?}", started.elapsed());
+        assert!(challenger.clone().check_witness(20, witness));
+    }
 
     /// The Blake3 fast path finds a witness the transcript accepts, after
     /// a large pending buffer, and the digest it computes is the
