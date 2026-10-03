@@ -936,21 +936,16 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitch<F, EF>
     ///
     /// # Algorithm
     ///
-    /// The equality polynomial factors over the variables:
+    /// The equality polynomial factors over the variables, and in characteristic two each
+    /// factor is affine:
     ///
     /// ```text
-    ///     eq(X, Y) = prod_i ( X_i*Y_i + (1 - X_i)(1 - Y_i) )
+    ///     eq(X, Y) = prod_i ( X_i*Y_i + (1 + X_i)(1 + Y_i) ) = prod_i ( 1 + X_i + Y_i )
     /// ```
     ///
-    /// Each factor lands on a different tensor leg.
-    /// From the identity, every variable adds an agree and a disagree term:
-    ///
-    /// ```text
-    ///     agree     scale a copy's columns by a, its rows by b
-    ///     disagree  scale the element's columns by 1 - a, its rows by 1 - b
-    /// ```
-    ///
-    /// The two scalings commute, so either order gives the term.
+    /// Each factor lands on both tensor legs, `X_i` as `a ⊗ 1` and `Y_i` as `1 ⊗ b`.
+    /// A variable therefore costs one column scaling and one row scaling, where the agree and
+    /// disagree terms of the product form cost two of each.
     /// The alternative sums the element over the hypercube, exponentially.
     fn equality_element(&self, r_prime: &Point<EF>) -> BitTensor<EF, EF> {
         // Boolean leading coordinates select a committed slot directly.
@@ -958,13 +953,7 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitch<F, EF>
         let (prefix, _) = self.fixed_prefix();
         let mut element = BitTensor::one();
         for (&a, &b) in self.high()[prefix..].iter().zip(r_prime.as_slice()) {
-            let mut agree = element.clone();
-            agree.scale_columns(a);
-            agree.scale_rows(b);
-
-            element.scale_columns(EF::ONE - a);
-            element.scale_rows(EF::ONE - b);
-            element += agree;
+            element.mul_equality_factor(a, b);
         }
         element
     }

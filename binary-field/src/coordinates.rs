@@ -1,5 +1,7 @@
 //! The `F_2`-coordinates of a binary field, read off its little-endian bytes.
 
+use alloc::vec::Vec;
+
 use p3_field::{Field, RawDataSerializable};
 
 use crate::poly64::Poly64;
@@ -30,6 +32,24 @@ pub trait BitCoordinates: Field + RawDataSerializable {
     ///
     /// Panics if the stream ends before a whole element has been read.
     fn from_coordinate_bytes(bytes: impl Iterator<Item = u8>) -> Self;
+
+    /// The bit matrix whose rows are `rows`, read by column.
+    ///
+    /// Element `v` of the result has coordinate `u` set exactly when `rows[u]` has coordinate
+    /// `v` set, so there are [`BitCoordinates::DIMENSION`] of `R` of them, and `rows` holds at
+    /// most `Self::DIMENSION` elements, missing rows reading as zero:
+    ///
+    /// ```text
+    ///     rows[u] = sum_v  b(u, v) gamma_v      ->      out[v] = sum_u  b(u, v) beta_u
+    /// ```
+    ///
+    /// A field whose values carry their coordinates in their bytes declines with `None`, and
+    /// the caller reads the bytes.  A value type that cannot hand its coordinates out as bytes,
+    /// such as one recording the arithmetic done on it, answers here instead, and a tensor
+    /// whose legs are such a type then never reads a coordinate.
+    fn transpose<R: BitCoordinates>(_rows: &[R]) -> Option<Vec<Self>> {
+        None
+    }
 }
 
 impl<F: TowerLevel> BitCoordinates for F {
@@ -38,6 +58,10 @@ impl<F: TowerLevel> BitCoordinates for F {
     #[inline]
     fn from_coordinate_bytes(bytes: impl Iterator<Item = u8>) -> Self {
         F::from_le_byte_iter(bytes)
+    }
+
+    fn transpose<R: BitCoordinates>(rows: &[R]) -> Option<Vec<Self>> {
+        F::transpose_coordinates(rows)
     }
 }
 

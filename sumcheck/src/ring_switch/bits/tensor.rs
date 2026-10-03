@@ -93,6 +93,13 @@ impl<EF: BitCoordinates, R: BitCoordinates> BitTensor<EF, R> {
     ///
     /// Row `u` takes `b` exactly when coordinate `u` of `a` is set.
     pub fn add_exterior_product(&mut self, a: EF, b: R) {
+        // A type that does not read its coordinates hands them out as elements instead.
+        if let Some(coordinates) = R::transpose(&[a]) {
+            for (row, coordinate) in self.rows.iter_mut().zip(coordinates) {
+                *row += coordinate * b;
+            }
+            return;
+        }
         for u in Coefficients::of(a).iter_set() {
             self.rows[u] += b;
         }
@@ -131,6 +138,9 @@ impl<EF: BitCoordinates, R: BitCoordinates> BitTensor<EF, R> {
     /// Taken once per use rather than maintained alongside the rows.
     #[must_use]
     pub fn columns(&self) -> Vec<EF> {
+        if let Some(columns) = EF::transpose(&self.rows) {
+            return columns;
+        }
         // Read each row's coordinates once, so the transpose is one gather.
         let source = self
             .rows
@@ -183,6 +193,17 @@ impl<EF: BitCoordinates, R: BitCoordinates> BitTensor<EF, R> {
     /// That is one multiplication per coordinate, whatever the element was accumulated from.
     /// A zero row scales to nothing, so its multiplication is never formed.
     pub fn add_scaled_columns(&mut self, other: &Self, a: EF) {
+        // In the column reading the scaling is one multiplication per column, and a type that
+        // transposes without reading its coordinates takes that route rather than reading them.
+        if let Some(columns) = EF::transpose(&other.rows) {
+            let scaled: Vec<EF> = columns.into_iter().map(|column| a * column).collect();
+            let rows = R::transpose(&scaled)
+                .expect("a type transposing one leg of a tensor transposes the other");
+            for (row, scaled) in self.rows.iter_mut().zip(rows) {
+                *row += scaled;
+            }
+            return;
+        }
         for (u, &row) in other.rows.iter().enumerate() {
             if row != R::ZERO {
                 let mut basis = Coefficients::<EF>::zero();
@@ -252,6 +273,9 @@ impl<EF: BitCoordinates, R: BitCoordinates> BitTensor<EF, R> {
     /// Coordinate `u` of the column is coordinate `v` of row `u`, so this is `dim EF` bit reads.
     #[must_use]
     pub fn column(&self, v: usize) -> EF {
+        if let Some(columns) = EF::transpose(&self.rows) {
+            return columns[v];
+        }
         let mut column = Coefficients::<EF>::zero();
         for (u, &row) in self.rows.iter().enumerate() {
             if Coefficients::of(row).get(v) {

@@ -21,6 +21,8 @@ mod poly_slice;
 mod subfield;
 mod tables;
 mod tower;
+#[doc(hidden)]
+pub use tower::private as tower_private;
 mod transcript;
 
 pub use aes::{ByteMatrix, LinearizedPoly8b, PackedRijndael8b, Rijndael8b};

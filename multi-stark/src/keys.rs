@@ -135,6 +135,26 @@ pub struct VerifyingKey<C: MultiStarkConfig> {
     pub(crate) air_profiles: Vec<AirProfile>,
 }
 
+impl<C: MultiStarkConfig> VerifyingKey<C> {
+    /// The same key under another configuration over the same AIRs.
+    ///
+    /// The heights and zerocheck metadata carry over unchanged.
+    /// The preprocessed commitment, if any, is carried by `lift`.
+    ///
+    /// A verifier that runs the same protocol over another value type, such as one that records
+    /// the verification as a circuit, reads the key this way rather than redoing setup.
+    pub fn lift<D: MultiStarkConfig>(
+        &self,
+        lift: impl FnOnce(&Commitment<C>) -> Commitment<D>,
+    ) -> VerifyingKey<D> {
+        VerifyingKey {
+            preprocessed: self.preprocessed.as_ref().map(lift),
+            preprocessed_log_heights: self.preprocessed_log_heights.clone(),
+            air_profiles: self.air_profiles.clone(),
+        }
+    }
+}
+
 /// Commit all AIR preprocessed traces once, returning matched prover and verifier keys.
 ///
 /// When the AIR declares no preprocessed trace, both keys carry no preprocessed data.

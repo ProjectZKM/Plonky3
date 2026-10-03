@@ -37,7 +37,11 @@ use crate::{Gf2, tables};
 /// `cantor_basis` is *the* Cantor basis — `v_0 = 1` and `v_i² + v_i = v_{i−1}` — not merely some
 /// `F_2`-linearly independent sequence. An external implementation satisfying none of that would
 /// fail silently, with wrong evaluations rather than a compile error, wherever those assume it.
-pub(crate) mod private {
+#[doc(hidden)]
+pub mod private {
+    /// Seals [`super::TowerLevel`]. Public only so a recording wrapper of one level, which
+    /// carries that level's own representation and Cantor basis, can implement it; any other
+    /// implementation breaks the invariant above.
     pub trait Sealed {}
 }
 
@@ -72,6 +76,15 @@ pub trait TowerLevel: Field + private::Sealed {
     /// # Panics
     /// Panics if `i` is at least the bit width `2^LOG_BITS` of this level.
     fn cantor_basis(i: usize) -> Self;
+
+    /// The bit matrix whose rows are `rows` read by column, for a value type that cannot hand
+    /// out its coordinates as bytes.
+    ///
+    /// See [`BitCoordinates::transpose`](crate::BitCoordinates::transpose), which forwards here.
+    /// Every level of the tower reads its bytes, so the default declines.
+    fn transpose_coordinates<R: crate::BitCoordinates>(_rows: &[R]) -> Option<Vec<Self>> {
+        None
+    }
 }
 
 /// The panic message shared by every [`TowerLevel::from_le_byte_iter`] implementation.
