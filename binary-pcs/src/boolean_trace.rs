@@ -569,9 +569,12 @@ where
         &self,
         second: &Self,
         first_side: PairOpening<'_, Self::ProverData, EF>,
-        second_side: PairOpening<'_, Self::ProverData, EF>,
+        second_side: PairOpening<'_, &Self::ProverData, EF>,
         challenger: &mut Challenger,
-    ) -> Result<(Self::Proof, Self::Proof), Self::ProverError> {
+    ) -> Result<(Self::Proof, Self::Proof), Self::ProverError>
+    where
+        Self::ProverData: Clone,
+    {
         let BooleanTraceCommitmentData {
             inner: first_inner,
             tables: first_tables,
@@ -582,7 +585,7 @@ where
         } = second_side.prover_data;
         // Every shape, point and supplied run of both sides is checked before either moves.
         second.check_open(
-            &second_tables,
+            second_tables,
             second_side.protocol,
             second_side.points,
             second_side.known,
@@ -595,13 +598,13 @@ where
             challenger,
         )?;
         let second_pending = second.batch_columns(
-            &second_tables,
+            second_tables,
             second_side.protocol,
             second_side.points,
             second_side.known,
             challenger,
         )?;
-        drop((first_tables, second_tables));
+        drop(first_tables);
         let ((first_readings, first_opening), (second_readings, second_opening)) = self
             .inner
             .open_readings_pair(

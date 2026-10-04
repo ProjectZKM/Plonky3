@@ -28,7 +28,8 @@ use crate::pcs::proof::{
 use crate::transcript::{WhirProverTranscript, WhirShape};
 
 /// The Merkle prover data of the polynomial the next queries open.
-type WhirRoundData<EF, F, MT> = RoundData<
+type WhirRoundData<'a, EF, F, MT> = RoundData<
+    'a,
     F,
     <MT as Mmcs<F>>::ProverData<DenseMatrix<F>>,
     <MT as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, DenseMatrix<EF>>>,
@@ -42,21 +43,45 @@ type WhirRoundData<EF, F, MT> = RoundData<
 /// - Subsequent rounds commit to folded extension-field evaluations,
 ///   reinterpreted as wider base-field rows so a single Merkle backend
 ///   handles both shapes.
-type WhirRoundState<EF, F, MT> = RoundState<
+type WhirRoundState<'a, EF, F, MT> = RoundState<
+    'a,
     EF,
     F,
     <MT as Mmcs<F>>::ProverData<DenseMatrix<F>>,
     <MT as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, DenseMatrix<EF>>>,
 >;
 
+/// Merkle prover data a batched first round opens: the run's own, or a caller's it borrows.
+///
+/// Owned data is released when the first round hands over to the folded commitment;
+/// borrowed data stays with its owner, which is never copied for the run.
+#[derive(Debug)]
+pub enum Held<'a, T> {
+    /// Data the run owns.
+    Owned(T),
+    /// Data the run reads in place.
+    Borrowed(&'a T),
+}
+
+impl<T> core::ops::Deref for Held<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Owned(data) => data,
+            Self::Borrowed(data) => data,
+        }
+    }
+}
+
 /// Active Merkle prover data for the polynomial currently being queried.
 #[derive(Debug)]
-enum RoundData<F, BaseData, ExtData> {
+enum RoundData<'a, F, BaseData, ExtData> {
     /// Base-field commitment produced by the initial round.
     Base(BaseData),
     /// Several base-field commitments whose polynomials the run batches,
     /// with the coefficient each enters the batch with.
-    Batched(Vec<BaseData>, Vec<F>),
+    Batched(Vec<Held<'a, BaseData>>, Vec<F>),
     /// Extension-field commitment produced by every subsequent folded round.
     Ext(ExtData),
 }
@@ -66,7 +91,7 @@ enum RoundData<F, BaseData, ExtData> {
 /// Tracks the sumcheck prover, folding randomness, and Merkle
 /// commitments across base and extension field rounds.
 #[derive(Debug)]
-struct RoundState<EF, F, BaseData, ExtData>
+struct RoundState<'a, EF, F, BaseData, ExtData>
 where
     F: Field,
     EF: ExtensionField<F>,
@@ -76,7 +101,7 @@ where
     /// Folding challenges (alpha_1, ..., alpha_k) for the current round.
     folding_randomness: Point<EF>,
     /// Active Merkle prover data for the polynomial currently being queried.
-    round_data: RoundData<F, BaseData, ExtData>,
+    round_data: RoundData<'a, F, BaseData, ExtData>,
 }
 
 /// WHIR prover bundling the protocol config with its FFT and commitment backends.
@@ -215,7 +240,7 @@ where
         initial_ood_answers: Vec<EF>,
         challenger: &mut Challenger,
         layout: L,
-        prover_data: Vec<MT::ProverData<DenseMatrix<F>>>,
+        prover_data: Vec<Held<'_, MT::ProverData<DenseMatrix<F>>>>,
         coefficients: Vec<F>,
         num_opening_claims: usize,
     ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
@@ -241,7 +266,7 @@ where
         initial_ood_answers: Vec<EF>,
         challenger: &mut Challenger,
         layout: L,
-        round_data: WhirRoundData<EF, F, MT>,
+        round_data: WhirRoundData<'_, EF, F, MT>,
         num_opening_claims: usize,
     ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
     where
@@ -312,7 +337,7 @@ where
         &self,
         round_index: usize,
         transcript: &mut WhirProverTranscript<'_, Challenger, F, EF>,
-        round_state: &mut WhirRoundState<EF, F, MT>,
+        round_state: &mut WhirRoundState<'_, EF, F, MT>,
         variable_order: VariableOrder,
     ) -> WhirRoundProof<F, EF, MT>
     where
@@ -392,7 +417,7 @@ where
                 let openings: Vec<_> = datas
                     .iter()
                     .map(|data| {
-                        SharedProofOpening::open(&self.mmcs, &stir_challenges_indexes, data)
+                        SharedProofOpening::open(&self.mmcs, &stir_challenges_indexes, &**data)
                     })
                     .collect();
                 for (query, &challenge) in stir_challenges_indexes.iter().enumerate() {
@@ -483,7 +508,7 @@ where
         &self,
         round_index: usize,
         transcript: &mut WhirProverTranscript<'_, Challenger, F, EF>,
-        round_state: &mut WhirRoundState<EF, F, MT>,
+        round_state: &mut WhirRoundState<'_, EF, F, MT>,
     ) -> (
         Option<Poly<EF>>,
         F,
@@ -519,7 +544,7 @@ where
                 datas
                     .iter()
                     .map(|data| {
-                        SharedProofOpening::open(&self.mmcs, &final_challenge_indexes, data)
+                        SharedProofOpening::open(&self.mmcs, &final_challenge_indexes, &**data)
                     })
                     .collect(),
             ),

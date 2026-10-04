@@ -33,12 +33,13 @@ use p3_commit::Mmcs;
 use p3_field::{ExtensionField, Field};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_multilinear_util::point::Point;
+use p3_multilinear_util::split_eq::SplitEq;
 use p3_sumcheck::layout::{Layout, Table, Verifier};
 use p3_sumcheck::{OpeningEvals, OpeningProtocol, OpeningRequest};
 use serde::{Deserialize, Serialize};
 
 use super::adapter::WhirProverData;
-use super::prover::WhirProver;
+use super::prover::{Held, WhirProver};
 use super::verifier::errors::VerifierError;
 use super::verifier::{BaseCommitments, WhirVerifier};
 use crate::WhirConfigError;
@@ -74,6 +75,26 @@ fn single_request(protocol: &OpeningProtocol) -> (usize, &OpeningRequest) {
         "a pair opening opens each commitment once"
     );
     opening
+}
+
+/// The current-row columns `request` names, each evaluated at `point`.
+///
+/// The multilinear extension of a column over its own rows, as every layout claims it, read
+/// off the table without recording a claim.
+fn column_evals<F: Field, EF: ExtensionField<F>>(
+    table: &Table<F>,
+    request: &OpeningRequest,
+    point: &Point<EF>,
+) -> OpeningEvals<EF> {
+    let eq = SplitEq::<F, EF>::new_packed(point, EF::ONE);
+    OpeningEvals::new(
+        request
+            .current()
+            .iter()
+            .map(|&column| eq.eval_base(table.poly(column)))
+            .collect(),
+        Vec::new(),
+    )
 }
 
 /// `a + gamma b`, coordinate by coordinate, over both views.
@@ -146,17 +167,21 @@ where
     ///
     /// Neither commitment is bound here: each was bound when it was made.
     ///
+    /// The second is read in place, never copied: a commitment reused across proofs, as a
+    /// preprocessed one is, keeps its one codeword and its one set of tables.
+    ///
     /// # Errors
     ///
     /// Returns an error when the claims exceed the configured budget.
     ///
     /// # Panics
     ///
-    /// When the protocol asks for anything but one opening, or the two layouts differ.
+    /// When the protocol asks for anything but one opening of current-row columns, or the two
+    /// layouts differ.
     pub fn open_pair_at(
         &self,
         first: WhirProverData<F, EF, MT, L>,
-        second: WhirProverData<F, EF, MT, L>,
+        second: &WhirProverData<F, EF, MT, L>,
         protocol: &OpeningProtocol,
         points: &[Point<EF>; 2],
         challenger: &mut Challenger,
@@ -173,26 +198,24 @@ where
                 .ok_or(WhirConfigError::InitialClaimCountOverflow)?,
         )?;
 
+        assert!(
+            request.next().is_empty(),
+            "a pair opening reads the current row only"
+        );
+
         let WhirProverData {
-            layout: mut f,
+            layout: f,
             merkle_data: f_data,
             ..
         } = first;
-        let WhirProverData {
-            layout: mut g,
-            merkle_data: g_data,
-            ..
-        } = second;
+        let g = &second.layout;
 
         let (evals, cross) = tracing::info_span!("pair values").in_scope(|| {
-            let evals = vec![
-                f.record_opening(table_idx, request, &points[0]),
-                g.record_opening(table_idx, request, &points[1]),
-            ];
-            let cross = vec![
-                g.record_opening(table_idx, request, &points[0]),
-                f.record_opening(table_idx, request, &points[1]),
-            ];
+            let at = |layout: &L, point: &Point<EF>| {
+                column_evals(layout.table(table_idx), request, point)
+            };
+            let evals = vec![at(&f, &points[0]), at(g, &points[1])];
+            let cross = vec![at(g, &points[0]), at(&f, &points[1])];
             (evals, cross)
         });
 
@@ -219,7 +242,7 @@ where
                 })
                 .collect::<Vec<_>>()
         });
-        drop((f, g));
+        drop(f);
         let mut layout = L::from_witness(L::new_witness(tables, self.round_folding_factor(0)));
 
         let initial_ood_answers = (0..self.commitment_ood_samples)
@@ -237,7 +260,7 @@ where
             initial_ood_answers,
             challenger,
             layout,
-            vec![f_data, g_data],
+            vec![Held::Owned(f_data), Held::Borrowed(&second.merkle_data)],
             vec![F::ONE, gamma],
             2,
         )?;
@@ -423,7 +446,7 @@ mod tests {
     fn run<L: Layout<F, EF>>(pow_bits: usize, tamper: Tamper) -> Result<(), VerifierError> {
         let spec = TableSpec::new(
             TableShape::new(8, 2),
-            vec![OpeningBatch::new(vec![0, 1], vec![1])],
+            vec![OpeningBatch::new(vec![0, 1], Vec::new())],
         );
         let protocol = OpeningProtocol::new(vec![spec.clone()]);
         let pcs = pcs::<L>(9, pow_bits);
@@ -448,7 +471,7 @@ mod tests {
         let mut proof: PairProof<F, EF, Mmcs> = pcs
             .open_pair_at(
                 first_data,
-                unrelated.unwrap_or(second_data),
+                &unrelated.unwrap_or(second_data),
                 &protocol,
                 &points,
                 &mut prover,
@@ -525,7 +548,7 @@ mod tests {
         let (a, b) = (commit(1), commit(2));
         let point = Point::new((0..8).map(|c| EF::from_u64(5 + c)).collect());
         let proof = pcs
-            .open_pair_at(a, b, &protocol, &[point.clone(), point], &mut challenger())
+            .open_pair_at(a, &b, &protocol, &[point.clone(), point], &mut challenger())
             .unwrap();
         assert_eq!(proof.whir.rounds.len(), pcs.n_rounds());
         assert!(matches!(

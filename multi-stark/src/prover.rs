@@ -648,7 +648,7 @@ where
                     known: &known,
                 },
                 PairOpening {
-                    prover_data: preprocessed.prover_data.clone(),
+                    prover_data: &preprocessed.prover_data,
                     protocol: schedule.protocol(),
                     points: &against,
                     known: &none,

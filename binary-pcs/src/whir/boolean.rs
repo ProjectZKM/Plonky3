@@ -539,7 +539,7 @@ where
         &self,
         second: &Self,
         first_side: (BooleanWhirData<F, EF, MT>, &[BitOpening<EF>]),
-        second_side: (BooleanWhirData<F, EF, MT>, &[BitOpening<EF>]),
+        second_side: (&BooleanWhirData<F, EF, MT>, &[BitOpening<EF>]),
         challenger: &mut Challenger,
     ) -> Result<PairReadings<EF, BooleanWhirProof<F, EF, MT>>, BooleanWhirError> {
         self.check_partner(second)?;
@@ -547,7 +547,7 @@ where
         let (first_readings, first_reduction, first_point) =
             self.switch(&first_side.0, first_side.1, challenger)?;
         let (second_readings, second_reduction, second_point) =
-            second.switch(&second_side.0, second_side.1, challenger)?;
+            second.switch(second_side.0, second_side.1, challenger)?;
 
         let pair = tracing::info_span!("pair opening")
             .in_scope(|| {
@@ -771,7 +771,7 @@ where
         &self,
         second: &Self,
         first_side: (Self::ProverData, &[BitOpening<EF>]),
-        second_side: (Self::ProverData, &[BitOpening<EF>]),
+        second_side: (&Self::ProverData, &[BitOpening<EF>]),
         challenger: &mut Challenger,
     ) -> Result<PairReadings<EF, Self::Proof>, Self::Error> {
         Self::open_readings_pair(self, second, first_side, second_side, challenger)

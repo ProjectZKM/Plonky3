@@ -19,7 +19,7 @@ pub use parameters::{
     SecurityAssumption, TerminalBudget, WhirConfig, WhirConfigError,
 };
 pub use pcs::proof::{PcsProof, QueryOpenings, SharedProofOpening, WhirProof, WhirRoundProof};
-pub use pcs::prover::WhirProver;
+pub use pcs::prover::{Held, WhirProver};
 pub use pcs::verifier::WhirVerifier;
 pub use pcs::verifier::errors::VerifierError;
 pub use pcs::zk::{

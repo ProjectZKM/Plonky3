@@ -1141,7 +1141,7 @@ mod pair {
                     known: &[None],
                 },
                 PairOpening {
-                    prover_data: second_data,
+                    prover_data: &second_data,
                     protocol: &second_protocol,
                     points: &second_points,
                     known: &[None],

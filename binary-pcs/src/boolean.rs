@@ -284,24 +284,21 @@ pub trait BooleanMultilinearPcs<EF, Challenger>: BooleanBackend<EF> {
 
     /// Open a witness of this commitment and one of `second`'s, in that order, as one step.
     ///
-    /// The default opens each by its own proof. A commitment able to discharge both by one
-    /// proximity opening overrides it.
+    /// The second side's data is borrowed, so a reused commitment is read in place and never
+    /// copied. A commitment that cannot share one proximity opening between the two refuses.
     ///
     /// # Errors
     ///
-    /// As [`open_readings`](BooleanMultilinearPcs::open_readings), for either side.
+    /// As [`open_readings`](BooleanMultilinearPcs::open_readings), for either side, or a
+    /// commitment that does not open pairs.
     #[allow(clippy::type_complexity)]
     fn open_readings_pair(
         &self,
         second: &Self,
         first_side: (Self::ProverData, &[BitOpening<EF>]),
-        second_side: (Self::ProverData, &[BitOpening<EF>]),
+        second_side: (&Self::ProverData, &[BitOpening<EF>]),
         challenger: &mut Challenger,
-    ) -> Result<PairReadings<EF, Self::Proof>, Self::Error> {
-        let first = self.open_readings(first_side.0, first_side.1, challenger)?;
-        let second = second.open_readings(second_side.0, second_side.1, challenger)?;
-        Ok((first, second))
-    }
+    ) -> Result<PairReadings<EF, Self::Proof>, Self::Error>;
 
     /// Check what [`open_readings_pair`](BooleanMultilinearPcs::open_readings_pair) produced.
     ///
@@ -830,6 +827,16 @@ where
         self.inner.observe_commitment(commitment, challenger);
     }
 
+    fn open_readings_pair(
+        &self,
+        _second: &Self,
+        _first_side: (Self::ProverData, &[BitOpening<EF>]),
+        _second_side: (&Self::ProverData, &[BitOpening<EF>]),
+        _challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, Self::Proof>, Self::Error> {
+        Err(BooleanPcsError::PairUnsupported)
+    }
+
     fn open_readings(
         &self,
         prover_data: Self::ProverData,
@@ -941,6 +948,10 @@ pub struct BooleanProof<EF: Field, MT: Mmcs<EF>, MX: Mmcs<EF>> {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BooleanPcsError<EF, MmcsError> {
+    /// The folding-only commitment opens each commitment by its own proof, never as a pair.
+    #[error("the folding-only commitment does not open pairs")]
+    PairUnsupported,
+
     /// The witness is narrower than the coordinates one element absorbs.
     #[error("a bit witness of {actual} variables cannot absorb {needed} into one element")]
     WitnessTooNarrow {

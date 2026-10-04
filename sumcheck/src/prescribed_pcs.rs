@@ -294,7 +294,10 @@ where
     ///
     /// A scheme may share work between the two, such as one proximity opening for both.
     ///
-    /// The default opens `first`, then `second`, each by its own path.
+    /// The second side's data is borrowed: it is typically a preprocessed commitment that
+    /// every proof reuses, so a scheme reading it in place copies none of it.
+    ///
+    /// The default opens `first`, then a copy of `second`, each by its own path.
     ///
     /// # Errors
     ///
@@ -308,9 +311,12 @@ where
         &self,
         second: &Self,
         first_side: PairOpening<'_, Self::ProverData, Challenge>,
-        second_side: PairOpening<'_, Self::ProverData, Challenge>,
+        second_side: PairOpening<'_, &Self::ProverData, Challenge>,
         challenger: &mut Challenger,
-    ) -> Result<(Self::Proof, Self::Proof), Self::ProverError> {
+    ) -> Result<(Self::Proof, Self::Proof), Self::ProverError>
+    where
+        Self::ProverData: Clone,
+    {
         let first = self.open_at_known(
             first_side.prover_data,
             first_side.protocol,
@@ -319,7 +325,7 @@ where
             challenger,
         )?;
         let second = second.open_at_known(
-            second_side.prover_data,
+            second_side.prover_data.clone(),
             second_side.protocol,
             second_side.points,
             second_side.known,

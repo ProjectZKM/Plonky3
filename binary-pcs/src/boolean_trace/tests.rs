@@ -213,6 +213,22 @@ impl BooleanMultilinearPcs<EF, MyChallenger> for BitsOnly {
             .verify_readings(commitment, openings, readings, proof, challenger)
     }
 
+    fn open_readings_pair(
+        &self,
+        second: &Self,
+        first_side: (Self::ProverData, &[BitOpening<EF>]),
+        second_side: (&Self::ProverData, &[BitOpening<EF>]),
+        challenger: &mut MyChallenger,
+    ) -> Result<crate::boolean::PairReadings<EF, Self::Proof>, Self::Error> {
+        BooleanMultilinearPcs::open_readings_pair(
+            &self.0,
+            &second.0,
+            first_side,
+            second_side,
+            challenger,
+        )
+    }
+
     fn readings_security(
         &self,
         num_claims: usize,
