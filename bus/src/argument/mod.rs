@@ -1,5 +1,6 @@
 //! Commitment-independent reduction from a planned bus to terminal leaf claims.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use p3_challenger::FieldChallenger;
@@ -98,19 +99,17 @@ impl BusPlan {
             return Err(error);
         }
 
+        // The leaves become the trees' lowest levels as they are, so none is copied.
+        let trees = ProductGkrProof::trees(vec![pushes, pulls], self.product_shape());
+
         // Shared-root encoding is a statement, so reject a false witness explicitly.
-        let push_root = pushes.iter().copied().product::<EF>();
-        let pull_root = pulls.iter().copied().product::<EF>();
-        if push_root != pull_root {
+        let roots = trees.roots();
+        if roots[0] != roots[1] {
             transcript.abort();
             return Err(BusArgumentError::UnbalancedProducts);
         }
         let (product, output) = transcript.product(|challenger| {
-            ProductGkrProof::prove::<F, _>(
-                &[pushes.as_slice(), pulls.as_slice()],
-                self.product_shape(),
-                challenger,
-            )
+            ProductGkrProof::prove_trees::<F, _>(trees, self.product_shape(), challenger)
         });
         transcript.finish();
 

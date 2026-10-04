@@ -3,14 +3,14 @@
 use alloc::vec::Vec;
 
 use p3_field::Field;
+use p3_maybe_rayon::prelude::*;
 
-/// Folds a fully materialized multilinear table in place.
+/// Folds a fully materialized multilinear table, replacing it by the half-length result.
 pub(super) fn fold_dense<F: Field>(values: &mut Vec<F>, challenge: F) {
-    let output_len = values.len() / 2;
-    for row in 0..output_len {
-        values[row] = interpolate_pair([values[2 * row], values[2 * row + 1]], challenge);
-    }
-    values.truncate(output_len);
+    *values = values
+        .par_chunks_exact(2)
+        .map(|pair| interpolate_pair([pair[0], pair[1]], challenge))
+        .collect();
 }
 
 /// Combines one claim per tree with consecutive powers of one challenge.

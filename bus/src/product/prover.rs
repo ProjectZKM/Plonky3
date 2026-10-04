@@ -1,11 +1,18 @@
 //! Identity-padded storage and folding state used by the product prover.
+//!
+//! Every pass over a level runs in parallel. A level is held once: the leaves are taken by
+//! value, and a radix-four layer reads its level in place until its first fold halves it.
 
 use alloc::vec::Vec;
 
 use p3_field::Field;
+use p3_maybe_rayon::prelude::*;
 
 use super::ROUND_POLY_LEN;
 use super::math::interpolate_pair;
+
+/// Rows one task of a sumcheck round sums before its message joins the others.
+const ROUND_CHUNK: usize = 1 << 12;
 
 /// An arbitrary table prefix whose omitted suffix is the multiplicative identity.
 struct IdentityPrefix<F> {
@@ -34,30 +41,10 @@ impl<F: Field> IdentityPrefix<F> {
         // A partial final group is completed by implicit identity factors.
         let values = self
             .values
-            .chunks(arity)
+            .par_chunks(arity)
             .map(|chunk| chunk.iter().copied().product())
             .collect();
         Self::new(values)
-    }
-
-    /// Binds the lowest remaining variable in place.
-    fn fold(&mut self, logical_len: usize, challenge: F) {
-        debug_assert!(self.values.len() <= logical_len);
-        debug_assert!(logical_len >= 2);
-        let output_len = self.values.len().div_ceil(2);
-
-        // Missing entries retain the constant-one suffix during interpolation.
-        for row in 0..output_len {
-            let zero = self.get(2 * row);
-            let one = self.get(2 * row + 1);
-            self.values[row] = interpolate_pair([zero, one], challenge);
-        }
-        self.values.truncate(output_len);
-
-        // Restore the canonical shortest representation after folding.
-        while self.values.last() == Some(&F::ONE) {
-            self.values.pop();
-        }
     }
 }
 
@@ -68,13 +55,14 @@ pub(super) struct ProductLayers<F> {
 }
 
 impl<F: Field> ProductLayers<F> {
-    /// Builds every product level needed by the radix-four descent.
-    pub(super) fn new(leaves: &[F], log_height: usize) -> Self {
+    /// Builds every product level needed by the radix-four descent, keeping `leaves` as the
+    /// lowest one.
+    pub(super) fn new(leaves: Vec<F>, log_height: usize) -> Self {
         // Unvisited depths remain empty constant-one prefixes.
         let mut layers = (0..=log_height)
             .map(|_| IdentityPrefix::new(Vec::new()))
             .collect::<Vec<_>>();
-        layers[0] = IdentityPrefix::new(leaves.to_vec());
+        layers[0] = IdentityPrefix::new(leaves);
 
         // Two multiplication levels are retained per radix-four layer.
         let mut depth = 0;
@@ -103,58 +91,73 @@ impl<F: Field> ProductLayers<F> {
     pub(super) fn binary_children(&self, depth: usize) -> [F; 2] {
         [self.layers[depth].get(0), self.layers[depth].get(1)]
     }
-
-    /// Splits one retained level into four low-bit child prefixes.
-    fn radix_four_state(&self, depth: usize, logical_len: usize) -> RadixFourState<F> {
-        RadixFourState::new(&self.layers[depth], logical_len)
-    }
 }
 
 /// Four child multilinears represented as arbitrary prefixes of constant-one tables.
-struct RadixFourState<F> {
-    /// One prefix per low-bit child slot.
-    children: [IdentityPrefix<F>; 4],
+///
+/// Child `slot` holds the level's entries `4 j + slot`. Before the first fold they are read
+/// where the level holds them; the fold writes each child out at half the length.
+enum RadixFourState<'a, F> {
+    /// The retained level, its four children interleaved.
+    Level(&'a IdentityPrefix<F>),
+    /// The children after a fold, one prefix each.
+    Folded([IdentityPrefix<F>; 4]),
 }
 
-impl<F: Field> RadixFourState<F> {
-    /// Splits an interleaved product level into four child tables.
-    fn new(values: &IdentityPrefix<F>, logical_len: usize) -> Self {
-        let mut children: [Vec<F>; 4] = core::array::from_fn(|_| Vec::new());
-        for (index, &value) in values.values.iter().enumerate() {
-            let slot = index % 4;
-            let row = index / 4;
-            debug_assert!(row < logical_len);
-            children[slot].push(value);
+impl<F: Field> RadixFourState<'_, F> {
+    /// Entry `row` of child `slot`, through implicit identity padding.
+    #[inline]
+    fn get(&self, slot: usize, row: usize) -> F {
+        match self {
+            Self::Level(level) => level.get(4 * row + slot),
+            Self::Folded(children) => children[slot].get(row),
         }
-        let children = children.map(IdentityPrefix::new);
-        Self { children }
+    }
+
+    /// Explicit entries child `slot` holds.
+    const fn explicit_len(&self, slot: usize) -> usize {
+        match self {
+            Self::Level(level) => level.values.len().saturating_sub(slot).div_ceil(4),
+            Self::Folded(children) => children[slot].values.len(),
+        }
     }
 
     /// Binds one parent variable in every child multilinear.
-    fn fold(&mut self, challenge: F, logical_len: usize) {
-        for child in &mut self.children {
-            child.fold(logical_len, challenge);
-        }
+    fn fold(&mut self, challenge: F) {
+        let children = core::array::from_fn(|slot| {
+            // Missing entries retain the constant-one suffix during interpolation.
+            let values = (0..self.explicit_len(slot).div_ceil(2))
+                .into_par_iter()
+                .map(|row| {
+                    interpolate_pair(
+                        [self.get(slot, 2 * row), self.get(slot, 2 * row + 1)],
+                        challenge,
+                    )
+                })
+                .collect();
+            IdentityPrefix::new(values)
+        });
+        *self = Self::Folded(children);
     }
 
     /// Reads the four terminal child claims after every parent variable is bound.
     fn children(&self) -> [F; 4] {
-        core::array::from_fn(|slot| self.children[slot].get(0))
+        core::array::from_fn(|slot| self.get(slot, 0))
     }
 }
 
 /// Per-tree states reduced by one shared radix-four sumcheck.
-pub(super) struct RadixFourBatch<F> {
+pub(super) struct RadixFourBatch<'a, F> {
     /// One folding state for each product tree.
-    states: Vec<RadixFourState<F>>,
+    states: Vec<RadixFourState<'a, F>>,
 }
 
-impl<F: Field> RadixFourBatch<F> {
-    /// Creates the batched states from one retained level per tree.
-    pub(super) fn new(layers: &[ProductLayers<F>], depth: usize, logical_len: usize) -> Self {
+impl<'a, F: Field> RadixFourBatch<'a, F> {
+    /// Creates the batched states over one retained level per tree, read in place.
+    pub(super) fn new(layers: &'a [ProductLayers<F>], depth: usize) -> Self {
         let states = layers
             .iter()
-            .map(|layers| layers.radix_four_state(depth, logical_len))
+            .map(|layers| RadixFourState::Level(&layers.layers[depth]))
             .collect();
         Self { states }
     }
@@ -171,42 +174,51 @@ impl<F: Field> RadixFourBatch<F> {
 
         // Node one is omitted because the running sum reconstructs it.
         let nodes = [0, 2, 3, 4, 5].map(F::interpolation_node);
-        let mut evaluations = [F::ZERO; ROUND_POLY_LEN];
+        let rows = logical_len / 2;
 
-        for row in 0..logical_len / 2 {
-            let eq_zero = equality[2 * row];
-            let eq_one = equality[2 * row + 1];
-
-            for (node_index, node) in nodes.into_iter().enumerate() {
-                let eq_value = interpolate_pair([eq_zero, eq_one], node);
-                let mut power = F::ONE;
-                let mut batched_product = F::ZERO;
-
-                for state in &self.states {
-                    let product = state
-                        .children
-                        .iter()
-                        .map(|child| {
-                            let zero = child.get(2 * row);
-                            let one = child.get(2 * row + 1);
-                            interpolate_pair([zero, one], node)
-                        })
-                        .product::<F>();
-                    batched_product += power * product;
-                    power *= batching;
+        // Each chunk of rows sums its own message; the chunks' messages are added at the end.
+        let partials = (0..rows.div_ceil(ROUND_CHUNK))
+            .into_par_iter()
+            .map(|chunk| {
+                let mut evaluations = [F::ZERO; ROUND_POLY_LEN];
+                for row in chunk * ROUND_CHUNK..((chunk + 1) * ROUND_CHUNK).min(rows) {
+                    let eq_zero = equality[2 * row];
+                    let eq_one = equality[2 * row + 1];
+                    for (node_index, node) in nodes.into_iter().enumerate() {
+                        let eq_value = interpolate_pair([eq_zero, eq_one], node);
+                        let mut power = F::ONE;
+                        let mut batched_product = F::ZERO;
+                        for state in &self.states {
+                            let product = (0..4)
+                                .map(|slot| {
+                                    let zero = state.get(slot, 2 * row);
+                                    let one = state.get(slot, 2 * row + 1);
+                                    interpolate_pair([zero, one], node)
+                                })
+                                .product::<F>();
+                            batched_product += power * product;
+                            power *= batching;
+                        }
+                        evaluations[node_index] += eq_value * batched_product;
+                    }
                 }
-
-                evaluations[node_index] += eq_value * batched_product;
-            }
-        }
-
-        evaluations
+                evaluations
+            })
+            .collect::<Vec<_>>();
+        partials
+            .into_iter()
+            .fold([F::ZERO; ROUND_POLY_LEN], |mut sum, partial| {
+                for (sum, partial) in sum.iter_mut().zip(partial) {
+                    *sum += partial;
+                }
+                sum
+            })
     }
 
     /// Binds one parent variable across every tree in the batch.
-    pub(super) fn fold(&mut self, challenge: F, logical_len: usize) {
+    pub(super) fn fold(&mut self, challenge: F) {
         for state in &mut self.states {
-            state.fold(challenge, logical_len);
+            state.fold(challenge);
         }
     }
 

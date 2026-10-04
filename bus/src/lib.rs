@@ -44,7 +44,7 @@ pub use plan::{
 };
 pub use product::{
     ProductGkrError, ProductGkrLayerProof, ProductGkrOutput, ProductGkrProof, ProductGkrRootShape,
-    ProductGkrShape, ProductGkrShapeError,
+    ProductGkrShape, ProductGkrShapeError, ProductTrees,
 };
 pub use ram::{
     MAX_RAM_BIT_WIDTH, MIN_RAM_ACCESS_COUNT, RamAccess, RamAir, RamBoundary, RamError, RamLayout,

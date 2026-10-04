@@ -327,30 +327,36 @@ where
         // Fingerprint weights are shared by every row and every declaration.
         let weights = challenges.fingerprint_weights();
         BusDirection::ALL.map(|direction| {
-            // Blocks are independent, and concatenating them restores the planned leaf order.
-            self.plan
-                .blocks(direction)
-                .iter()
-                .map(|block| {
-                    self.materialize_block(
-                        block,
-                        tables,
-                        preprocessed,
-                        periodic,
-                        public_values,
-                        &weights,
-                        challenges.offset,
-                    )
-                })
-                .collect::<Vec<_>>()
-                .concat()
+            // Blocks are independent and laid out back to back in the planned leaf order, so
+            // each one is written into its own run of the one vector the direction owns.
+            let blocks = self.plan.blocks(direction);
+            let mut leaves =
+                EF::zero_vec(blocks.iter().map(|block| 1usize << block.log_height).sum());
+            let mut rest = leaves.as_mut_slice();
+            for block in blocks {
+                let (run, tail) = rest.split_at_mut(1usize << block.log_height);
+                rest = tail;
+                self.materialize_block(
+                    run,
+                    block,
+                    tables,
+                    preprocessed,
+                    periodic,
+                    public_values,
+                    &weights,
+                    challenges.offset,
+                );
+            }
+            leaves
         })
     }
 
-    /// Materialize one aligned block from the exact tables committed by this proof.
+    /// Materialize one aligned block from the exact tables committed by this proof into `run`,
+    /// one leaf per row.
     #[allow(clippy::too_many_arguments)]
     fn materialize_block(
         &self,
+        run: &mut [EF],
         block: &BusBlock,
         tables: &[&Table<F>],
         preprocessed: &[Option<&Table<F>>],
@@ -358,7 +364,7 @@ where
         public_values: &[&[F]],
         weights: &[EF],
         offset: EF,
-    ) -> Vec<EF> {
+    ) {
         let air = block.owner.air;
         let interaction = &self.profiles[air].interactions()[block.owner.declaration];
 
@@ -391,46 +397,44 @@ where
         let height = 1usize << block.log_height;
 
         // Boolean rows stay in the base field, so every tuple term is a cheap mixed product.
-        (0..height)
-            .into_par_iter()
-            .map_init(
-                || {
-                    (
-                        F::zero_vec(main_width),
-                        F::zero_vec(fixed_width),
-                        F::zero_vec(periodic_width),
-                        Vec::new(),
+        debug_assert_eq!(run.len(), height);
+        run.par_iter_mut().enumerate().for_each_init(
+            || {
+                (
+                    F::zero_vec(main_width),
+                    F::zero_vec(fixed_width),
+                    F::zero_vec(periodic_width),
+                    Vec::new(),
+                )
+            },
+            |(main, fixed, periodic, scratch), (row, leaf)| {
+                // Unread columns keep their zero, which no planned expression names.
+                for (&index, column) in main_indices.iter().zip(&main_columns) {
+                    main[index] = column.value(row);
+                }
+                for (&index, column) in fixed_indices.iter().zip(&fixed_columns) {
+                    fixed[index] = column.value(row);
+                }
+                for (&index, column) in periodic_indices.iter().zip(&periodic_columns) {
+                    periodic[index] = column.value(row);
+                }
+                *leaf = factor
+                    .evaluate(
+                        scratch,
+                        BusEvaluation {
+                            main,
+                            preprocessed: fixed,
+                            public,
+                            periodic,
+                            is_first_row: F::from_bool(row == 0),
+                            is_last_row: F::from_bool(row + 1 == height),
+                            is_transition: F::from_bool(row + 1 < height),
+                        },
                     )
-                },
-                |(main, fixed, periodic, scratch), row| {
-                    // Unread columns keep their zero, which no planned expression names.
-                    for (&index, column) in main_indices.iter().zip(&main_columns) {
-                        main[index] = column.value(row);
-                    }
-                    for (&index, column) in fixed_indices.iter().zip(&fixed_columns) {
-                        fixed[index] = column.value(row);
-                    }
-                    for (&index, column) in periodic_indices.iter().zip(&periodic_columns) {
-                        periodic[index] = column.value(row);
-                    }
-                    factor
-                        .evaluate(
-                            scratch,
-                            BusEvaluation {
-                                main,
-                                preprocessed: fixed,
-                                public,
-                                periodic,
-                                is_first_row: F::from_bool(row == 0),
-                                is_last_row: F::from_bool(row + 1 == height),
-                                is_transition: F::from_bool(row + 1 < height),
-                            },
-                        )
-                        // Table widths are checked against every AIR before this loop starts.
-                        .expect("a checked bus plan resolves against its committed table")
-                },
-            )
-            .collect()
+                    // Table widths are checked against every AIR before this loop starts.
+                    .expect("a checked bus plan resolves against its committed table");
+            },
+        );
     }
 }
 
