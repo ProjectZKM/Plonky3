@@ -382,28 +382,32 @@ fn the_planes_hold_every_cell_and_its_repeat_last_successor() {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        let cell = |planes: &Planes<'_>, column: usize, row: usize| {
-            let [low, high] = planes.planes((row / SLICED_LANES) * trace.width + column);
+        let cell = |planes: &Planes<'_>, layout: PlaneLayout<'_>, column: usize, row: usize| {
+            let [low, high] =
+                planes.planes((row / SLICED_LANES) * layout.width + layout.slot(column));
             let bit = |plane: u64| (plane >> (row % SLICED_LANES)) & 1 == 1;
             Tower::from(Gf4::from_bool(bit(low)) + Gf4::from_bool(bit(high)) * Gf4::GENERATOR)
         };
+        // Only a successor column has successor planes, one per word.
+        assert_eq!(trace.successor_width, successor_columns.len());
+        assert_eq!(
+            trace.successors.len(),
+            successor_columns.len() * height / SLICED_LANES
+        );
         for (index, column) in columns.iter().enumerate() {
             for row in 0..height {
                 assert_eq!(
-                    cell(&trace.cells, index, row),
+                    cell(&trace.cells, trace.cell_layout(), index, row),
                     column[row],
                     "column {index}"
                 );
-                let successor = if successor_columns.contains(&index) {
-                    column[(row + 1).min(height - 1)]
-                } else {
-                    Tower::ZERO
-                };
-                assert_eq!(
-                    cell(&trace.successors, index, row),
-                    successor,
-                    "column {index}"
-                );
+                if successor_columns.contains(&index) {
+                    assert_eq!(
+                        cell(&trace.successors, trace.successor_layout(), index, row),
+                        column[(row + 1).min(height - 1)],
+                        "column {index}"
+                    );
+                }
             }
         }
     });
@@ -530,7 +534,13 @@ fn plane_fold_five_challenges_matches_explicit_corner_sum() {
                 let mut actual = vec![Tower::ZERO; SLICED_LANES];
                 for (column, column_values) in columns.iter().enumerate().take(trace.width) {
                     for word in 0..words {
-                        fold.fold_word(&trace.cells, column, word, &mut actual);
+                        fold.fold_word(
+                            &trace.cells,
+                            trace.cell_layout(),
+                            column,
+                            word,
+                            &mut actual,
+                        );
                         for row in 0..SLICED_LANES {
                             let mut expected = Tower::ZERO;
                             for corner in 0..1 << prefix.len() {
@@ -599,6 +609,8 @@ fn plane_fold_trace_fixture(
             width,
             cells: Planes::Pairs(cells),
             successors: Planes::Pairs(vec![]),
+            successor_width: 0,
+            successor_slots: vec![],
             boundary: vec![],
             rounds: 0,
         },
@@ -621,6 +633,8 @@ fn low_plane_twin(trace: &SlicedTrace<'_>) -> SlicedTrace<'static> {
         width: trace.width,
         cells: Planes::Low(Cow::Owned(cells.iter().map(|&[low, _]| low).collect())),
         successors: Planes::Low(Cow::Owned(vec![])),
+        successor_width: 0,
+        successor_slots: vec![],
         boundary: trace.boundary.clone(),
         rounds: trace.rounds,
     }
@@ -676,7 +690,13 @@ fn plane_fold_reference_covers_prefixes_widths_and_special_challenges() {
                         let mut actual = vec![Tower::ZERO; SLICED_LANES];
                         for column in 0..width {
                             for word in 0..words {
-                                fold.fold_word(&trace.cells, column, word, &mut actual);
+                                fold.fold_word(
+                                    &trace.cells,
+                                    trace.cell_layout(),
+                                    column,
+                                    word,
+                                    &mut actual,
+                                );
                                 for row in 0..SLICED_LANES {
                                     let mut expected = Tower::ZERO;
                                     for corner in 0..1 << prefix_len {
@@ -3327,18 +3347,21 @@ fn a_reused_tile_reads_the_plane_fold_of_every_row_pair() {
             cells[(corner * words + word) * width + column][1] |= 1 << lane;
         }
         trace.successors = successor_planes(&trace);
+        trace.successor_width = trace.width;
+        trace.successor_slots = (0..trace.width).collect();
 
         let tower = PlaneFold::<Tower>::new::<Gf4, Tower>(&trace, &challenges);
         let poly = PlaneFold::<Ghash128>::new::<Gf4, Tower>(&trace, &challenges);
-        let fold_pair = |planes: &Planes<'_>, column: usize, pair: usize| {
-            let mut halves = [[Tower::ZERO; SLICED_LANES]; ROW_HALVES];
-            let mut poly_halves = [[Ghash128::ZERO; SLICED_LANES]; ROW_HALVES];
-            for (half, word) in [pair, pair + pairs].into_iter().enumerate() {
-                tower.fold_word(planes, column, word, &mut halves[half]);
-                poly.fold_word(planes, column, word, &mut poly_halves[half]);
-            }
-            (halves, poly_halves)
-        };
+        let fold_pair =
+            |planes: &Planes<'_>, layout: PlaneLayout<'_>, column: usize, pair: usize| {
+                let mut halves = [[Tower::ZERO; SLICED_LANES]; ROW_HALVES];
+                let mut poly_halves = [[Ghash128::ZERO; SLICED_LANES]; ROW_HALVES];
+                for (half, word) in [pair, pair + pairs].into_iter().enumerate() {
+                    tower.fold_word(planes, layout, column, word, &mut halves[half]);
+                    poly.fold_word(planes, layout, column, word, &mut poly_halves[half]);
+                }
+                (halves, poly_halves)
+            };
         for next_columns in [vec![], vec![0..width / 2, width / 2..width]] {
             let mut tower_tiles = [1, 2, 4, 8, SLICED_LANES]
                 .map(|tile_lanes| RowTile::with_lanes(tower.corners, width, tile_lanes));
@@ -3365,8 +3388,8 @@ fn a_reused_tile_reads_the_plane_fold_of_every_row_pair() {
                 let (cells, successors): (Vec<_>, Vec<_>) = (0..width)
                     .map(|column| {
                         (
-                            fold_pair(&trace.cells, column, pair),
-                            fold_pair(&trace.successors, column, pair),
+                            fold_pair(&trace.cells, trace.cell_layout(), column, pair),
+                            fold_pair(&trace.successors, trace.successor_layout(), column, pair),
                         )
                     })
                     .unzip();
@@ -3447,7 +3470,13 @@ fn folded_columns_match_the_plane_fold_across_block_boundaries() {
                             .iter()
                             .enumerate()
                         {
-                            fold.fold_word(&trace.cells, column, word, &mut expected);
+                            fold.fold_word(
+                                &trace.cells,
+                                trace.cell_layout(),
+                                column,
+                                word,
+                                &mut expected,
+                            );
                             assert_eq!(*values, expected, "column {column}, word {word}, {case}");
                         }
                     }
@@ -3540,8 +3569,14 @@ fn a_low_plane_reads_like_its_plane_pairs() {
         let mut actual = [Ghash128::ZERO; SLICED_LANES];
         for column in 0..width {
             for word in 0..fold_pairs.words {
-                fold_pairs.fold_word(&pairs.cells, column, word, &mut expected);
-                fold_low.fold_word(&low.cells, column, word, &mut actual);
+                fold_pairs.fold_word(
+                    &pairs.cells,
+                    pairs.cell_layout(),
+                    column,
+                    word,
+                    &mut expected,
+                );
+                fold_low.fold_word(&low.cells, low.cell_layout(), column, word, &mut actual);
                 assert_eq!(actual, expected, "column {column}, word {word}, {case}");
             }
         }
