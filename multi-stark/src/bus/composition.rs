@@ -7,11 +7,14 @@
 //! The family runs inside the zerocheck sumcheck, over the same cube and challenges.
 //! Its terminal expression is checked against the same openings the AIR constraints read.
 //!
-//! Round zero lifts every source column into the challenge field before any folding.
+//! A packed Boolean column is read where its table holds it for an AIR's first
+//! [`BIT_ROUNDS`] active rounds: after `j` folds a value is a sum of `2^j` source bits, each
+//! weighted by the equality polynomial of the challenges folded so far, read through tables of
+//! the weights' subset sums. Only at the last of those folds is the column written out, at
+//! `2^-BIT_ROUNDS` of its height; every fold after that releases the half it leaves.
 //!
-//! A degree-four extension therefore holds four times the trace for the whole reduction.
-//!
-//! The batched zerocheck avoids that by folding packed base-field rows in its first round.
+//! A dense column, a periodic one and the selectors are lifted into the challenge field as
+//! they always were. A table shorter than the cube holds nothing while it is dormant.
 
 use alloc::vec::Vec;
 
@@ -21,9 +24,114 @@ use p3_maybe_rayon::prelude::*;
 use p3_multilinear_util::point::Point;
 use p3_multilinear_util::poly::Poly;
 use p3_sumcheck::generic_degree::{RoundPolyInterpolator, RoundProver};
-use p3_sumcheck::layout::Table;
+use p3_sumcheck::layout::{ColumnView, Table};
 
 use crate::bus::BusContext;
+
+/// Active rounds an AIR's packed Boolean columns are read as bits before they are written out.
+const BIT_ROUNDS: usize = 4;
+
+/// Bits one subset-sum table covers.
+const TABLE_BITS: usize = 8;
+
+/// One source column of a bus term, as the rounds read it.
+enum Source<'a, F: Field, EF> {
+    /// A packed Boolean column, read through the challenges folded into it so far.
+    Bits(ColumnView<'a, F>),
+    /// The column folded into the challenge field.
+    Dense(Poly<EF>),
+}
+
+/// The challenges an AIR's bit columns have absorbed, as subset sums of their equality weights.
+///
+/// After `j` folds, the value at `i` of a column of current length `L` reads the `2^j` source
+/// bits at `b L + i`, the first challenge on the most significant bit of `b`. Table `t` holds,
+/// for every byte `m`, the sum of the weights of the offsets `8 t + k` whose bit `k` of `m` is
+/// set.
+struct BitFolds<EF> {
+    /// Challenges folded so far, first bound first.
+    challenges: Vec<EF>,
+    /// One subset-sum table per eight offsets.
+    tables: Vec<[EF; 1 << TABLE_BITS]>,
+}
+
+impl<EF: Field> BitFolds<EF> {
+    /// No challenge yet: a value is its bit.
+    fn new() -> Self {
+        let mut folds = Self {
+            challenges: Vec::new(),
+            tables: Vec::new(),
+        };
+        folds.rebuild();
+        folds
+    }
+
+    /// Absorb one more challenge.
+    fn push(&mut self, challenge: EF) {
+        self.challenges.push(challenge);
+        self.rebuild();
+    }
+
+    /// Rebuild the subset-sum tables for the challenges absorbed so far.
+    fn rebuild(&mut self) {
+        let weights = Point::new(self.challenges.clone()).equality_weights_msb();
+        self.tables = weights
+            .chunks(TABLE_BITS)
+            .map(|chunk| {
+                let mut table = [EF::ZERO; 1 << TABLE_BITS];
+                for mask in 1..1usize << chunk.len() {
+                    let low = mask.trailing_zeros() as usize;
+                    table[mask] = table[mask & (mask - 1)] + chunk[low];
+                }
+                table
+            })
+            .collect();
+    }
+
+    /// The value at `i` of the bit column `column`, at current length `len`.
+    #[inline]
+    fn value<F: Field>(&self, column: ColumnView<'_, F>, len: usize, i: usize) -> EF {
+        let mut value = EF::ZERO;
+        for (chunk, table) in self.tables.iter().enumerate() {
+            let offsets = (1usize << self.challenges.len()).min((chunk + 1) * TABLE_BITS);
+            let mut mask = 0usize;
+            for (k, offset) in (chunk * TABLE_BITS..offsets).enumerate() {
+                mask |= usize::from(column.value(offset * len + i) == F::ONE) << k;
+            }
+            value += table[mask];
+        }
+        value
+    }
+}
+
+impl<F: Field, EF: ExtensionField<F>> Source<'_, F, EF> {
+    /// The column at `i`, of current length `len`.
+    #[inline]
+    fn value(&self, folds: &BitFolds<EF>, len: usize, i: usize) -> EF {
+        match self {
+            Self::Bits(column) => folds.value(*column, len, i),
+            Self::Dense(poly) => poly.as_slice()[i],
+        }
+    }
+
+    /// A column read in place when it holds bits, lifted into the challenge field otherwise.
+    fn of(column: ColumnView<'_, F>) -> Source<'_, F, EF> {
+        match column {
+            ColumnView::Boolean { .. } => Source::Bits(column),
+            ColumnView::Dense(_) => {
+                Source::Dense(Poly::new(column.values().map(Into::into).collect()))
+            }
+        }
+    }
+}
+
+/// Fold a dense polynomial's leading variable and give back the half it leaves.
+fn fold_released<EF: Field>(poly: &mut Poly<EF>, challenge: EF) {
+    poly.fix_prefix_var_mut(challenge);
+    let mut values = core::mem::replace(poly, Poly::new(alloc::vec![EF::ZERO])).into_evals();
+    values.shrink_to_fit();
+    *poly = Poly::new(values);
+}
 
 /// Prover state for the mixed-height bus composition polynomial.
 pub(crate) struct BusCompositionProver<'a, F: Field, EF: ExtensionField<F>> {
@@ -34,7 +142,7 @@ pub(crate) struct BusCompositionProver<'a, F: Field, EF: ExtensionField<F>> {
     /// Random tuple-fingerprint shift.
     offset: EF,
     /// Folded source polynomials grouped once per AIR.
-    airs: Vec<AirState<F, EF>>,
+    airs: Vec<AirState<'a, F, EF>>,
     /// Maximum round degree, derived once from the public plan.
     degree: usize,
     /// Number of global variables already bound.
@@ -54,17 +162,17 @@ struct CompositionTerm<EF> {
 }
 
 /// Folded source multilinears shared by every bus term owned by one AIR.
-struct AirState<F: Field, EF: ExtensionField<F>> {
-    /// Polynomials of the main columns this AIR's declarations read.
-    main: Vec<Poly<EF>>,
+struct AirState<'a, F: Field, EF: ExtensionField<F>> {
+    /// The main columns this AIR's declarations read.
+    main: Vec<Source<'a, F, EF>>,
     /// Column index of each of those, and the declared width they are placed into.
     main_layout: (Vec<usize>, usize),
-    /// Polynomials of the preprocessed columns this AIR's declarations read.
-    preprocessed: Vec<Poly<EF>>,
+    /// The preprocessed columns this AIR's declarations read.
+    preprocessed: Vec<Source<'a, F, EF>>,
     /// Column index of each of those, and the declared width they are placed into.
     preprocessed_layout: (Vec<usize>, usize),
-    /// Polynomials of the periodic columns this AIR's declarations read, at full height.
-    periodic: Vec<Poly<EF>>,
+    /// The periodic columns this AIR's declarations read, at full height.
+    periodic: Vec<Source<'a, F, EF>>,
     /// Column index of each of those, and the declared width they are placed into.
     periodic_layout: (Vec<usize>, usize),
     /// First-row, last-row, and transition selector polynomials.
@@ -79,9 +187,13 @@ struct AirState<F: Field, EF: ExtensionField<F>> {
     prefix_evaluation: EF,
     /// Public inputs read by this block's symbolic expressions.
     public_values: Vec<F>,
+    /// The challenges the bit columns have absorbed, while any remains bits.
+    folds: BitFolds<EF>,
+    /// Active folds this AIR's columns have taken.
+    active_folds: usize,
 }
 
-impl<F, EF> AirState<F, EF>
+impl<F, EF> AirState<'_, F, EF>
 where
     F: Field,
     EF: ExtensionField<F>,
@@ -114,6 +226,7 @@ where
             })
             .collect::<Vec<_>>();
 
+        let folds = &self.folds;
         let main_polys = &self.main;
         let (main_indices, main_width) = (&self.main_layout.0, self.main_layout.1);
         let fixed_polys = &self.preprocessed;
@@ -139,13 +252,13 @@ where
                 |(mut claims, mut main, mut preprocessed, mut periodic, mut scratch), row| {
                     // Unread columns keep their zero, which no planned expression names.
                     for (&index, column) in main_indices.iter().zip(main_polys) {
-                        main[index] = column.as_slice()[row];
+                        main[index] = column.value(folds, height, row);
                     }
                     for (&index, column) in fixed_indices.iter().zip(fixed_polys) {
-                        preprocessed[index] = column.as_slice()[row];
+                        preprocessed[index] = column.value(folds, height, row);
                     }
                     for (&index, column) in periodic_indices.iter().zip(periodic_polys) {
-                        periodic[index] = column.as_slice()[row];
+                        periodic[index] = column.value(folds, height, row);
                     }
                     let evaluation = BusEvaluation {
                         main: &main,
@@ -180,6 +293,51 @@ where
     }
 }
 
+impl<F, EF> AirState<'_, F, EF>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    /// Bind this AIR's leading row variable.
+    ///
+    /// Dense columns fold and give back the half they leave. Bit columns absorb the challenge,
+    /// and at the last of their bit rounds are written out at the length the folds left.
+    fn fold(&mut self, challenge: EF) {
+        let len = self.equality.as_slice().len() / 2;
+        for poly in self
+            .selectors
+            .iter_mut()
+            .chain(core::iter::once(&mut self.equality))
+        {
+            fold_released(poly, challenge);
+        }
+        self.folds.push(challenge);
+        self.active_folds += 1;
+        let write_out = self.active_folds == BIT_ROUNDS;
+        let folds = &self.folds;
+        for column in self
+            .main
+            .iter_mut()
+            .chain(&mut self.preprocessed)
+            .chain(&mut self.periodic)
+        {
+            match column {
+                Source::Dense(poly) => fold_released(poly, challenge),
+                Source::Bits(view) if write_out => {
+                    let view = *view;
+                    *column = Source::Dense(Poly::new(
+                        (0..len)
+                            .into_par_iter()
+                            .map(|i| folds.value(view, len, i))
+                            .collect(),
+                    ));
+                }
+                Source::Bits(_) => {}
+            }
+        }
+    }
+}
+
 impl<'a, F, EF> BusCompositionProver<'a, F, EF>
 where
     F: Field,
@@ -195,8 +353,8 @@ where
     pub(crate) fn new(
         context: &'a BusContext<F, EF>,
         output: &BusReductionOutput<EF>,
-        tables: &[&Table<F>],
-        preprocessed: &[Option<&Table<F>>],
+        tables: &[&'a Table<F>],
+        preprocessed: &[Option<&'a Table<F>>],
         periodic: &[Option<Table<F>>],
         public_values: &[&[F]],
         direction_challenge: EF,
@@ -220,28 +378,21 @@ where
                 let coefficient = direction_weight * block_weight;
                 let state = airs[air].get_or_insert_with(|| {
                     // Column views read a packed Boolean table without expanding it first.
-                    // Only the columns a declaration reads are lifted, and then folded.
+                    // Only the columns a declaration reads are taken, and a bit column is read
+                    // where it lies until its first rounds are folded.
                     let main_columns = context.main_columns(air);
                     let main = main_columns
                         .iter()
-                        .map(|&column| {
-                            Poly::new(
-                                tables[air]
-                                    .column(column)
-                                    .values()
-                                    .map(Into::into)
-                                    .collect(),
-                            )
-                        })
+                        .map(|&column| Source::of(tables[air].column(column)))
                         .collect::<Vec<_>>();
                     let fixed_columns = context.preprocessed_columns(air);
                     let fixed_width = preprocessed[air].map_or(0, Table::num_polys);
                     let preprocessed = preprocessed[air]
                         .iter()
-                        .flat_map(|table| {
-                            fixed_columns.iter().map(|&column| {
-                                Poly::new(table.column(column).values().map(Into::into).collect())
-                            })
+                        .flat_map(|&table| {
+                            fixed_columns
+                                .iter()
+                                .map(move |&column| Source::of(table.column(column)))
                         })
                         .collect::<Vec<_>>();
                     // Periodic columns fold exactly like committed ones.
@@ -251,7 +402,9 @@ where
                         .iter()
                         .flat_map(|table| {
                             periodic_columns.iter().map(|&column| {
-                                Poly::new(table.column(column).values().map(Into::into).collect())
+                                Source::Dense(Poly::new(
+                                    table.column(column).values().map(Into::into).collect(),
+                                ))
                             })
                         })
                         .collect::<Vec<_>>();
@@ -282,6 +435,8 @@ where
                         unused_prefix: num_variables - share.row_variables,
                         prefix_evaluation: EF::ONE,
                         public_values: public_values[air].to_vec(),
+                        folds: BitFolds::new(),
+                        active_folds: 0,
                     }
                 });
                 // Row geometry is captured from the first share and reused by every later one.
@@ -318,7 +473,7 @@ where
         }
     }
 
-    fn evaluate_air(&self, air: &AirState<F, EF>, node: EF) -> EF {
+    fn evaluate_air(&self, air: &AirState<'_, F, EF>, node: EF) -> EF {
         // Slot placement is settled once per term, outside the row loop below.
         let factors = air
             .terms
@@ -337,7 +492,8 @@ where
             .collect::<Vec<_>>();
 
         // Interpolate shared columns once, then evaluate every declaration owned by this AIR.
-        let half = air.equality.as_slice().len() / 2;
+        let len = air.equality.as_slice().len();
+        let half = len / 2;
         (0..half)
             .into_par_iter()
             .map_init(
@@ -354,17 +510,20 @@ where
                         let values = poly.as_slice();
                         values[row] + (values[row + half] - values[row]) * node
                     };
+                    let source = |column: &Source<'_, F, EF>| {
+                        let low = column.value(&air.folds, len, row);
+                        low + (column.value(&air.folds, len, row + half) - low) * node
+                    };
                     // Unread columns keep their zero, which no planned expression names.
-                    for (&index, polynomial) in air.main_layout.0.iter().zip(&air.main) {
-                        main[index] = interpolate(polynomial);
+                    for (&index, column) in air.main_layout.0.iter().zip(&air.main) {
+                        main[index] = source(column);
                     }
-                    for (&index, polynomial) in
-                        air.preprocessed_layout.0.iter().zip(&air.preprocessed)
+                    for (&index, column) in air.preprocessed_layout.0.iter().zip(&air.preprocessed)
                     {
-                        prep[index] = interpolate(polynomial);
+                        prep[index] = source(column);
                     }
-                    for (&index, polynomial) in air.periodic_layout.0.iter().zip(&air.periodic) {
-                        periodic[index] = interpolate(polynomial);
+                    for (&index, column) in air.periodic_layout.0.iter().zip(&air.periodic) {
+                        periodic[index] = source(column);
                     }
                     let evaluation = BusEvaluation {
                         main,
@@ -404,16 +563,7 @@ where
                 air.prefix_evaluation *= challenge;
                 continue;
             }
-            for polynomial in air
-                .main
-                .iter_mut()
-                .chain(&mut air.preprocessed)
-                .chain(&mut air.periodic)
-                .chain(&mut air.selectors)
-                .chain(core::iter::once(&mut air.equality))
-            {
-                polynomial.fix_prefix_var_mut(challenge);
-            }
+            air.fold(challenge);
         }
         self.round += 1;
     }
@@ -486,6 +636,43 @@ mod tests {
             profile.interactions()[0].factor_degree_multiple_with_transition(1),
             2
         );
+    }
+
+    #[test]
+    fn bit_columns_read_what_their_dense_folds_hold() {
+        use p3_matrix::dense::RowMajorMatrix;
+        use p3_multilinear_util::poly::Poly;
+        use p3_sumcheck::layout::Table;
+        use rand::rngs::SmallRng;
+        use rand::{RngExt, SeedableRng};
+
+        use super::{BitFolds, Source};
+
+        type F = BinaryField128;
+        let mut rng = SmallRng::seed_from_u64(7);
+        let height = 1 << 7;
+        let cells: alloc::vec::Vec<F> = (0..2 * height)
+            .map(|_| F::from_bool(rng.random::<bool>()))
+            .collect();
+        let table = Table::from_boolean_rows(&RowMajorMatrix::new(cells, 2)).unwrap();
+        for column in 0..2 {
+            let view = table.column(column);
+            let bits: Source<'_, F, F> = Source::of(view);
+            assert!(matches!(bits, Source::Bits(_)));
+            let mut dense = Poly::new(view.values().collect::<alloc::vec::Vec<_>>());
+            let mut folds = BitFolds::new();
+            let mut len = height;
+            // Past the write-out round too, so a column read as bits that long still agrees.
+            for _ in 0..6 {
+                for i in 0..len {
+                    assert_eq!(bits.value(&folds, len, i), dense.as_slice()[i]);
+                }
+                let challenge = F::from_u64(rng.random::<u64>());
+                dense.fix_prefix_var_mut(challenge);
+                folds.push(challenge);
+                len /= 2;
+            }
+        }
     }
 
     #[test]
