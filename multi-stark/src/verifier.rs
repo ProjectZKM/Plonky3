@@ -7,7 +7,7 @@ use p3_air::{BoundaryIoError, boundary};
 use p3_challenger::{CanObserve, CanSampleUniformBits, FieldChallenger, GrindingChallenger};
 use p3_commit::MultilinearPcs;
 use p3_lookup::TraceWindow;
-use p3_sumcheck::{OpeningEvals, PrescribedPointPcs};
+use p3_sumcheck::{OpeningEvals, PairCheck, PrescribedPointPcs};
 use thiserror::Error;
 
 use crate::VerifierInstances;
@@ -311,7 +311,8 @@ where
             pow_bits,
             indexed_plan.is_some(),
             bus.is_some(),
-        ),
+        )
+        .with_pair_openings(config.pair_openings()),
     );
 
     // 1. Replay the reusable batched preprocessed commitment before any challenge
@@ -466,51 +467,86 @@ where
     let main_schedule = instances.main_schedule(indexed_plan.as_ref(), |role, rows| {
         trace_suffix(points.at(role), rows)
     });
-    let main_evals = match transcript.main_opening(|challenger| {
-        config.pcs().verify_at(
-            &proof.commitment,
-            &proof.opening,
-            main_schedule.protocol(),
-            &main_schedule.against(),
-            challenger,
-        )
-    }) {
-        Ok(evals) => evals,
-        // Nothing below can change this verdict, so the preprocessed opening never runs.
-        Err(error) => {
-            transcript.abort();
-            return Err(VerificationError::Opening(error));
-        }
-    };
-
-    // 9. Open the preprocessed tables at every point a claim was left at.
-    // The owned batches are kept local so the closing check can borrow them.
     let preprocessed_schedule = instances
         .preprocessed_schedule(indexed_plan.as_ref(), |role, rows| {
             trace_suffix(points.at(role), rows)
         });
-    let opened_preprocessed = transcript.preprocessed_opening(|challenger| {
+    let main_against = main_schedule.against();
+    let preprocessed_against = preprocessed_schedule.against();
+
+    // 8 and 9 as one step: both traces under one opening, the main side first.
+    let (main_evals, preprocessed_evals) = if transcript.pairs() {
         let commitment = preprocessed_commitment
             .expect("a described preprocessed commitment is checked before the replay");
         let opening = proof
             .preprocessed_opening
             .as_ref()
             .expect("missing preprocessed opening rejected before verification");
-        config.preprocessed_pcs().verify_at(
-            commitment,
-            opening,
-            preprocessed_schedule.protocol(),
-            &preprocessed_schedule.against(),
-            challenger,
-        )
-    });
+        let opened = transcript.pair_opening(|challenger| {
+            config.pcs().verify_pair_at(
+                config.preprocessed_pcs(),
+                PairCheck {
+                    commitment: &proof.commitment,
+                    proof: &proof.opening,
+                    protocol: main_schedule.protocol(),
+                    points: &main_against,
+                },
+                PairCheck {
+                    commitment,
+                    proof: opening,
+                    protocol: preprocessed_schedule.protocol(),
+                    points: &preprocessed_against,
+                },
+                challenger,
+            )
+        });
+        transcript.finish();
+        let (main_evals, preprocessed_evals) = opened.map_err(VerificationError::Opening)?;
+        (main_evals, Some(preprocessed_evals))
+    } else {
+        let main_evals = match transcript.main_opening(|challenger| {
+            config.pcs().verify_at(
+                &proof.commitment,
+                &proof.opening,
+                main_schedule.protocol(),
+                &main_against,
+                challenger,
+            )
+        }) {
+            Ok(evals) => evals,
+            // Nothing below can change this verdict, so the preprocessed opening never runs.
+            Err(error) => {
+                transcript.abort();
+                return Err(VerificationError::Opening(error));
+            }
+        };
 
-    // Every described step has now been replayed.
-    transcript.finish();
+        // 9. Open the preprocessed tables at every point a claim was left at.
+        // The owned batches are kept local so the closing check can borrow them.
+        let opened_preprocessed = transcript.preprocessed_opening(|challenger| {
+            let commitment = preprocessed_commitment
+                .expect("a described preprocessed commitment is checked before the replay");
+            let opening = proof
+                .preprocessed_opening
+                .as_ref()
+                .expect("missing preprocessed opening rejected before verification");
+            config.preprocessed_pcs().verify_at(
+                commitment,
+                opening,
+                preprocessed_schedule.protocol(),
+                &preprocessed_against,
+                challenger,
+            )
+        });
 
-    let preprocessed_evals = opened_preprocessed
-        .transpose()
-        .map_err(VerificationError::Opening)?;
+        // Every described step has now been replayed.
+        transcript.finish();
+
+        let preprocessed_evals = opened_preprocessed
+            .transpose()
+            .map_err(VerificationError::Opening)?;
+        (main_evals, preprocessed_evals)
+    };
 
     let preprocessed_next_columns = instances.preprocessed_next_columns();
     let next_columns = instances.next_columns();

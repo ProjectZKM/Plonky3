@@ -149,6 +149,39 @@ impl<T: Send + Sync + Clone, P> SharedProofOpening<T, P> {
     }
 }
 
+/// Row `query` of a batch of openings, combined by `coefficients`.
+///
+/// Every opening holds the same positions of commitments of one shape, so
+/// row `query` of each is the same coset of its codeword, and the batched
+/// codeword's coset is their combination.
+///
+/// # Panics
+///
+/// Panics unless there is one coefficient per opening and the rows agree in length.
+pub(crate) fn combined_row<F: p3_field::Field, P>(
+    openings: &[SharedProofOpening<F, P>],
+    coefficients: &[F],
+    query: usize,
+) -> Vec<F> {
+    assert_eq!(
+        openings.len(),
+        coefficients.len(),
+        "one coefficient per opening"
+    );
+    let width = openings
+        .first()
+        .map_or(0, |opening| opening.rows[query].len());
+    let mut row = vec![F::ZERO; width];
+    for (opening, &coefficient) in openings.iter().zip(coefficients) {
+        let opened = &opening.rows[query];
+        assert_eq!(opened.len(), width, "batched rows have one width");
+        for (acc, &value) in row.iter_mut().zip(opened) {
+            *acc += coefficient * value;
+        }
+    }
+    row
+}
+
 /// Field-tagged shared-proof opening for one queried oracle.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum QueryOpenings<F, EF, P> {
@@ -156,6 +189,10 @@ pub enum QueryOpenings<F, EF, P> {
     Base(SharedProofOpening<F, P>),
     /// Extension-field rows (every folded round commitment).
     Extension(SharedProofOpening<EF, P>),
+    /// Base-field rows of several initial commitments opened together, one
+    /// opening per commitment at the same positions, combined by the
+    /// batching coefficients.
+    Batched(Vec<SharedProofOpening<F, P>>),
 }
 
 impl<F: Clone + Send + Sync, EF, MT: Mmcs<F>> WhirProof<F, EF, MT> {

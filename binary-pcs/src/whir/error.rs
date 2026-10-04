@@ -109,6 +109,19 @@ pub enum BooleanWhirError {
     /// A surviving claim was not closed by the value the commitment opened.
     #[error("a surviving claim does not match the opened value")]
     SurvivingClaim,
+
+    /// A proof discharges its claim another way than the verifier was asked to check.
+    #[error("the proof's opening is not the kind this check reads")]
+    OpeningKind,
+
+    /// A pair's two commitments are not words of one code.
+    #[error("a pair opening needs one code: witnesses of {first} and {second} variables")]
+    PairShape {
+        /// Variables of the first side's witness.
+        first: usize,
+        /// Variables of the second side's witness.
+        second: usize,
+    },
 }
 
 /// Why a schedule or a proof was refused by the ceiling.

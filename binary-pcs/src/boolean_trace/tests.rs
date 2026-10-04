@@ -968,13 +968,14 @@ fn optimized_security_charges_batches_and_column_coordinates() {
 }
 
 #[test]
-fn optimized_security_rejects_a_protocol_with_the_wrong_stacked_arity() {
+fn optimized_security_rejects_a_protocol_stacking_past_the_commitment() {
+    // Committed: 8 rows by 3 columns stacks to 10 variables; the protocol's 5 columns to 11.
     let committed_shape = TableShape::new(8, 3);
     let scheme = pcs(&[committed_shape]);
-    let protocol_shape = TableShape::new(8, 2);
+    let protocol_shape = TableShape::new(8, 5);
     let protocol = OpeningProtocol::new(vec![TableSpec::new(
         protocol_shape,
-        vec![OpeningBatch::new(vec![0, 1], Vec::new())],
+        vec![OpeningBatch::new(vec![0, 1, 2, 3, 4], Vec::new())],
     )]);
 
     let security = <BooleanTracePcs<EF, MyMmcs, MyMmcs> as PrescribedPointPcs<

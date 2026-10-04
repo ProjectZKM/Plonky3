@@ -132,6 +132,17 @@ pub enum VerifierError {
     #[error("Proof is missing the final polynomial evaluations")]
     MissingFinalPoly,
 
+    /// The grind guarding a pair opening's batching draw fell short.
+    #[error("pair opening: batching grinding witness clears fewer than {bits} bits")]
+    InvalidPairPowWitness {
+        /// Difficulty the witness must meet.
+        bits: usize,
+    },
+
+    /// A pair opening at zero batching difficulty carries a witness other than zero.
+    #[error("pair opening: non-canonical batching witness at zero difficulty")]
+    NonCanonicalPairPowWitness,
+
     /// Final polynomial has the wrong number of evaluations.
     #[error("Final polynomial length mismatch: expected {expected}, got {actual}")]
     FinalPolyLengthMismatch { expected: usize, actual: usize },

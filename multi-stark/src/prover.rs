@@ -9,7 +9,7 @@ use p3_commit::MultilinearPcs;
 use p3_field::PrimeCharacteristicRing;
 use p3_field::{ExtensionField, Field};
 use p3_lookup::InteractionSymbolicBuilder;
-use p3_sumcheck::{OpeningEvals, PrescribedPointPcs};
+use p3_sumcheck::{OpeningEvals, PairOpening, PrescribedPointPcs};
 
 use crate::ProverInstances;
 use crate::backend::{GenericBackend, ZerocheckBackend};
@@ -364,7 +364,8 @@ where
             pow_bits,
             indexed_plan.is_some(),
             bus.is_some(),
-        ),
+        )
+        .with_pair_openings(config.pair_openings()),
     );
 
     // 1. Bind the reusable batched preprocessed commitment before any challenge depends on it.
@@ -607,43 +608,27 @@ where
     // The zerocheck folded each of those columns down to exactly that value, so the scheme is
     // handed them rather than left to evaluate the table again.
     let points = RunPoints::new(&point, indexed_output.as_ref());
-    let opening = transcript.main_opening(|challenger| {
-        let schedule = instances.main_schedule(indexed_plan.as_ref(), |role, rows| {
-            trace_suffix(points.at(role), rows)
-        });
-        let mut known = alloc::vec![None; schedule.protocol().num_openings()];
-        let first_batches = schedule.first_batch_per_table();
-        debug_assert_eq!(
-            (zerocheck_proof.local.len(), zerocheck_proof.next.len()),
-            (first_batches.len(), first_batches.len()),
-            "the zerocheck opens every committed table once"
-        );
-        for ((batch, local), next) in first_batches
-            .into_iter()
-            .zip(zerocheck_proof.local)
-            .zip(zerocheck_proof.next)
-        {
-            known[batch] = Some(OpeningEvals::new(local, next));
-        }
-        config.pcs().open_at_known(
-            prover_data,
-            schedule.protocol(),
-            &schedule.against(),
-            &known,
-            challenger,
-        )
+    let main_schedule = instances.main_schedule(indexed_plan.as_ref(), |role, rows| {
+        trace_suffix(points.at(role), rows)
     });
+    let mut known = alloc::vec![None; main_schedule.protocol().num_openings()];
+    let first_batches = main_schedule.first_batch_per_table();
+    debug_assert_eq!(
+        (zerocheck_proof.local.len(), zerocheck_proof.next.len()),
+        (first_batches.len(), first_batches.len()),
+        "the zerocheck opens every committed table once"
+    );
+    for ((batch, local), next) in first_batches
+        .into_iter()
+        .zip(zerocheck_proof.local)
+        .zip(zerocheck_proof.next)
+    {
+        known[batch] = Some(OpeningEvals::new(local, next));
+    }
+    let main_against = main_schedule.against();
 
-    let opening = opening
-        .inspect_err(|_| transcript.abort())
-        .map_err(|source| ProvingError::Pcs {
-            phase: "main opening",
-            source,
-        })?;
-
-    // 9. Open each non-empty preprocessed table at every point a claim was left at.
-    // The setup commitment data is reused rather than rebuilt.
-    let preprocessed_opening = transcript.preprocessed_opening(|challenger| {
+    // 8 and 9 as one step: both traces under one opening, the main side first.
+    let (opening, preprocessed_opening) = if transcript.pairs() {
         let preprocessed = proving_key
             .preprocessed
             .as_ref()
@@ -651,21 +636,79 @@ where
         let schedule = instances.preprocessed_schedule(indexed_plan.as_ref(), |role, rows| {
             trace_suffix(points.at(role), rows)
         });
-        config.preprocessed_pcs().open_at(
-            preprocessed.prover_data.clone(),
-            schedule.protocol(),
-            &schedule.against(),
-            challenger,
-        )
-    });
+        let against = schedule.against();
+        let none = alloc::vec![None; schedule.protocol().num_openings()];
+        let opened = transcript.pair_opening(|challenger| {
+            config.pcs().open_pair_at(
+                config.preprocessed_pcs(),
+                PairOpening {
+                    prover_data,
+                    protocol: main_schedule.protocol(),
+                    points: &main_against,
+                    known: &known,
+                },
+                PairOpening {
+                    prover_data: preprocessed.prover_data.clone(),
+                    protocol: schedule.protocol(),
+                    points: &against,
+                    known: &none,
+                },
+                challenger,
+            )
+        });
+        let (opening, preprocessed_opening) =
+            opened
+                .inspect_err(|_| transcript.abort())
+                .map_err(|source| ProvingError::Pcs {
+                    phase: "pair opening",
+                    source,
+                })?;
+        (opening, Some(preprocessed_opening))
+    } else {
+        let opening = transcript.main_opening(|challenger| {
+            config.pcs().open_at_known(
+                prover_data,
+                main_schedule.protocol(),
+                &main_against,
+                &known,
+                challenger,
+            )
+        });
 
-    let preprocessed_opening = preprocessed_opening
-        .transpose()
-        .inspect_err(|_| transcript.abort())
-        .map_err(|source| ProvingError::Pcs {
-            phase: "preprocessed opening",
-            source,
-        })?;
+        let opening = opening
+            .inspect_err(|_| transcript.abort())
+            .map_err(|source| ProvingError::Pcs {
+                phase: "main opening",
+                source,
+            })?;
+
+        // 9. Open each non-empty preprocessed table at every point a claim was left at.
+        // The setup commitment data is reused rather than rebuilt.
+        let preprocessed_opening = transcript.preprocessed_opening(|challenger| {
+            let preprocessed = proving_key
+                .preprocessed
+                .as_ref()
+                .expect("preprocessed proving key is missing for an AIR with preprocessed columns");
+            let schedule = instances.preprocessed_schedule(indexed_plan.as_ref(), |role, rows| {
+                trace_suffix(points.at(role), rows)
+            });
+            config.preprocessed_pcs().open_at(
+                preprocessed.prover_data.clone(),
+                schedule.protocol(),
+                &schedule.against(),
+                challenger,
+            )
+        });
+
+        let preprocessed_opening = preprocessed_opening
+            .transpose()
+            .inspect_err(|_| transcript.abort())
+            .map_err(|source| ProvingError::Pcs {
+                phase: "preprocessed opening",
+                source,
+            })?;
+        (opening, preprocessed_opening)
+    };
 
     // Every described step has now been played.
     transcript.finish();

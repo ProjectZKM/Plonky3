@@ -23,22 +23,47 @@ where
 {
     /// Where each table's columns land in the bit witness, planned from the shapes.
     ///
+    /// Shapes stacking below the committed arity fill the witness's first cells, the rest
+    /// zero: each slot keeps its index, and its address gains leading zero coordinates.
+    ///
     /// # Errors
     ///
-    /// Returns an error unless the shapes stack to the committed arity.
+    /// Returns an error when the shapes stack past the committed arity.
     pub(super) fn placements(
         &self,
         shapes: &[TableShape],
     ) -> Result<Vec<TablePlacement>, BooleanTraceCommitmentError<B::Error>> {
         // Prover and verifier both plan from the public shapes, so neither picks its own.
         let (arity, placements) = plan_stacked_layout(shapes);
-        if arity != self.num_variables() {
-            return Err(BooleanTraceCommitmentError::StackedArity {
+        let pad = self.stacked_pad(arity)?;
+        Ok(placements
+            .into_iter()
+            .map(|placement| {
+                let selectors = placement
+                    .selectors()
+                    .iter()
+                    .map(|selector| Selector::new(selector.num_variables() + pad, selector.index()))
+                    .collect();
+                TablePlacement::new(placement.idx(), selectors)
+            })
+            .collect())
+    }
+
+    /// Leading coordinates the committed arity has beyond what the shapes stack to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shapes stack past the committed arity.
+    pub(super) fn stacked_pad(
+        &self,
+        arity: usize,
+    ) -> Result<usize, BooleanTraceCommitmentError<B::Error>> {
+        self.num_variables()
+            .checked_sub(arity)
+            .ok_or(BooleanTraceCommitmentError::StackedArity {
                 expected: self.num_variables(),
                 actual: arity,
-            });
-        }
-        Ok(placements)
+            })
     }
 
     /// The bit claims the per-column route raises, in transcript order.

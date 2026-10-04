@@ -94,10 +94,12 @@ use p3_field::{ExtensionField, Field};
 use p3_multilinear_util::point::Point;
 use p3_multilinear_util::poly::Poly;
 use p3_multilinear_util::split_eq::SplitEq;
-use p3_sumcheck::layout::{Table, plan_stacked_layout};
+use p3_security::SecurityTerm;
+use p3_sumcheck::layout::{Table, TablePlacement, plan_stacked_layout};
 use p3_sumcheck::ring_switch::bits::BitRingSwitch;
 use p3_sumcheck::{
-    OpeningEvals, OpeningProtocol, PrescribedOpeningSecurity, PrescribedPointPcs, TableShape,
+    OpeningEvals, OpeningProtocol, PairCheck, PairOpening, PrescribedOpeningSecurity,
+    PrescribedPointPcs, TableShape,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -105,7 +107,7 @@ use thiserror::Error;
 use self::plan::{OpeningRoute, TableRun, opening_evals, sample_points, value_count};
 use crate::boolean::{
     BitOpening, BitReadings, BooleanBackend, BooleanMultilinearPcs, BooleanPcs, BooleanPcsError,
-    BooleanProof,
+    BooleanProof, ReadingsCheck,
 };
 use crate::boolean_trace_transcript::{
     ColumnBatchProverTranscript, ColumnBatchShape, ColumnBatchVerifierTranscript,
@@ -188,8 +190,11 @@ where
     /// The claims one batch raises: one per aligned block of its table's columns.
     ///
     /// Block `b` reads its columns at the first `j_b` coordinates of the column point.
+    ///
+    /// `pad` leading zero coordinates address the stacked tables inside a wider witness.
     fn block_claims<'a>(
         run: &'a TableRun,
+        pad: usize,
         point: &'a Point<EF>,
         column_point: &'a Point<EF>,
         current: &'a [EF],
@@ -208,8 +213,10 @@ where
             };
             let mut local = block_point;
             local.extend(point);
+            let mut lifted = Point::hypercube(0, pad);
+            lifted.extend(&block.prefix.lift_prefix(&local));
             let opening = BitOpening {
-                point: block.prefix.lift_prefix(&local),
+                point: lifted,
                 row_variables: run.shape.table_variables,
                 current: true,
                 next,
@@ -519,42 +526,12 @@ where
     }
 
     fn prescribed_security(&self, protocol: &OpeningProtocol) -> Option<PrescribedOpeningSecurity> {
-        // A protocol this scheme would refuse gets no assessment, so a caller fails closed.
-        let shapes = protocol.table_shapes();
-        if plan_stacked_layout(&shapes).0 != self.num_variables() {
-            return None;
-        }
-        // A reduction sends carry and last once its successor view outruns one element.
-        let absorbed = BitRingSwitch::<B::Val, EF>::ABSORBED;
-        let route = OpeningRoute::new(protocol);
-        let mut security = self.inner.readings_security(
-            route.num_reductions(),
-            route.successor_tensors(&shapes, absorbed),
-        )?;
-        if let OpeningRoute::Batched(runs) = route {
-            // Every combined claim of a batch reads one column point, so each is charged.
-            //
-            // A table split into several blocks raises one combined claim per block and view.
-            //
-            // The batching challenge is drawn before any candidate has been named.
-            //
-            // So it pays the same list the ring-switch reduction below it paid for.
-            //
-            // A union bound taken once does not shrink the set the next draw faces.
-            let claims = runs
-                .iter()
-                .map(|run| run.shape.num_batches * run.shape.num_views() * run.blocks.len())
-                .sum();
-            let column_variables = runs
-                .iter()
-                .map(|run| run.shape.column_variables())
-                .max()
-                .unwrap_or(0);
-            security.charge_reduction(p3_security::multilinear::column_batch_term(
-                claims,
-                column_variables,
-                EF::bits(),
-            ));
+        let ((num_reductions, successor_tensors), batching) = self.reduction_route(protocol)?;
+        let mut security = self
+            .inner
+            .readings_security(num_reductions, successor_tensors)?;
+        if let Some(term) = batching {
+            security.charge_reduction(term);
         }
         Some(security)
     }
@@ -578,24 +555,247 @@ where
         known: &[Option<OpeningEvals<EF>>],
         challenger: &mut Challenger,
     ) -> Result<Self::Proof, Self::ProverError> {
-        // Every shape, point and supplied value run is checked before the transcript moves.
-        Self::validate_source_shapes(&prover_data.tables, protocol)?;
+        let BooleanTraceCommitmentData { inner, tables } = prover_data;
+        let pending = self.batch_columns(&tables, protocol, points, known, challenger)?;
+        drop(tables);
+        let (readings, opening) = self
+            .inner
+            .open_readings(inner, &pending.openings, challenger)
+            .map_err(BooleanTraceCommitmentError::Boolean)?;
+        pending.finish(&readings, opening)
+    }
+
+    fn open_pair_at(
+        &self,
+        second: &Self,
+        first_side: PairOpening<'_, Self::ProverData, EF>,
+        second_side: PairOpening<'_, Self::ProverData, EF>,
+        challenger: &mut Challenger,
+    ) -> Result<(Self::Proof, Self::Proof), Self::ProverError> {
+        let BooleanTraceCommitmentData {
+            inner: first_inner,
+            tables: first_tables,
+        } = first_side.prover_data;
+        let BooleanTraceCommitmentData {
+            inner: second_inner,
+            tables: second_tables,
+        } = second_side.prover_data;
+        // Every shape, point and supplied run of both sides is checked before either moves.
+        second.check_open(
+            &second_tables,
+            second_side.protocol,
+            second_side.points,
+            second_side.known,
+        )?;
+        let first = self.batch_columns(
+            &first_tables,
+            first_side.protocol,
+            first_side.points,
+            first_side.known,
+            challenger,
+        )?;
+        let second_pending = second.batch_columns(
+            &second_tables,
+            second_side.protocol,
+            second_side.points,
+            second_side.known,
+            challenger,
+        )?;
+        drop((first_tables, second_tables));
+        let ((first_readings, first_opening), (second_readings, second_opening)) = self
+            .inner
+            .open_readings_pair(
+                &second.inner,
+                (first_inner, &first.openings),
+                (second_inner, &second_pending.openings),
+                challenger,
+            )
+            .map_err(BooleanTraceCommitmentError::Boolean)?;
+        Ok((
+            first.finish(&first_readings, first_opening)?,
+            second_pending.finish(&second_readings, second_opening)?,
+        ))
+    }
+
+    fn verify_at(
+        &self,
+        commitment: &Self::Commitment,
+        proof: &Self::Proof,
+        protocol: &OpeningProtocol,
+        points: &[Point<EF>],
+        challenger: &mut Challenger,
+    ) -> Result<Vec<OpeningEvals<EF>>, Self::Error> {
+        let (openings, readings) = self.replay_columns(proof, protocol, points, challenger)?;
+        // One bit proof answers for every batched claim at once.
+        self.inner
+            .verify_readings(commitment, &openings, &readings, &proof.opening, challenger)
+            .map_err(BooleanTraceCommitmentError::Boolean)?;
+        Ok(opening_evals(protocol, &proof.values))
+    }
+
+    fn verify_pair_at(
+        &self,
+        second: &Self,
+        first_side: PairCheck<'_, Self::Commitment, Self::Proof, EF>,
+        second_side: PairCheck<'_, Self::Commitment, Self::Proof, EF>,
+        challenger: &mut Challenger,
+    ) -> Result<(Vec<OpeningEvals<EF>>, Vec<OpeningEvals<EF>>), Self::Error> {
+        second.check_replay(second_side.proof, second_side.protocol, second_side.points)?;
+        let (first_openings, first_readings) = self.replay_columns(
+            first_side.proof,
+            first_side.protocol,
+            first_side.points,
+            challenger,
+        )?;
+        let (second_openings, second_readings) = second.replay_columns(
+            second_side.proof,
+            second_side.protocol,
+            second_side.points,
+            challenger,
+        )?;
+        self.inner
+            .verify_readings_pair(
+                &second.inner,
+                ReadingsCheck {
+                    commitment: first_side.commitment,
+                    openings: &first_openings,
+                    readings: &first_readings,
+                    proof: &first_side.proof.opening,
+                },
+                ReadingsCheck {
+                    commitment: second_side.commitment,
+                    openings: &second_openings,
+                    readings: &second_readings,
+                    proof: &second_side.proof.opening,
+                },
+                challenger,
+            )
+            .map_err(BooleanTraceCommitmentError::Boolean)?;
+        Ok((
+            opening_evals(first_side.protocol, &first_side.proof.values),
+            opening_evals(second_side.protocol, &second_side.proof.values),
+        ))
+    }
+
+    fn prescribed_pair_security(
+        &self,
+        second: &Self,
+        first_protocol: &OpeningProtocol,
+        second_protocol: &OpeningProtocol,
+    ) -> Option<(PrescribedOpeningSecurity, PrescribedOpeningSecurity)> {
+        let (first_route, first_batching) = self.reduction_route(first_protocol)?;
+        let (second_route, second_batching) = second.reduction_route(second_protocol)?;
+        let (mut first, mut second_report) =
+            self.inner
+                .readings_pair_security(&second.inner, first_route, second_route)?;
+        if let Some(term) = first_batching {
+            first.charge_reduction(term);
+        }
+        if let Some(term) = second_batching {
+            second_report.charge_reduction(term);
+        }
+        Some((first, second_report))
+    }
+}
+
+/// A trace opening whose columns are batched, waiting on the bit opening underneath.
+struct PendingOpening<EF> {
+    /// Every claim the bit opening must answer.
+    openings: Vec<BitOpening<EF>>,
+    /// What the readings become once they are back.
+    route: PendingRoute<EF>,
+}
+
+/// How a pending opening turns readings into its proof.
+enum PendingRoute<EF> {
+    /// One reduction per column read: the readings are the values.
+    PerColumn(plan::ClaimPlan),
+    /// Batched columns: the values are already known, and the readings must match.
+    Batched {
+        values: Vec<EF>,
+        expected: Vec<BitReadings<EF>>,
+    },
+}
+
+impl<EF: Field> PendingOpening<EF> {
+    /// The trace proof, once the bit opening has answered every claim.
+    fn finish<P, E>(
+        self,
+        readings: &[BitReadings<EF>],
+        opening: P,
+    ) -> Result<BooleanTraceCommitmentProof<EF, P>, BooleanTraceCommitmentError<E>> {
+        match self.route {
+            PendingRoute::PerColumn(plan) => Ok(BooleanTraceCommitmentProof {
+                values: plan.values(readings),
+                opening,
+            }),
+            PendingRoute::Batched { values, expected } => {
+                if readings.len() != expected.len() {
+                    return Err(BooleanTraceCommitmentError::ColumnBatchValueMismatch {
+                        batch: expected.len(),
+                    });
+                }
+                for (batch, (actual, expected)) in readings.iter().zip(&expected).enumerate() {
+                    if actual != expected {
+                        return Err(BooleanTraceCommitmentError::ColumnBatchValueMismatch {
+                            batch,
+                        });
+                    }
+                }
+                Ok(BooleanTraceCommitmentProof { values, opening })
+            }
+        }
+    }
+}
+
+impl<EF, B> BooleanTraceCommitment<EF, B>
+where
+    EF: BitCoordinates + ExtensionField<B::Val>,
+    B: BooleanBackend<EF>,
+    B::Val: TranscriptField + TowerLevel,
+{
+    /// Check every shape, point and supplied value run, before the transcript moves.
+    fn check_open(
+        &self,
+        tables: &[Table<B::Val>],
+        protocol: &OpeningProtocol,
+        points: &[Point<EF>],
+        known: &[Option<OpeningEvals<EF>>],
+    ) -> Result<Vec<TablePlacement>, BooleanTraceCommitmentError<B::Error>> {
+        Self::validate_source_shapes(tables, protocol)?;
         let placements = self.validate_opening(protocol, points)?;
         Self::validate_known(protocol, known)?;
+        Ok(placements)
+    }
+
+    /// Evaluate and bind every batch's values, and raise the claims the bit opening answers.
+    fn batch_columns<Challenger>(
+        &self,
+        tables: &[Table<B::Val>],
+        protocol: &OpeningProtocol,
+        points: &[Point<EF>],
+        known: &[Option<OpeningEvals<EF>>],
+        challenger: &mut Challenger,
+    ) -> Result<PendingOpening<EF>, BooleanTraceCommitmentError<B::Error>>
+    where
+        Challenger: FieldChallenger<B::Val>
+            + GrindingChallenger<Witness = B::Val>
+            + CanSampleUniformBits<B::Val>,
+    {
+        // Every shape, point and supplied value run is checked before the transcript moves.
+        let placements = self.check_open(tables, protocol, points, known)?;
         let runs = match OpeningRoute::new(protocol) {
             OpeningRoute::PerColumn(plan) => {
                 let openings = Self::bit_openings(protocol, plan.claims(), points, &placements);
-                let (readings, opening) = self
-                    .inner
-                    .open_readings(prover_data.inner, &openings, challenger)
-                    .map_err(BooleanTraceCommitmentError::Boolean)?;
-                let values = plan.values(&readings);
-                return Ok(BooleanTraceCommitmentProof { values, opening });
+                return Ok(PendingOpening {
+                    openings,
+                    route: PendingRoute::PerColumn(plan),
+                });
             }
             OpeningRoute::Batched(runs) => runs,
         };
+        let pad = self.stacked_pad(plan_stacked_layout(&protocol.table_shapes()).0)?;
 
-        let BooleanTraceCommitmentData { inner, tables } = prover_data;
         let mut values = Vec::with_capacity(value_count(protocol));
         let mut openings = Vec::new();
         let mut expected = Vec::new();
@@ -636,7 +836,7 @@ where
                 // Both value runs are bound before the point that combines either of them.
                 let column_point = transcript.batch(point, current, successor);
                 for (opening, readings) in
-                    Self::block_claims(run, point, &column_point, current, successor)
+                    Self::block_claims(run, pad, point, &column_point, current, successor)
                 {
                     openings.push(opening);
                     expected.push(readings);
@@ -644,33 +844,19 @@ where
             }
             transcript.finish();
         }
-
-        let (readings, opening) = self
-            .inner
-            .open_readings(inner, &openings, challenger)
-            .map_err(BooleanTraceCommitmentError::Boolean)?;
-        if readings.len() != expected.len() {
-            return Err(BooleanTraceCommitmentError::ColumnBatchValueMismatch {
-                batch: expected.len(),
-            });
-        }
-        for (batch, (actual, expected)) in readings.iter().zip(&expected).enumerate() {
-            if actual != expected {
-                return Err(BooleanTraceCommitmentError::ColumnBatchValueMismatch { batch });
-            }
-        }
-        Ok(BooleanTraceCommitmentProof { values, opening })
+        Ok(PendingOpening {
+            openings,
+            route: PendingRoute::Batched { values, expected },
+        })
     }
 
-    fn verify_at(
+    /// Check a proof's shape against its protocol and points, before the transcript moves.
+    fn check_replay<P>(
         &self,
-        commitment: &Self::Commitment,
-        proof: &Self::Proof,
+        proof: &BooleanTraceCommitmentProof<EF, P>,
         protocol: &OpeningProtocol,
         points: &[Point<EF>],
-        challenger: &mut Challenger,
-    ) -> Result<Vec<OpeningEvals<EF>>, Self::Error> {
-        // Every shape, point and value count is checked before the transcript moves.
+    ) -> Result<Vec<TablePlacement>, BooleanTraceCommitmentError<B::Error>> {
         let placements = self.validate_opening(protocol, points)?;
         let expected_values = value_count(protocol);
         if proof.values.len() != expected_values {
@@ -679,25 +865,33 @@ where
                 actual: proof.values.len(),
             });
         }
+        Ok(placements)
+    }
 
+    /// Replay every batch's binding, and raise the claims and readings the bit proof answers.
+    #[allow(clippy::type_complexity)]
+    fn replay_columns<P, Challenger>(
+        &self,
+        proof: &BooleanTraceCommitmentProof<EF, P>,
+        protocol: &OpeningProtocol,
+        points: &[Point<EF>],
+        challenger: &mut Challenger,
+    ) -> Result<(Vec<BitOpening<EF>>, Vec<BitReadings<EF>>), BooleanTraceCommitmentError<B::Error>>
+    where
+        Challenger: FieldChallenger<B::Val>
+            + GrindingChallenger<Witness = B::Val>
+            + CanSampleUniformBits<B::Val>,
+    {
+        // Every shape, point and value count is checked before the transcript moves.
+        let placements = self.check_replay(proof, protocol, points)?;
         let runs = match OpeningRoute::new(protocol) {
             OpeningRoute::PerColumn(plan) => {
                 let openings = Self::bit_openings(protocol, plan.claims(), points, &placements);
-
-                // One bit proof answers for every column of every batch at once.
-                self.inner
-                    .verify_readings(
-                        commitment,
-                        &openings,
-                        &plan.readings(&proof.values),
-                        &proof.opening,
-                        challenger,
-                    )
-                    .map_err(BooleanTraceCommitmentError::Boolean)?;
-                return Ok(opening_evals(protocol, &proof.values));
+                return Ok((openings, plan.readings(&proof.values)));
             }
             OpeningRoute::Batched(runs) => runs,
         };
+        let pad = self.stacked_pad(plan_stacked_layout(&protocol.table_shapes()).0)?;
 
         let mut openings = Vec::new();
         let mut readings = Vec::new();
@@ -717,7 +911,7 @@ where
                 // Both value runs are bound before the point that combines either of them.
                 let column_point = transcript.batch(point, current, successor)?;
                 for (opening, reading) in
-                    Self::block_claims(run, point, &column_point, current, successor)
+                    Self::block_claims(run, pad, point, &column_point, current, successor)
                 {
                     openings.push(opening);
                     readings.push(reading);
@@ -725,13 +919,62 @@ where
             }
             transcript.finish();
         }
+        Ok((openings, readings))
+    }
 
-        // One bit proof answers for every batched claim at once.
-        self.inner
-            .verify_readings(commitment, &openings, &readings, &proof.opening, challenger)
-            .map_err(BooleanTraceCommitmentError::Boolean)?;
-
-        Ok(opening_evals(protocol, &proof.values))
+    /// The reductions an opening of this protocol asks of the bit commitment, and the column
+    /// batching draw it makes itself.
+    ///
+    /// # Returns
+    ///
+    /// `(claims, successor tensors)` for the bit commitment, and the batching term if any.
+    ///
+    /// Nothing when the protocol does not stack to this commitment's arity.
+    fn reduction_route(
+        &self,
+        protocol: &OpeningProtocol,
+    ) -> Option<((usize, bool), Option<SecurityTerm>)> {
+        // A protocol this scheme would refuse gets no assessment, so a caller fails closed.
+        let shapes = protocol.table_shapes();
+        if plan_stacked_layout(&shapes).0 > self.num_variables() {
+            return None;
+        }
+        // A reduction sends carry and last once its successor view outruns one element.
+        let absorbed = BitRingSwitch::<B::Val, EF>::ABSORBED;
+        let route = OpeningRoute::new(protocol);
+        let reductions = (
+            route.num_reductions(),
+            route.successor_tensors(&shapes, absorbed),
+        );
+        let batching = match route {
+            // Every combined claim of a batch reads one column point, so each is charged.
+            //
+            // A table split into several blocks raises one combined claim per block and view.
+            //
+            // The batching challenge is drawn before any candidate has been named.
+            //
+            // So it pays the same list the ring-switch reduction below it paid for.
+            //
+            // A union bound taken once does not shrink the set the next draw faces.
+            OpeningRoute::Batched(runs) => {
+                let claims = runs
+                    .iter()
+                    .map(|run| run.shape.num_batches * run.shape.num_views() * run.blocks.len())
+                    .sum();
+                let column_variables = runs
+                    .iter()
+                    .map(|run| run.shape.column_variables())
+                    .max()
+                    .unwrap_or(0);
+                Some(p3_security::multilinear::column_batch_term(
+                    claims,
+                    column_variables,
+                    EF::bits(),
+                ))
+            }
+            OpeningRoute::PerColumn(_) => None,
+        };
+        Some((reductions, batching))
     }
 }
 

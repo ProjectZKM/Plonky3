@@ -27,7 +27,7 @@ pub mod whir;
 
 pub use boolean::{
     BitOpening, BitReadings, BooleanBackend, BooleanMultilinearPcs, BooleanPcs, BooleanPcsError,
-    BooleanProof,
+    BooleanProof, PairReadings, ReadingsCheck,
 };
 pub use boolean_trace::{
     BooleanTraceCommitment, BooleanTraceCommitmentData, BooleanTraceCommitmentError,

@@ -281,6 +281,86 @@ pub trait BooleanMultilinearPcs<EF, Challenger>: BooleanBackend<EF> {
         proof: &Self::Proof,
         challenger: &mut Challenger,
     ) -> Result<(), Self::Error>;
+
+    /// Open a witness of this commitment and one of `second`'s, in that order, as one step.
+    ///
+    /// The default opens each by its own proof. A commitment able to discharge both by one
+    /// proximity opening overrides it.
+    ///
+    /// # Errors
+    ///
+    /// As [`open_readings`](BooleanMultilinearPcs::open_readings), for either side.
+    #[allow(clippy::type_complexity)]
+    fn open_readings_pair(
+        &self,
+        second: &Self,
+        first_side: (Self::ProverData, &[BitOpening<EF>]),
+        second_side: (Self::ProverData, &[BitOpening<EF>]),
+        challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, Self::Proof>, Self::Error> {
+        let first = self.open_readings(first_side.0, first_side.1, challenger)?;
+        let second = second.open_readings(second_side.0, second_side.1, challenger)?;
+        Ok((first, second))
+    }
+
+    /// Check what [`open_readings_pair`](BooleanMultilinearPcs::open_readings_pair) produced.
+    ///
+    /// # Errors
+    ///
+    /// As [`verify_readings`](BooleanMultilinearPcs::verify_readings), for either side.
+    fn verify_readings_pair(
+        &self,
+        second: &Self,
+        first_side: ReadingsCheck<'_, EF, Self::Commitment, Self::Proof>,
+        second_side: ReadingsCheck<'_, EF, Self::Commitment, Self::Proof>,
+        challenger: &mut Challenger,
+    ) -> Result<(), Self::Error> {
+        self.verify_readings(
+            first_side.commitment,
+            first_side.openings,
+            first_side.readings,
+            first_side.proof,
+            challenger,
+        )?;
+        second.verify_readings(
+            second_side.commitment,
+            second_side.openings,
+            second_side.readings,
+            second_side.proof,
+            challenger,
+        )
+    }
+
+    /// Every labelled algebraic error one pair opening charges, one report per side.
+    ///
+    /// Each side is `(claims, successor tensors)`, as
+    /// [`readings_security`](BooleanMultilinearPcs::readings_security) takes them.
+    fn readings_pair_security(
+        &self,
+        second: &Self,
+        first_side: (usize, bool),
+        second_side: (usize, bool),
+    ) -> Option<(PrescribedOpeningSecurity, PrescribedOpeningSecurity)> {
+        Some((
+            self.readings_security(first_side.0, first_side.1)?,
+            second.readings_security(second_side.0, second_side.1)?,
+        ))
+    }
+}
+
+/// Each side's readings and proof, first side first.
+pub type PairReadings<EF, P> = ((Vec<BitReadings<EF>>, P), (Vec<BitReadings<EF>>, P));
+
+/// One side of a pair opening, as the verifier checks it.
+pub struct ReadingsCheck<'a, EF, C, P> {
+    /// The side's commitment, bound by the caller.
+    pub commitment: &'a C,
+    /// The claims the side answers.
+    pub openings: &'a [BitOpening<EF>],
+    /// The readings it claims at each.
+    pub readings: &'a [BitReadings<EF>],
+    /// The side's proof.
+    pub proof: &'a P,
 }
 
 /// One claim about the bit witness: a point, and the readings asked for there.

@@ -105,6 +105,9 @@ const MAIN_OPENING: &str = "main_opening";
 /// Step label of the bracket around the delegated preprocessed-trace opening.
 const PREPROCESSED_OPENING: &str = "preprocessed_opening";
 
+/// Step label of the bracket around one opening of both trace commitments.
+const PAIR_OPENING: &str = "pair_opening";
+
 /// Sponge alphabet of a challenger that speaks the base field natively.
 type Alphabet<F> = FieldUnit<F>;
 
@@ -131,6 +134,9 @@ struct MainOpening;
 
 /// Type-level name of the sub-protocol the statement delegates its preprocessed openings to.
 struct PreprocessedOpening;
+
+/// Type-level name of the sub-protocol the statement delegates both openings to at once.
+struct PairOpening;
 
 /// The matched marker pair recording one delegation.
 ///
@@ -187,6 +193,10 @@ pub struct MultiStarkShape {
     pub has_indexed: bool,
     /// Whether any AIR declares a binary-native bus interaction.
     pub has_bus: bool,
+    /// Whether the main and preprocessed traces are opened as one pair.
+    ///
+    /// A batch without a preprocessed trace has nothing to pair, and ignores it.
+    pub pair_openings: bool,
 }
 
 impl MultiStarkShape {
@@ -246,7 +256,21 @@ impl MultiStarkShape {
             pow_bits,
             has_indexed,
             has_bus,
+            pair_openings: false,
         }
+    }
+
+    /// This shape, opening its two traces as one pair when `pair` holds.
+    #[must_use]
+    pub const fn with_pair_openings(mut self, pair: bool) -> Self {
+        self.pair_openings = pair;
+        self
+    }
+
+    /// Whether the run opens both traces under one bracket.
+    #[must_use]
+    pub fn pairs(&self) -> bool {
+        self.pair_openings && self.has_preprocessed()
     }
 
     /// Number of preprocessed tables the batch stacks under one commitment.
@@ -332,11 +356,16 @@ impl MultiStarkShape {
         if self.has_indexed {
             steps.extend(delegation::<IndexedLookup>(INDEXED_LOOKUP));
         }
-        steps.extend(delegation::<MainOpening>(MAIN_OPENING));
-
+        // A paired run opens both traces under one bracket, the main side first.
+        //
         // Nothing is opened against a commitment the batch never made.
-        if self.has_preprocessed() {
-            steps.extend(delegation::<PreprocessedOpening>(PREPROCESSED_OPENING));
+        if self.pairs() {
+            steps.extend(delegation::<PairOpening>(PAIR_OPENING));
+        } else {
+            steps.extend(delegation::<MainOpening>(MAIN_OPENING));
+            if self.has_preprocessed() {
+                steps.extend(delegation::<PreprocessedOpening>(PREPROCESSED_OPENING));
+            }
         }
 
         InteractionPattern::new(steps).expect("matched brackets are always well formed")
@@ -556,6 +585,24 @@ where
         output
     }
 
+    /// Lend the sponge to one opening of both traces, bracketed as a sub-protocol.
+    ///
+    /// # Returns
+    ///
+    /// Whatever the delegated run produced.
+    pub fn pair_opening<R>(&mut self, run: impl FnOnce(&mut C) -> R) -> R {
+        self.state.begin_protocol::<PairOpening>(PAIR_OPENING);
+        let output = run(self.state.challenger_mut());
+        self.state.end_protocol::<PairOpening>(PAIR_OPENING);
+        output
+    }
+
+    /// Whether the run opens both traces under one bracket.
+    #[must_use]
+    pub fn pairs(&self) -> bool {
+        self.shape.pairs()
+    }
+
     /// Lend the sponge to the preprocessed-trace opening, when the batch describes one.
     ///
     /// # Returns
@@ -770,6 +817,24 @@ where
         output
     }
 
+    /// Lend the sponge to one opening of both traces, bracketed as a sub-protocol.
+    ///
+    /// # Returns
+    ///
+    /// Whatever the delegated run produced.
+    pub fn pair_opening<R>(&mut self, run: impl FnOnce(&mut C) -> R) -> R {
+        self.state.begin_protocol::<PairOpening>(PAIR_OPENING);
+        let output = run(self.state.challenger_mut());
+        self.state.end_protocol::<PairOpening>(PAIR_OPENING);
+        output
+    }
+
+    /// Whether the run opens both traces under one bracket.
+    #[must_use]
+    pub fn pairs(&self) -> bool {
+        self.shape.pairs()
+    }
+
     /// Lend the sponge to the preprocessed-trace opening, when the batch describes one.
     ///
     /// # Returns
@@ -897,6 +962,7 @@ mod tests {
             pow_bits: 4,
             has_indexed: false,
             has_bus: false,
+            pair_openings: false,
         }
     }
 
@@ -969,6 +1035,7 @@ mod tests {
             pow_bits,
             has_indexed,
             has_bus,
+            pair_openings,
         } = base_shape();
         let num_instances = instances.len();
         let MultiStarkInstanceShape {
@@ -997,6 +1064,10 @@ mod tests {
         let mut shape = base_shape();
         shape.has_bus = !has_bus;
         mutations.push(("has_bus", shape));
+
+        let mut shape = base_shape();
+        shape.pair_openings = !pair_openings;
+        mutations.push(("pair_openings", shape));
 
         let mut shape = base_shape();
         shape.instances.truncate(num_instances - 1);
@@ -1076,8 +1147,12 @@ mod tests {
         transcript.bus_argument(|_| ());
         transcript.lookup_argument(|_| ());
         transcript.zerocheck(|_| ());
-        transcript.main_opening(|_| ());
-        transcript.preprocessed_opening(|_| ());
+        if transcript.pairs() {
+            transcript.pair_opening(|_| ());
+        } else {
+            transcript.main_opening(|_| ());
+            transcript.preprocessed_opening(|_| ());
+        }
         transcript.finish();
 
         challenger.sample()
@@ -1104,8 +1179,12 @@ mod tests {
         transcript.bus_argument(|_| ());
         transcript.lookup_argument(|_| ());
         transcript.zerocheck(|_| ());
-        transcript.main_opening(|_| ());
-        transcript.preprocessed_opening(|_| ());
+        if transcript.pairs() {
+            transcript.pair_opening(|_| ());
+        } else {
+            transcript.main_opening(|_| ());
+            transcript.preprocessed_opening(|_| ());
+        }
         transcript.finish();
 
         challenger.sample()
@@ -1231,6 +1310,7 @@ mod tests {
                 pow_bits: 6,
                 has_indexed: false,
                 has_bus: false,
+                pair_openings: false,
             }
         );
         assert_eq!(shape.num_preprocessed_tables(), 1);
@@ -1537,6 +1617,7 @@ mod tests {
                 pow_bits,
                 has_indexed: false,
                 has_bus: false,
+                pair_openings: false,
             },
         )
     }

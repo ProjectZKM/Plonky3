@@ -704,23 +704,41 @@ where
     // A protocol missing them assesses a smaller opening than the proof performs.
     //
     // It also understates the candidate count charged to every outer draw above.
-    builder.add_opening_evidence(
-        CommittedTrace::Main,
-        config.pcs().prescribed_security(
-            &instances
-                .main_schedule(indexed.as_ref(), |_, _| ())
-                .into_protocol(),
-        ),
-    );
-    if preprocessed_cells > 0 {
+    let main_protocol = instances
+        .main_schedule(indexed.as_ref(), |_, _| ())
+        .into_protocol();
+    if preprocessed_cells > 0 && config.pair_openings() {
+        // One opening serves both commitments, so it is priced once, on the main side.
+        //
+        // The preprocessed side keeps only the draws its own reductions make.
+        let preprocessed_protocol = instances
+            .preprocessed_schedule(indexed.as_ref(), |_, _| ())
+            .into_protocol();
+        let (main, preprocessed) = config
+            .pcs()
+            .prescribed_pair_security(
+                config.preprocessed_pcs(),
+                &main_protocol,
+                &preprocessed_protocol,
+            )
+            .unzip();
+        builder.add_opening_evidence(CommittedTrace::Main, main);
+        builder.add_opening_evidence(CommittedTrace::Preprocessed, preprocessed);
+    } else {
         builder.add_opening_evidence(
-            CommittedTrace::Preprocessed,
-            config.preprocessed_pcs().prescribed_security(
-                &instances
-                    .preprocessed_schedule(indexed.as_ref(), |_, _| ())
-                    .into_protocol(),
-            ),
+            CommittedTrace::Main,
+            config.pcs().prescribed_security(&main_protocol),
         );
+        if preprocessed_cells > 0 {
+            builder.add_opening_evidence(
+                CommittedTrace::Preprocessed,
+                config.preprocessed_pcs().prescribed_security(
+                    &instances
+                        .preprocessed_schedule(indexed.as_ref(), |_, _| ())
+                        .into_protocol(),
+                ),
+            );
+        }
     }
     builder.add_collision_cap(
         config

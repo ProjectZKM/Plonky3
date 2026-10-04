@@ -1677,7 +1677,8 @@ mod tests {
             .opening
             .opening
             .opening
-            .whir
+            .whir_mut()
+            .expect("an unpaired proof carries its own run")
             .final_poly
             .as_mut()
             .expect("small WHIR proof has a final polynomial");

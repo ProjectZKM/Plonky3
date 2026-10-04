@@ -289,6 +289,117 @@ where
         points: &[Point<Challenge>],
         challenger: &mut Challenger,
     ) -> Result<Vec<OpeningEvals<Challenge>>, Self::Error>;
+
+    /// Open a commitment of this scheme and one of `second`'s, in that order, as one step.
+    ///
+    /// A scheme may share work between the two, such as one proximity opening for both.
+    ///
+    /// The default opens `first`, then `second`, each by its own path.
+    ///
+    /// # Errors
+    ///
+    /// As [`open_at_known`](PrescribedPointPcs::open_at_known), for either side.
+    ///
+    /// # Panics
+    ///
+    /// As [`open_at_known`](PrescribedPointPcs::open_at_known), for either side.
+    #[allow(clippy::type_complexity)]
+    fn open_pair_at(
+        &self,
+        second: &Self,
+        first_side: PairOpening<'_, Self::ProverData, Challenge>,
+        second_side: PairOpening<'_, Self::ProverData, Challenge>,
+        challenger: &mut Challenger,
+    ) -> Result<(Self::Proof, Self::Proof), Self::ProverError> {
+        let first = self.open_at_known(
+            first_side.prover_data,
+            first_side.protocol,
+            first_side.points,
+            first_side.known,
+            challenger,
+        )?;
+        let second = second.open_at_known(
+            second_side.prover_data,
+            second_side.protocol,
+            second_side.points,
+            second_side.known,
+            challenger,
+        )?;
+        Ok((first, second))
+    }
+
+    /// Verify what [`open_pair_at`](PrescribedPointPcs::open_pair_at) produced.
+    ///
+    /// # Returns
+    ///
+    /// Each side's evaluation batches, as [`verify_at`](PrescribedPointPcs::verify_at) returns them.
+    ///
+    /// # Errors
+    ///
+    /// As [`verify_at`](PrescribedPointPcs::verify_at), for either side.
+    #[allow(clippy::type_complexity)]
+    fn verify_pair_at(
+        &self,
+        second: &Self,
+        first_side: PairCheck<'_, Self::Commitment, Self::Proof, Challenge>,
+        second_side: PairCheck<'_, Self::Commitment, Self::Proof, Challenge>,
+        challenger: &mut Challenger,
+    ) -> Result<(Vec<OpeningEvals<Challenge>>, Vec<OpeningEvals<Challenge>>), Self::Error> {
+        let first = self.verify_at(
+            first_side.commitment,
+            first_side.proof,
+            first_side.protocol,
+            first_side.points,
+            challenger,
+        )?;
+        let second = second.verify_at(
+            second_side.commitment,
+            second_side.proof,
+            second_side.protocol,
+            second_side.points,
+            challenger,
+        )?;
+        Ok((first, second))
+    }
+
+    /// Soundness evidence for one pair opening, one report per side.
+    ///
+    /// The default prices each side as its own opening.
+    fn prescribed_pair_security(
+        &self,
+        second: &Self,
+        first_protocol: &OpeningProtocol,
+        second_protocol: &OpeningProtocol,
+    ) -> Option<(PrescribedOpeningSecurity, PrescribedOpeningSecurity)> {
+        Some((
+            self.prescribed_security(first_protocol)?,
+            second.prescribed_security(second_protocol)?,
+        ))
+    }
+}
+
+/// One side of a pair opening, as the prover holds it.
+pub struct PairOpening<'a, D, EF> {
+    /// Prover data returned by the commitment phase.
+    pub prover_data: D,
+    /// Table shapes and per-point column batches.
+    pub protocol: &'a OpeningProtocol,
+    /// One prescribed point per batch.
+    pub points: &'a [Point<EF>],
+    /// Values the caller already holds, one entry per batch.
+    pub known: &'a [Option<OpeningEvals<EF>>],
+}
+
+/// One side of a pair opening, as the verifier checks it.
+pub struct PairCheck<'a, C, P, EF> {
+    /// Commitment to the columns.
+    pub commitment: &'a C,
+    /// This side's proof.
+    pub proof: &'a P,
+    /// Table shapes and column batches.
+    pub protocol: &'a OpeningProtocol,
+    /// Prescribed points in opening order.
+    pub points: &'a [Point<EF>],
 }
 
 #[cfg(test)]

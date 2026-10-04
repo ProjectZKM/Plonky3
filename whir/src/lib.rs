@@ -18,7 +18,6 @@ pub use parameters::{
     DEFAULT_MAX_POW, FoldingFactor, FoldingFactorError, ProtocolParameters, RoundConfig,
     SecurityAssumption, TerminalBudget, WhirConfig, WhirConfigError,
 };
-pub use pcs::WhirProverData;
 pub use pcs::proof::{PcsProof, QueryOpenings, SharedProofOpening, WhirProof, WhirRoundProof};
 pub use pcs::prover::WhirProver;
 pub use pcs::verifier::WhirVerifier;
@@ -31,5 +30,6 @@ pub use pcs::zk::{
     MaskOpeningPair, ZkConfigError, ZkParameters, ZkRoundProof, ZkVerifierError, ZkWhirConfig,
     ZkWhirProof,
 };
+pub use pcs::{PairProof, WhirProverData, pair_batching_error};
 pub use transcript::WhirShape;
 pub use transcript::zk::{ZkBaseCaseShape, ZkWhirShape};

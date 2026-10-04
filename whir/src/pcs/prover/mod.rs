@@ -23,9 +23,16 @@ use crate::domain::{WhirDomain, WhirQueryPoint};
 use crate::parameters::WhirConfig;
 use crate::pcs::committer::writer::commit_extension;
 use crate::pcs::proof::{
-    QueryOpenings, SharedProofOpening, SumcheckData, WhirProof, WhirRoundProof,
+    QueryOpenings, SharedProofOpening, SumcheckData, WhirProof, WhirRoundProof, combined_row,
 };
 use crate::transcript::{WhirProverTranscript, WhirShape};
+
+/// The Merkle prover data of the polynomial the next queries open.
+type WhirRoundData<EF, F, MT> = RoundData<
+    F,
+    <MT as Mmcs<F>>::ProverData<DenseMatrix<F>>,
+    <MT as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, DenseMatrix<EF>>>,
+>;
 
 /// Per-round prover state with the Merkle authentication shapes
 /// baked in for the WHIR commitment scheme.
@@ -44,9 +51,12 @@ type WhirRoundState<EF, F, MT> = RoundState<
 
 /// Active Merkle prover data for the polynomial currently being queried.
 #[derive(Debug)]
-enum RoundData<BaseData, ExtData> {
+enum RoundData<F, BaseData, ExtData> {
     /// Base-field commitment produced by the initial round.
     Base(BaseData),
+    /// Several base-field commitments whose polynomials the run batches,
+    /// with the coefficient each enters the batch with.
+    Batched(Vec<BaseData>, Vec<F>),
     /// Extension-field commitment produced by every subsequent folded round.
     Ext(ExtData),
 }
@@ -66,7 +76,7 @@ where
     /// Folding challenges (alpha_1, ..., alpha_k) for the current round.
     folding_randomness: Point<EF>,
     /// Active Merkle prover data for the polynomial currently being queried.
-    round_data: RoundData<BaseData, ExtData>,
+    round_data: RoundData<F, BaseData, ExtData>,
 }
 
 /// WHIR prover bundling the protocol config with its FFT and commitment backends.
@@ -171,6 +181,72 @@ where
     where
         Challenger: CanObserve<MT::Commitment>,
     {
+        self.prove_from(
+            initial_ood_answers,
+            challenger,
+            layout,
+            RoundData::Base(prover_data),
+            num_opening_claims,
+        )
+    }
+
+    /// Execute the WHIR protocol on a batch of committed polynomials.
+    ///
+    /// The layout holds the batched polynomial `sum_i c_i f_i` and its claims.
+    /// The first round's queries open every commitment at the same positions,
+    /// and the verifier combines the rows by the same coefficients, so the
+    /// batch costs one path per commitment in that round and nothing after.
+    ///
+    /// # Arguments
+    ///
+    /// - `initial_ood_answers`: answers at the commitment phase's out-of-domain points.
+    /// - `challenger`: the sponge the whole proof shares, borrowed for this run.
+    /// - `layout`: the batched polynomial's layout, holding the claims to batch.
+    /// - `prover_data`: Merkle prover data behind each initial commitment.
+    /// - `coefficients`: the coefficient each commitment's polynomial enters with.
+    /// - `num_opening_claims`: opening claims the caller bound before this run.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless there is one coefficient per commitment.
+    #[instrument(skip_all)]
+    pub fn prove_batched(
+        &self,
+        initial_ood_answers: Vec<EF>,
+        challenger: &mut Challenger,
+        layout: L,
+        prover_data: Vec<MT::ProverData<DenseMatrix<F>>>,
+        coefficients: Vec<F>,
+        num_opening_claims: usize,
+    ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        assert_eq!(
+            prover_data.len(),
+            coefficients.len(),
+            "one coefficient per commitment"
+        );
+        self.prove_from(
+            initial_ood_answers,
+            challenger,
+            layout,
+            RoundData::Batched(prover_data, coefficients),
+            num_opening_claims,
+        )
+    }
+
+    fn prove_from(
+        &self,
+        initial_ood_answers: Vec<EF>,
+        challenger: &mut Challenger,
+        layout: L,
+        round_data: WhirRoundData<EF, F, MT>,
+        num_opening_claims: usize,
+    ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
         assert_eq!(self.round_folding_factor(0), layout.folding());
         self.config.validate_initial_claims(
             layout
@@ -198,7 +274,7 @@ where
         let mut round_state = RoundState {
             sumcheck_prover,
             folding_randomness,
-            round_data: RoundData::Base(prover_data),
+            round_data,
         };
 
         // Build one round proof per intermediate folding round.
@@ -312,6 +388,31 @@ where
                 }
                 QueryOpenings::Base(opening)
             }
+            RoundData::Batched(datas, coefficients) => {
+                let openings: Vec<_> = datas
+                    .iter()
+                    .map(|data| {
+                        SharedProofOpening::open(&self.mmcs, &stir_challenges_indexes, data)
+                    })
+                    .collect();
+                for (query, &challenge) in stir_challenges_indexes.iter().enumerate() {
+                    let row = combined_row(&openings, coefficients, query);
+                    let eval = Poly::new(row).eval_base(&query_randomness);
+                    match self.dft.query_point(
+                        round_params.log_folded_domain_size,
+                        round_params.num_variables,
+                        challenge,
+                    ) {
+                        WhirQueryPoint::Univariate(var) => {
+                            stir_statement.add_constraint(var, eval);
+                        }
+                        WhirQueryPoint::Multilinear(point) => {
+                            stir_statement.add_point_constraint(point, eval);
+                        }
+                    }
+                }
+                QueryOpenings::Batched(openings)
+            }
             RoundData::Ext(data) => {
                 let mut opening =
                     SharedProofOpening::open(&self.extension_mmcs, &stir_challenges_indexes, data);
@@ -414,6 +515,14 @@ where
                 &final_challenge_indexes,
                 data,
             )),
+            RoundData::Batched(datas, _) => QueryOpenings::Batched(
+                datas
+                    .iter()
+                    .map(|data| {
+                        SharedProofOpening::open(&self.mmcs, &final_challenge_indexes, data)
+                    })
+                    .collect(),
+            ),
             RoundData::Ext(data) => QueryOpenings::Extension(SharedProofOpening::open(
                 &self.extension_mmcs,
                 &final_challenge_indexes,

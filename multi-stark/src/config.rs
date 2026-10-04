@@ -93,6 +93,18 @@ pub trait MultiStarkConfig {
         unimplemented!("this configuration does not provide a preprocessed commitment scheme")
     }
 
+    /// Whether the main and preprocessed traces are opened as one pair.
+    ///
+    /// The scheme's [`open_pair_at`](p3_sumcheck::PrescribedPointPcs::open_pair_at) then runs
+    /// once for both, under one transcript bracket, in place of two openings. A scheme that can
+    /// share a proximity opening between the two commitments does so; the preprocessed scheme
+    /// must then commit at the main scheme's arity.
+    ///
+    /// The default opens them apart.
+    fn pair_openings(&self) -> bool {
+        false
+    }
+
     /// Smallest table arity the commitment scheme accepts without padding.
     ///
     /// A table below this floor is zero-padded before commitment, which breaks the successor view:

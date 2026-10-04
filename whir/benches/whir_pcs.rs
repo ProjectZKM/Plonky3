@@ -319,6 +319,7 @@ impl<L: Layout<F, EF>> Bench<L> {
             let (queries, proof) = match openings {
                 QueryOpenings::Base(opening) => (opening.rows.len(), &opening.proof),
                 QueryOpenings::Extension(opening) => (opening.rows.len(), &opening.proof),
+                QueryOpenings::Batched(batch) => (batch[0].rows.len(), &batch[0].proof),
             };
             (queries, proof.sibling_hashes.len())
         };

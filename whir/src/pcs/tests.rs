@@ -882,6 +882,11 @@ mod error_variant_tests {
                 opening.rows.pop();
                 original
             }
+            QueryOpenings::Batched(batch) => {
+                let original = batch[0].rows.len();
+                batch[0].rows.pop();
+                original
+            }
         }
     }
 

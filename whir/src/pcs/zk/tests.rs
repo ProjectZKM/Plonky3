@@ -524,6 +524,7 @@ fn zk_whir_rejects_missing_query_opening() {
     let dropped = match &mut proven.proof.rounds[0].openings {
         QueryOpenings::Base(opening) => opening.rows.pop().is_some(),
         QueryOpenings::Extension(opening) => opening.rows.pop().is_some(),
+        QueryOpenings::Batched(batch) => batch[0].rows.pop().is_some(),
     };
     assert!(dropped, "fixture has query openings");
     let err = proven.verify().unwrap_err();

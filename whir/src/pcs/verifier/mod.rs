@@ -22,10 +22,26 @@ use super::committer::reader::ParsedCommitment;
 use crate::alloc::string::ToString;
 use crate::domain::{WhirDomain, WhirQueryPoint};
 use crate::parameters::{RoundConfig, WhirConfig};
-use crate::pcs::proof::{QueryOpenings, WhirProof};
+use crate::pcs::proof::{QueryOpenings, WhirProof, combined_row};
 use crate::transcript::{WhirShape, WhirVerifierTranscript};
 
 pub mod errors;
+
+/// The commitments the first round's queries open, with the coefficient
+/// each one's polynomial enters the batched polynomial with.
+#[derive(Debug)]
+pub struct BaseCommitments<'a, C, F> {
+    pub roots: &'a [C],
+    pub coefficients: &'a [F],
+}
+
+impl<C, F> Clone for BaseCommitments<'_, C, F> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<C, F> Copy for BaseCommitments<'_, C, F> {}
 
 /// Replays a WHIR opening proof against a public commitment and the
 /// constraint built by the layout adapter.
@@ -161,6 +177,44 @@ where
     where
         Challenger: CanObserve<MT::Commitment>,
     {
+        let one = [F::ONE];
+        let base = BaseCommitments {
+            roots: core::slice::from_ref(parsed_commitment),
+            coefficients: &one,
+        };
+        self.verify_batched(proof, challenger, base, num_opening_claims, layout)
+    }
+
+    /// Verify a run on a batch of committed polynomials: the layout's claims
+    /// are about `sum_i c_i f_i`, and the first round's queries open every
+    /// commitment at the same positions.
+    ///
+    /// # Errors
+    ///
+    /// Any rejection a step raises; a batch with a coefficient count other
+    /// than its commitment count is malformed.
+    #[instrument(skip_all)]
+    pub fn verify_batched(
+        &self,
+        proof: &WhirProof<F, EF, MT>,
+        challenger: &mut Challenger,
+        base: BaseCommitments<'_, MT::Commitment, F>,
+        num_opening_claims: usize,
+        layout: &LayoutVerifier<F, EF>,
+    ) -> Result<Point<EF>, VerifierError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        if base.roots.is_empty() || base.roots.len() != base.coefficients.len() {
+            return Err(VerifierError::MerkleProofInvalid {
+                position: 0,
+                reason: format!(
+                    "{} commitments batched with {} coefficients",
+                    base.roots.len(),
+                    base.coefficients.len()
+                ),
+            });
+        }
         // Reject a proof that carries the wrong number of rounds before any
         // transcript work. The per-round commitment slot is checked further
         // down, where each round is parsed.
@@ -206,7 +260,7 @@ where
 
         // A rejection releases the driver's completeness check on its way out.
         // Dropping an unfinished driver otherwise panics on top of the error.
-        match self.replay(proof, &mut transcript, parsed_commitment, layout) {
+        match self.replay(proof, &mut transcript, base, layout) {
             Ok(randomness) => {
                 transcript.finish();
                 Ok(randomness)
@@ -228,7 +282,7 @@ where
         &self,
         proof: &WhirProof<F, EF, MT>,
         transcript: &mut WhirVerifierTranscript<'_, Challenger, F, EF>,
-        parsed_commitment: &MT::Commitment,
+        base: BaseCommitments<'_, MT::Commitment, F>,
         layout: &LayoutVerifier<F, EF>,
     ) -> Result<Point<EF>, VerifierError>
     where
@@ -236,7 +290,7 @@ where
     {
         let mut constraints = Vec::new();
         let mut round_folding_randomness = Vec::new();
-        let mut prev_commitment = parsed_commitment.clone();
+        let mut prev_commitment: Option<MT::Commitment> = None;
 
         // The delegate draws the claim-batching challenge, then replays its own rounds.
         //
@@ -286,7 +340,8 @@ where
                 proof,
                 transcript,
                 round_params,
-                &prev_commitment,
+                base,
+                prev_commitment.as_ref(),
                 current_folding_randomness,
                 round_index,
             )?;
@@ -326,7 +381,7 @@ where
             })?;
             round_folding_randomness.push(folding_randomness);
 
-            prev_commitment = new_commitment.root;
+            prev_commitment = Some(new_commitment.root);
         }
 
         // Final round: receive the polynomial in the clear.
@@ -350,7 +405,8 @@ where
             proof,
             transcript,
             &final_round_config,
-            &prev_commitment,
+            base,
+            prev_commitment.as_ref(),
             final_round_folding_randomness,
             self.n_rounds(),
         )?;
@@ -414,12 +470,14 @@ where
     ///
     /// Checks PoW witness, generates query indices, verifies Merkle proofs,
     /// and evaluates folded polynomials at the queried positions.
+    #[allow(clippy::too_many_arguments)]
     fn verify_stir_challenges(
         &self,
         proof: &WhirProof<F, EF, MT>,
         transcript: &mut WhirVerifierTranscript<'_, Challenger, F, EF>,
         params: &RoundConfig,
-        commitment: &MT::Commitment,
+        base: BaseCommitments<'_, MT::Commitment, F>,
+        commitment: Option<&MT::Commitment>,
         folding_randomness: &Point<EF>,
         round_index: usize,
     ) -> Result<SelectStatement<F, EF>, VerifierError> {
@@ -442,6 +500,7 @@ where
         }];
         let answers = self.verify_merkle_proof(
             proof,
+            base,
             commitment,
             &stir_challenges_indexes,
             &dimensions,
@@ -482,7 +541,8 @@ where
     fn verify_merkle_proof(
         &self,
         proof: &WhirProof<F, EF, MT>,
-        root: &MT::Commitment,
+        base: BaseCommitments<'_, MT::Commitment, F>,
+        root: Option<&MT::Commitment>,
         indices: &[usize],
         dimensions: &[Dimensions],
         round_index: usize,
@@ -502,17 +562,22 @@ where
         // Round 0 queries the base-field initial commitment.
         // Every later round queries a folded extension-field commitment.
         // A variant that disagrees with the round is malformed.
-        match (openings, round_index == 0) {
-            (QueryOpenings::Base(opening), true) => {
-                if opening.rows.len() != indices.len() {
-                    return Err(VerifierError::StirQueryCountMismatch {
-                        round_index,
-                        expected: indices.len(),
-                        actual: opening.rows.len(),
-                    });
-                }
+        let count = |actual: usize| -> Result<(), VerifierError> {
+            if actual == indices.len() {
+                Ok(())
+            } else {
+                Err(VerifierError::StirQueryCountMismatch {
+                    round_index,
+                    expected: indices.len(),
+                    actual,
+                })
+            }
+        };
+        match (openings, round_index == 0, root) {
+            (QueryOpenings::Base(opening), true, _) if base.roots.len() == 1 => {
+                count(opening.rows.len())?;
                 opening
-                    .verify(self.mmcs, root, dimensions, indices)
+                    .verify(self.mmcs, &base.roots[0], dimensions, indices)
                     .map_err(|_| VerifierError::MerkleProofInvalid {
                         position: 0,
                         reason: "Base field Merkle multiproof verification failed".to_string(),
@@ -523,14 +588,30 @@ where
                     .map(|row| row.iter().map(|&f| f.into()).collect())
                     .collect())
             }
-            (QueryOpenings::Extension(opening), false) => {
-                if opening.rows.len() != indices.len() {
-                    return Err(VerifierError::StirQueryCountMismatch {
-                        round_index,
-                        expected: indices.len(),
-                        actual: opening.rows.len(),
-                    });
+            (QueryOpenings::Batched(batch), true, _)
+                if base.roots.len() > 1 && batch.len() == base.roots.len() =>
+            {
+                for (opening, root) in batch.iter().zip(base.roots) {
+                    count(opening.rows.len())?;
+                    opening
+                        .verify(self.mmcs, root, dimensions, indices)
+                        .map_err(|_| VerifierError::MerkleProofInvalid {
+                            position: 0,
+                            reason: "Batched base field Merkle multiproof verification failed"
+                                .to_string(),
+                        })?;
                 }
+                Ok((0..indices.len())
+                    .map(|query| {
+                        combined_row(batch, base.coefficients, query)
+                            .into_iter()
+                            .map(Into::into)
+                            .collect()
+                    })
+                    .collect())
+            }
+            (QueryOpenings::Extension(opening), false, Some(root)) => {
+                count(opening.rows.len())?;
                 let extension_mmcs = ExtensionMmcs::new(self.mmcs);
                 opening
                     .verify(&extension_mmcs, root, dimensions, indices)
