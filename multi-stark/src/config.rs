@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use p3_challenger::fs::TranscriptField;
 use p3_commit::MultilinearPcs;
 use p3_field::ExtensionField;
+use p3_matrix::dense::RowMajorMatrix;
 use p3_sumcheck::layout::Table;
 
 pub use crate::rounds::sliced::MAX_SLICED_ROUNDS;
@@ -91,6 +92,15 @@ pub trait MultiStarkConfig {
     /// A configuration proving an AIR with preprocessed columns must override it.
     fn preprocessed_pcs(&self) -> &Self::Pcs {
         unimplemented!("this configuration does not provide a preprocessed commitment scheme")
+    }
+
+    /// One preprocessed table from the trace an AIR returns, one row per trace row.
+    ///
+    /// The proving key holds every preprocessed table for every proof. The default stores
+    /// each cell as an element; a scheme that commits bits may pack the table instead, at one
+    /// bit per cell, as its main tables arrive.
+    fn preprocessed_table(&self, trace: RowMajorMatrix<Self::Val>) -> Table<Self::Val> {
+        Table::new(trace.transpose())
     }
 
     /// Whether the main and preprocessed traces are opened as one pair.

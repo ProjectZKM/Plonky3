@@ -317,6 +317,53 @@ impl<F: Field> Table<F> {
         }
     }
 
+    /// Packs a row-major trace whose every cell is zero or one, one column per polynomial.
+    ///
+    /// The result is the table [`Self::from_packed_bits`] builds: a bit per cell, sixty-four
+    /// rows to a word. No dense column-major copy of the trace is made on the way.
+    ///
+    /// # Returns
+    ///
+    /// Nothing when a cell is neither zero nor one.
+    ///
+    /// # Panics
+    ///
+    /// When the trace has no column, or a height that is not a power of two.
+    pub fn from_boolean_rows(trace: &RowMajorMatrix<F>) -> Option<Self> {
+        let (width, height) = (trace.width, trace.height());
+        assert!(width > 0, "packed table must have at least one column");
+        assert!(
+            height.is_power_of_two(),
+            "table height must be a power of two"
+        );
+        let mut words = alloc::vec![0u64; width * height.div_ceil(64)];
+        let all_bits = words
+            .par_chunks_mut(width)
+            .enumerate()
+            .all(|(block, word_row)| {
+                let rows = 64 * block..(64 * block + 64).min(height);
+                trace.values[rows.start * width..rows.end * width]
+                    .chunks_exact(width)
+                    .enumerate()
+                    .all(|(lane, row)| {
+                        row.iter().zip(word_row.iter_mut()).all(|(&cell, word)| {
+                            if cell == F::ONE {
+                                *word |= 1 << lane;
+                                true
+                            } else {
+                                cell == F::ZERO
+                            }
+                        })
+                    })
+            });
+        all_bits.then(|| {
+            Self::from_packed_bits(
+                RowMajorMatrix::new(words, width),
+                height.trailing_zeros() as usize,
+            )
+        })
+    }
+
     /// Creates a zero-filled table.
     ///
     /// # Panics
@@ -1196,14 +1243,41 @@ mod tests {
     use p3_field::extension::BinomialExtensionField;
     use p3_util::log2_ceil_usize;
     use proptest::prelude::*;
-    use rand::SeedableRng;
     use rand::rngs::SmallRng;
+    use rand::{RngExt, SeedableRng};
 
     use super::*;
     use crate::layout::{Layout, PrefixProver, SuffixProver};
 
     type F = BabyBear;
     type EF = BinomialExtensionField<F, 4>;
+
+    #[test]
+    fn boolean_rows_pack_to_the_cells_a_dense_table_holds() {
+        // Heights below, at and above one word; three columns, so words interleave.
+        for log_height in [3, 6, 9] {
+            let height = 1 << log_height;
+            let mut rng = SmallRng::seed_from_u64(log_height as u64);
+            let cells: Vec<F> = (0..3 * height)
+                .map(|_| F::from_bool(rng.random::<bool>()))
+                .collect();
+            let trace = RowMajorMatrix::new(cells, 3);
+            let packed = Table::from_boolean_rows(&trace).expect("every cell is a bit");
+            let dense = Table::new(trace.clone().transpose());
+            assert!(packed.packed_bits().is_some());
+            for column in 0..3 {
+                for row in 0..height {
+                    assert_eq!(
+                        packed.column(column).value(row),
+                        dense.column(column).value(row)
+                    );
+                }
+            }
+        }
+        // A cell that is not a bit is refused.
+        let trace = RowMajorMatrix::new(vec![F::ONE, F::TWO], 1);
+        assert!(Table::from_boolean_rows(&trace).is_none());
+    }
 
     struct ChunkedSource {
         /// Logical dimensions exposed to the placement plan.

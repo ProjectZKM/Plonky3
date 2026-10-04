@@ -16,7 +16,6 @@ use p3_commit::MultilinearPcs;
 use p3_field::{ExtensionField, Field};
 use p3_lookup::InteractionSymbolicBuilder;
 use p3_matrix::Matrix;
-use p3_sumcheck::layout::Table;
 use p3_util::log2_strict_usize;
 
 use crate::ProvingError;
@@ -209,7 +208,7 @@ where
             .expect("AIR with preprocessed columns must return a preprocessed trace");
 
         preprocessed_log_heights.push(log2_strict_usize(trace.height()));
-        tables.push(Table::new(trace.transpose()));
+        tables.push(config.preprocessed_table(trace));
     }
 
     if tables.is_empty() {
