@@ -1,0 +1,1258 @@
+//! Commit/open/verify round trips across the configuration sweep, and the negative tests that
+//! check the verifier rejects a malformed or mismatched proof for a specific typed reason
+//! rather than only failing. Everything here goes through `p3-binary-pcs`'s public
+//! `MultilinearPcs`/`PrescribedPointPcs` surface, exactly as an external caller would.
+//!
+//! Every prover/verifier pair uses two independently constructed challengers seeded
+//! identically rather than one challenger cloned after proving: a challenger cloned from the
+//! prover's own transcript already carries every observation the prover made, correct or not,
+//! so it can never disagree with a proof that desyncs the transcript from what the prover
+//! actually produced.
+
+use p3_binary_dft::EncodableLevel;
+use p3_binary_field::{
+    BinaryChallenger, BinaryField8, BinaryField16, BinaryField32, BinaryField64, BinaryField128,
+    TowerLevel,
+};
+use p3_binary_pcs::{
+    BinaryPcs, BinaryPcsConfig, BinaryPcsError, BinaryPcsParams, BinaryPcsProof, ChallengeField,
+    FoldAlphabet, GroupedCodewordMmcs,
+};
+use p3_challenger::fs::TranscriptField;
+use p3_challenger::{
+    CanObserve, CanSampleUniformBits, FieldChallenger, GrindingChallenger, HashChallenger,
+};
+use p3_commit::testing::assert_multilinear_commit_contract;
+use p3_commit::{Mmcs, MultilinearPcs};
+use p3_field::{ExtensionField, PrimeCharacteristicRing};
+use p3_keccak::Keccak256Hash;
+use p3_merkle_tree::MerkleTreeMmcs;
+use p3_multilinear_util::point::Point;
+use p3_multilinear_util::poly::Poly;
+use p3_sumcheck::layout::{Layout, SuffixProver, Table};
+use p3_sumcheck::{
+    OpeningBatch, OpeningEvals, OpeningProtocol, PrescribedPointPcs, TableShape, TableSpec,
+};
+use p3_symmetric::{CompressionFunctionFromHasher, SerializingHasher};
+use rand::SeedableRng;
+use rand::distr::{Distribution, StandardUniform};
+use rand::rngs::SmallRng;
+
+type F = BinaryField128;
+type MyHash = SerializingHasher<Keccak256Hash>;
+type MyCompress = CompressionFunctionFromHasher<Keccak256Hash, 2, 32>;
+type MyMmcs = MerkleTreeMmcs<F, u8, MyHash, MyCompress, 2, 32>;
+type MyChallenger = BinaryChallenger<F, HashChallenger<u8, Keccak256Hash, 32>>;
+type MyPcs = BinaryPcs<F, F, MyMmcs, MyMmcs>;
+type MyProof = BinaryPcsProof<F, F, MyMmcs, MyMmcs>;
+
+#[test]
+fn opening_claims_must_fit_the_security_budget() {
+    let mut rng = SmallRng::seed_from_u64(0xA17A);
+    let witness = SuffixProver::<F, F>::new_witness(vec![Table::rand(&mut rng, 1, 1)], 0);
+    let protocol = OpeningProtocol::new(vec![TableSpec::new(
+        TableShape::new(1, 1),
+        (0..7).map(|_| OpeningBatch::new(vec![0], vec![])).collect(),
+    )]);
+    // Both configurations query every pair. Only the claim budget distinguishes them.
+    let prover = BinaryPcs::new(
+        BinaryPcsConfig::try_new::<F, F>(1, params(2, 0, 40)).unwrap(),
+        mmcs(),
+        mmcs(),
+    )
+    .unwrap();
+    let verifier = BinaryPcs::new(
+        BinaryPcsConfig::try_new::<F, F>(1, params(2, 0, 124)).unwrap(),
+        mmcs(),
+        mmcs(),
+    )
+    .unwrap();
+    let mut ch = challenger();
+    let (root, data) = prover.commit(witness, &mut ch).unwrap();
+    let proof = prover.open(data, protocol.clone(), &mut ch).unwrap();
+    assert!(
+        verifier
+            .verify(&root, &proof, &mut challenger(), protocol)
+            .is_err()
+    );
+}
+
+#[test]
+fn single_folds_must_compose_all_rounds_and_query_error() {
+    // Sum_r (2^(22-r) + 1) + 2*20 = 8_388_660 field-error units.
+    // Its rounded bound is 104 bits; reserving half the error for queries leaves 103.
+    assert!(BinaryPcsConfig::try_new::<F, F>(20, params(2, 0, 104)).is_err());
+}
+
+#[test]
+fn binary_pcs_supplies_composed_prescribed_security() {
+    let pcs = BinaryPcs::new(
+        BinaryPcsConfig::try_new::<F, F>(4, params(2, 0, 100)).unwrap(),
+        mmcs(),
+        mmcs(),
+    )
+    .unwrap();
+    let protocol = OpeningProtocol::new(vec![TableSpec::new(
+        TableShape::new(4, 1),
+        vec![OpeningBatch::new(vec![0], vec![0])],
+    )]);
+    let evidence =
+        <MyPcs as PrescribedPointPcs<F, MyChallenger>>::prescribed_security(&pcs, &protocol)
+            .expect("binary PCS must supply its opening bound");
+    assert!(evidence.error().bits() >= 100.0);
+    assert_eq!(evidence.log2_max_candidates, 0.0);
+}
+
+#[test]
+fn claim_boundaries_cover_successors_and_both_opening_modes() {
+    for (nv, security, folding, cap) in [(1, 124, 1, 6), (4, 119, 2, 381)] {
+        let low = BinaryPcsConfig::try_new::<F, F>(nv, params(2, 0, 40))
+            .unwrap()
+            .try_with_folding(folding)
+            .unwrap();
+        let high = BinaryPcsConfig::try_new::<F, F>(nv, params(2, 0, security))
+            .unwrap()
+            .try_with_folding(folding)
+            .unwrap();
+        assert_eq!(high.max_opening_claims(), cap);
+        for count in [cap, cap + 1] {
+            for prescribed in [false, true] {
+                let mut rng = SmallRng::seed_from_u64(999);
+                let witness =
+                    SuffixProver::<F, F>::new_witness(vec![Table::rand(&mut rng, 1, nv)], 0);
+                let protocol = OpeningProtocol::new(vec![TableSpec::new(
+                    TableShape::new(nv, 1),
+                    (0..count / 2)
+                        .map(|_| OpeningBatch::new(vec![0], vec![0]))
+                        .chain((count % 2 == 1).then(|| OpeningBatch::new(vec![0], vec![])))
+                        .collect(),
+                )]);
+                let prover = BinaryPcs::new(low, mmcs(), mmcs()).unwrap();
+                let verifier = BinaryPcs::new(high, mmcs(), mmcs()).unwrap();
+                let mut pc = challenger();
+                let (root, data) = prover.commit(witness, &mut pc).unwrap();
+                let mut vc = challenger();
+                let mut guarded_ch = pc.clone();
+                let result = if prescribed {
+                    prover.observe_commitment(&root, &mut vc);
+                    let points: Vec<Point<F>> = protocol
+                        .iter_openings()
+                        .map(|_| Point::new((0..nv).map(|_| pc.sample_algebra_element()).collect()))
+                        .collect();
+                    let verifier_points: Vec<Point<F>> = protocol
+                        .iter_openings()
+                        .map(|_| Point::new((0..nv).map(|_| vc.sample_algebra_element()).collect()))
+                        .collect();
+                    guarded_ch = pc.clone();
+                    let mut snapshot = guarded_ch.clone();
+                    let guarded =
+                        verifier.try_open_at(data.clone(), &protocol, &points, &mut guarded_ch);
+                    assert_eq!(guarded.is_ok(), count <= cap);
+                    if count > cap {
+                        assert_claim_budget_error(&guarded.err().unwrap(), count, cap, security);
+                        assert_eq!(
+                            guarded_ch.sample_algebra_element::<F>(),
+                            snapshot.sample_algebra_element::<F>()
+                        );
+                    }
+                    let proof = prover
+                        .try_open_at(data, &protocol, &points, &mut pc)
+                        .unwrap();
+                    verifier
+                        .verify_at(&root, &proof, &protocol, &verifier_points, &mut vc)
+                        .map(|_| ())
+                } else {
+                    let mut snapshot = guarded_ch.clone();
+                    let guarded = verifier.try_open(data.clone(), &protocol, &mut guarded_ch);
+                    assert_eq!(guarded.is_ok(), count <= cap);
+                    if count > cap {
+                        assert_claim_budget_error(&guarded.err().unwrap(), count, cap, security);
+                        assert_eq!(
+                            guarded_ch.sample_algebra_element::<F>(),
+                            snapshot.sample_algebra_element::<F>()
+                        );
+                    }
+                    let proof = prover.try_open(data, &protocol, &mut pc).unwrap();
+                    verifier.verify(&root, &proof, &mut vc, protocol.clone())
+                };
+                if count <= cap {
+                    result.unwrap();
+                } else {
+                    assert_claim_budget_error(&result.unwrap_err(), count, cap, security);
+                    assert!(
+                        <MyPcs as PrescribedPointPcs<F, MyChallenger>>::prescribed_security(
+                            &verifier, &protocol
+                        )
+                        .is_none()
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn assert_claim_budget_error(
+    error: &BinaryPcsError<F, <MyMmcs as Mmcs<F>>::Error>,
+    count: usize,
+    cap: usize,
+    security: usize,
+) {
+    assert!(
+        matches!(error, BinaryPcsError::OpeningClaimCountExceedsSecurityBudget {
+        actual, max, security_level
+    } if *actual == count && *max == cap && *security_level == security)
+    );
+}
+
+#[test]
+fn invalid_protocols_and_points_fail_before_transcript_changes() {
+    let mut rng = SmallRng::seed_from_u64(32);
+    let witness = SuffixProver::<F, F>::new_witness(vec![Table::rand(&mut rng, 1, 4)], 0);
+    let pcs = BinaryPcs::new(
+        BinaryPcsConfig::try_new::<F, F>(4, params(2, 0, 100)).unwrap(),
+        mmcs(),
+        mmcs(),
+    )
+    .unwrap();
+    let mut ch = challenger();
+    let (_, data) = pcs.commit(witness, &mut ch).unwrap();
+    let bad = OpeningProtocol::new(vec![TableSpec::new(
+        TableShape::new(5, 1),
+        vec![OpeningBatch::new(vec![0], vec![])],
+    )]);
+    let mut snapshot = ch.clone();
+    assert!(matches!(
+        pcs.try_open(data.clone(), &bad, &mut ch),
+        Err(BinaryPcsError::InvalidOpeningProtocol)
+    ));
+    assert!(
+        <MyPcs as PrescribedPointPcs<F, MyChallenger>>::prescribed_security(&pcs, &bad).is_none()
+    );
+    let good = OpeningProtocol::new(vec![TableSpec::new(
+        TableShape::new(4, 1),
+        vec![OpeningBatch::new(vec![0], vec![])],
+    )]);
+    for points in [vec![], vec![Point::new(vec![F::ZERO; 3])]] {
+        assert!(matches!(
+            pcs.try_open_at(data.clone(), &good, &points, &mut ch),
+            Err(BinaryPcsError::OpeningPointShapeMismatch)
+        ));
+    }
+    assert_eq!(
+        ch.sample_algebra_element::<F>(),
+        snapshot.sample_algebra_element::<F>()
+    );
+
+    let (pcs, root, proof, _) = run_lifecycle(4, 2, 0, 100, 123);
+    let mut vc = challenger();
+    let mut snapshot = vc.clone();
+    for points in [vec![], vec![Point::new(vec![F::ZERO; 3])]] {
+        assert!(matches!(
+            pcs.verify_at(&root, &proof, &good, &points, &mut vc),
+            Err(BinaryPcsError::OpeningPointShapeMismatch)
+        ));
+    }
+    assert!(matches!(
+        pcs.verify_at(
+            &root,
+            &proof,
+            &bad,
+            &[Point::new(vec![F::ZERO; 5])],
+            &mut vc
+        ),
+        Err(BinaryPcsError::InvalidOpeningProtocol)
+    ));
+    assert_eq!(
+        vc.sample_algebra_element::<F>(),
+        snapshot.sample_algebra_element::<F>()
+    );
+}
+
+#[test]
+fn batched_folding_commits_only_batch_boundaries_and_verifies() {
+    for (num_variables, arity, expected_roots) in [(8, 3, 2), (7, 2, 3), (4, 4, 0)] {
+        let config = BinaryPcsConfig::try_new::<F, F>(num_variables, params(2, 0, 100))
+            .unwrap()
+            .try_with_folding(arity)
+            .unwrap();
+        let pcs = BinaryPcs::new(
+            config,
+            GroupedCodewordMmcs::for_folding(mmcs(), &config),
+            GroupedCodewordMmcs::for_folding(mmcs(), &config),
+        )
+        .unwrap();
+        let mut rng = SmallRng::seed_from_u64(0xBA7C);
+        let table = Table::rand(&mut rng, 1, num_variables);
+        let witness = SuffixProver::<F, F>::new_witness(vec![table], 0);
+        let protocol = OpeningProtocol::new(vec![TableSpec::new(
+            TableShape::new(num_variables, 1),
+            vec![OpeningBatch::new(vec![0], vec![0])],
+        )]);
+        let mut ch = challenger();
+        let (root, data) = pcs.commit(witness, &mut ch).unwrap();
+        let proof = pcs.open(data, protocol.clone(), &mut ch).unwrap();
+        assert_eq!(proof.rounds.len(), expected_roots);
+        assert_eq!(proof.sumcheck.num_rounds(), num_variables);
+        let bytes = postcard::to_allocvec(&proof).unwrap();
+        let decoded: BinaryPcsProof<
+            F,
+            F,
+            GroupedCodewordMmcs<MyMmcs>,
+            GroupedCodewordMmcs<MyMmcs>,
+        > = postcard::from_bytes(&bytes).unwrap();
+        pcs.verify(&root, &decoded, &mut challenger(), protocol.clone())
+            .unwrap();
+
+        // Authenticate every symbol in the coset, including those beyond the first pair.
+        let mut tampered = decoded.clone();
+        tampered.base_opened_values[(1 << arity) - 1][0] += F::ONE;
+        assert!(matches!(
+            pcs.verify(&root, &tampered, &mut challenger(), protocol.clone()),
+            Err(BinaryPcsError::MerkleFailed { round: 0, .. })
+        ));
+
+        let mut short_coset = decoded.clone();
+        short_coset.base_opened_values.pop();
+        assert!(matches!(
+            pcs.verify(&root, &short_coset, &mut challenger(), protocol.clone()),
+            Err(BinaryPcsError::OpeningCountMismatch { round: 0, .. })
+        ));
+
+        if !decoded.rounds.is_empty() {
+            let mut tampered = decoded;
+            // The final committed layer precedes a potentially shorter batch.
+            tampered.rounds.last_mut().unwrap().opened_values[0][0] += F::ONE;
+            assert!(matches!(
+                pcs.verify(&root, &tampered, &mut challenger(), protocol),
+                Err(BinaryPcsError::MerkleFailed { round, .. }) if round == expected_roots
+            ));
+        }
+    }
+}
+
+/// Default shape shared by every negative test: enough intermediate rounds
+/// (`num_fold_rounds - 1 == 7`) to truncate or permute, and `pow_bits > 0` so the grinding
+/// rejection has something to catch.
+const NUM_VARIABLES: usize = 8;
+const LOG_INV_RATE: usize = 2;
+const POW_BITS: usize = 4;
+const SECURITY_LEVEL: usize = 40;
+
+const fn mmcs() -> MyMmcs {
+    MyMmcs::new(
+        MyHash::new(Keccak256Hash),
+        MyCompress::new(Keccak256Hash),
+        0,
+    )
+}
+
+const fn challenger() -> MyChallenger {
+    MyChallenger::from_hasher(Vec::new(), Keccak256Hash)
+}
+
+/// The commitment scheme over one tower level, for a level chosen by the caller.
+type LevelMmcs<A> = MerkleTreeMmcs<A, u8, MyHash, MyCompress, 2, 32>;
+
+/// The transcript over one tower level, which is a transcript over its bytes.
+type LevelChallenger<A> = BinaryChallenger<A, HashChallenger<u8, Keccak256Hash, 32>>;
+
+/// The whole scheme at one committed alphabet and one challenge field.
+type LevelPcs<A, C> = BinaryPcs<A, C, LevelMmcs<A>, LevelMmcs<C>>;
+
+const fn level_mmcs<A>() -> LevelMmcs<A> {
+    LevelMmcs::new(
+        MyHash::new(Keccak256Hash),
+        MyCompress::new(Keccak256Hash),
+        0,
+    )
+}
+
+const fn level_challenger<A>() -> LevelChallenger<A> {
+    LevelChallenger::from_hasher(Vec::new(), Keccak256Hash)
+}
+
+/// Commit, open and verify one two-column table over a chosen pair of levels.
+///
+/// The caller picks the arity, the fold batching and the grinding budget.
+/// Nothing else varies, so a failure names the pair and the schedule that produced it.
+fn a_narrow_alphabet_round_trip<A, C>(
+    num_variables: usize,
+    log_folding_factor: usize,
+    pow_bits: usize,
+    seed: u64,
+) where
+    A: EncodableLevel + TranscriptField + FoldAlphabet<C> + PrimeCharacteristicRing,
+    C: ChallengeField<A> + ExtensionField<A> + TowerLevel + FoldAlphabet<C>,
+    StandardUniform: Distribution<A>,
+    LevelMmcs<A>: Mmcs<A>,
+    LevelMmcs<C>: Mmcs<C, Error = <LevelMmcs<A> as Mmcs<A>>::Error>,
+    LevelChallenger<A>: FieldChallenger<A>
+        + GrindingChallenger<Witness = A>
+        + CanSampleUniformBits<A>
+        + CanObserve<<LevelMmcs<A> as Mmcs<A>>::Commitment>
+        + CanObserve<<LevelMmcs<C> as Mmcs<C>>::Commitment>,
+{
+    // The table is one arity below the stack, so its two columns fill the committed cube.
+    //
+    //     table   2 columns of 2^(n-1) cells
+    //     stack   2^n cells, which is the arity the schedule commits
+    let table_arity = num_variables - 1;
+
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let table = Table::<A>::rand(&mut rng, 2, table_arity);
+    let witness = SuffixProver::<A, C>::new_witness(vec![table], 0);
+
+    let protocol = OpeningProtocol::new(vec![TableSpec::new(
+        TableShape::new(table_arity, 2),
+        vec![OpeningBatch::new(vec![0, 1], Vec::new())],
+    )]);
+
+    let config = BinaryPcsConfig::try_new_with_folding::<A, C>(
+        num_variables,
+        params(2, pow_bits, 40),
+        log_folding_factor,
+    )
+    .unwrap();
+
+    // The schedule records both widths, and prices its errors against the challenge one.
+    assert_eq!(config.committed_field_bits(), A::bits());
+    assert_eq!(config.challenge_field_bits(), C::bits());
+
+    let pcs: LevelPcs<A, C> = BinaryPcs::new(config, level_mmcs(), level_mmcs()).unwrap();
+
+    let mut prover_ch = level_challenger::<A>();
+    let (root, data) = pcs.commit(witness, &mut prover_ch).unwrap();
+    let proof = pcs.open(data, protocol.clone(), &mut prover_ch).unwrap();
+
+    // One base symbol is authenticated per query, whatever the alphabet.
+    assert!(proof.base_opened_values.iter().all(|row| row.len() == 1));
+
+    // The verifier runs on its own sponge, so a transcript desync shows up as a rejection.
+    pcs.verify(
+        &root,
+        &proof,
+        &mut level_challenger::<A>(),
+        protocol.clone(),
+    )
+    .unwrap();
+
+    // A tampered narrow symbol must break the fold chain, not slip through the widening.
+    let mut tampered = proof.clone();
+    tampered.base_opened_values[0][0] += A::ONE;
+    assert!(
+        pcs.verify(
+            &root,
+            &tampered,
+            &mut level_challenger::<A>(),
+            protocol.clone()
+        )
+        .is_err(),
+        "a tampered base symbol was accepted"
+    );
+
+    // A witness the search never found is refused, which is what pins that it ran.
+    if pow_bits > 0 {
+        let mut reground = proof;
+        reground.pow_witness += A::ONE;
+        let err = pcs
+            .verify(&root, &reground, &mut level_challenger::<A>(), protocol)
+            .unwrap_err();
+        assert!(
+            matches!(err, BinaryPcsError::InvalidPowWitness),
+            "expected a rejected grinding witness, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn every_committed_alphabet_round_trips_under_every_fold_schedule() {
+    // Invariant: the committed alphabet and the challenge field are separate choices.
+    //
+    // The pairs below are exactly the ones the fold route table admits.
+    // A challenge field must fold into itself, which only the two widest levels do.
+    //
+    //     - 8, 16, 32   ->  64 by lifting, and 128 through the packed route
+    //     - 64          ->  64 by its own route, and 128 through the packed route
+    //     - 128         ->  128 by the packed route
+    //
+    // Fixture state: arity 6, so a 2^8 base codeword, which is the whole 8-bit domain.
+    //
+    // Folding one to four covers a single fold, two batches, and a short trailing batch.
+    const ARITY: usize = 6;
+
+    for folding in 1..=4 {
+        a_narrow_alphabet_round_trip::<BinaryField8, BinaryField64>(ARITY, folding, 0, 0x8064);
+        a_narrow_alphabet_round_trip::<BinaryField8, BinaryField128>(ARITY, folding, 0, 0x8128);
+        a_narrow_alphabet_round_trip::<BinaryField16, BinaryField64>(ARITY, folding, 0, 0x1664);
+        a_narrow_alphabet_round_trip::<BinaryField16, BinaryField128>(ARITY, folding, 0, 0x1612);
+        a_narrow_alphabet_round_trip::<BinaryField32, BinaryField64>(ARITY, folding, 0, 0x3264);
+        a_narrow_alphabet_round_trip::<BinaryField32, BinaryField128>(ARITY, folding, 0, 0x3212);
+        a_narrow_alphabet_round_trip::<BinaryField64, BinaryField64>(ARITY, folding, 0, 0x6464);
+        a_narrow_alphabet_round_trip::<BinaryField64, BinaryField128>(ARITY, folding, 0, 0x6412);
+        a_narrow_alphabet_round_trip::<BinaryField128, BinaryField128>(ARITY, folding, 0, 0x1212);
+    }
+}
+
+#[test]
+fn a_narrow_grinding_witness_is_searched_and_replayed() {
+    // Invariant: the grinding witness is an element of the committed alphabet.
+    //
+    // So a narrow alphabet grinds a narrow witness, which both sides must agree on.
+    //
+    //     - 8 bits    no difficulty at all, since the header takes the whole width
+    //     - 16 bits   8 bits, which is the whole budget that level admits
+    //     - 32 bits   8 bits here, well inside the 24 the level admits
+    //
+    // The caps themselves are pinned separately, against the configuration alone.
+    // What runs here is the search and its replay, which only an end-to-end run reaches.
+    const ARITY: usize = 6;
+
+    a_narrow_alphabet_round_trip::<BinaryField16, BinaryField64>(ARITY, 1, 8, 0xA116);
+    a_narrow_alphabet_round_trip::<BinaryField16, BinaryField128>(ARITY, 2, 8, 0xA126);
+    a_narrow_alphabet_round_trip::<BinaryField32, BinaryField128>(ARITY, 3, 8, 0xA132);
+    a_narrow_alphabet_round_trip::<BinaryField64, BinaryField128>(ARITY, 1, 8, 0xA164);
+}
+
+/// The committed alphabet caps two things the challenge field does not.
+///
+/// The grinding witness is one of its elements, so its width caps the difficulty.
+/// The base codeword lives on its additive domain, so its width caps the codeword.
+#[test]
+fn the_committed_alphabet_caps_the_grind_and_the_domain() {
+    // A 64-bit witness leaves 56 bits under the counter's 8-bit header.
+    assert!(BinaryPcsConfig::try_new::<BinaryField64, F>(8, params(2, 56, 100)).is_ok());
+    assert!(BinaryPcsConfig::try_new::<BinaryField64, F>(8, params(2, 57, 100)).is_err());
+
+    // An 8-bit witness leaves none, so that alphabet admits no work at all.
+    assert!(BinaryPcsConfig::try_new::<BinaryField8, F>(6, params(2, 0, 40)).is_ok());
+    assert!(BinaryPcsConfig::try_new::<BinaryField8, F>(6, params(2, 1, 40)).is_err());
+
+    // An 8-bit level spans 256 domain points, so a 2^9 codeword names one it does not hold.
+    assert!(BinaryPcsConfig::try_new::<BinaryField8, F>(7, params(2, 0, 40)).is_err());
+}
+
+const fn params(log_inv_rate: usize, pow_bits: usize, security_level: usize) -> BinaryPcsParams {
+    BinaryPcsParams {
+        log_inv_rate,
+        pow_bits,
+        security_level,
+    }
+}
+
+/// Commits a random single-column table, opens column 0 at a transcript-sampled point with a
+/// fresh prover challenger, and returns everything a negative test needs: the PCS instance
+/// (reusable for a fresh `verify` call), the commitment, the genuine proof, and the opening
+/// protocol that produced it.
+fn run_lifecycle(
+    num_variables: usize,
+    log_inv_rate: usize,
+    pow_bits: usize,
+    security_level: usize,
+    seed: u64,
+) -> (
+    MyPcs,
+    <MyMmcs as Mmcs<F>>::Commitment,
+    MyProof,
+    OpeningProtocol,
+) {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let table = Table::rand(&mut rng, 1, num_variables);
+    let witness = SuffixProver::<F, F>::new_witness(vec![table], 0);
+
+    let protocol = OpeningProtocol::new(vec![TableSpec::new(
+        TableShape::new(num_variables, 1),
+        vec![OpeningBatch::new(vec![0], Vec::new())],
+    )]);
+
+    let config = BinaryPcsConfig::try_new::<F, F>(
+        num_variables,
+        params(log_inv_rate, pow_bits, security_level),
+    )
+    .unwrap();
+    let pcs = BinaryPcs::new(config, mmcs(), mmcs()).unwrap();
+
+    let mut prover_challenger = challenger();
+    let (commitment, prover_data) = pcs.commit(witness, &mut prover_challenger).unwrap();
+    let proof = pcs
+        .open(prover_data, protocol.clone(), &mut prover_challenger)
+        .unwrap();
+
+    (pcs, commitment, proof, protocol)
+}
+
+/// Runs one commit/open/verify round trip at `num_variables` and `log_inv_rate`, with the
+/// prover and the verifier on two independently constructed challengers seeded identically.
+fn assert_round_trips(num_variables: usize, log_inv_rate: usize, seed: u64) {
+    assert_round_trips_at(num_variables, log_inv_rate, POW_BITS, seed);
+}
+
+/// Runs one round trip with the grinding budget spelled out.
+///
+/// For the configurations whose point is the budget rather than the shape.
+fn assert_round_trips_at(num_variables: usize, log_inv_rate: usize, pow_bits: usize, seed: u64) {
+    let (pcs, commitment, proof, protocol) =
+        run_lifecycle(num_variables, log_inv_rate, pow_bits, SECURITY_LEVEL, seed);
+
+    let mut verifier_challenger = challenger();
+    pcs.verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_or_else(|err| {
+            panic!(
+                "num_variables={num_variables} log_inv_rate={log_inv_rate} pow_bits={pow_bits}: {err:?}"
+            )
+        });
+}
+
+/// The configuration sweep over the two knobs a caller has: the polynomial's arity and the
+/// code rate. The binding order is not a knob — the codeword fold only matches suffix binding,
+/// which `prover.rs`'s unit tests pin — so the type fixes it rather than the sweep covering it.
+#[test]
+fn small_configurations_round_trip() {
+    for &num_variables in &[6usize, 8, 10, 12] {
+        for &log_inv_rate in &[1usize, 2, 3] {
+            let seed = (num_variables as u64) << 8 | log_inv_rate as u64;
+            assert_round_trips(num_variables, log_inv_rate, seed);
+        }
+    }
+}
+
+#[test]
+fn a_zero_grinding_budget_round_trips() {
+    // Invariant: a zero grinding budget must leave both transcripts in the same state.
+    //
+    //     prover  : grind(0)         -> witness zero, transcript untouched
+    //     verifier: check_witness(0) -> accepts,      transcript untouched
+    //
+    // Both sides return early, and they agree only because both do.
+    // Drop either early return and the two desync at query sampling.
+    // Every honest proof would then stop verifying, at every shape.
+    //
+    // A zero budget is accepted for any positive security level, so it is reachable.
+    for &log_inv_rate in &[1usize, 2, 3] {
+        let seed = 0xB17_u64 << 8 | log_inv_rate as u64;
+        assert_round_trips_at(NUM_VARIABLES, log_inv_rate, 0, seed);
+    }
+}
+
+/// The degenerate edge below `small_configurations_round_trip`'s sweep: `num_variables = 1`
+/// gives `num_fold_rounds() == 1`, so `fold_rounds`'s `rounds` vector is empty and every
+/// `num_fold_rounds - 1` derivation in the verifier bottoms out at zero rather than
+/// underflowing.
+#[test]
+fn nv_1_round_trip() {
+    for &log_inv_rate in &[1usize, 2] {
+        let seed = 1u64 << 8 | log_inv_rate as u64;
+        assert_round_trips(1, log_inv_rate, seed);
+    }
+}
+
+/// This phase's exit criterion: a commit/open/verify round trip at `num_variables = 16`. The
+/// unoptimized fold and Merkle paths make a `2^16`-row codeword too slow for `cargo test`'s
+/// default debug profile, so this runs explicitly rather than in every default invocation:
+/// `cargo test --release -- --ignored` locally, or the `p3-binary-pcs` job in `ci-heavy.yml`.
+#[test]
+#[ignore = "commit/open/verify at num_variables = 16; run via `cargo test --release -- --ignored`, or through ci-heavy.yml's p3-binary-pcs job"]
+fn large_configuration_2_16_round_trips() {
+    for &log_inv_rate in &[1usize, 2, 3] {
+        let seed = 16u64 << 8 | log_inv_rate as u64;
+        assert_round_trips(16, log_inv_rate, seed);
+    }
+}
+
+/// A tampered `final_codeword` symbol is rejected: with `log_inv_rate = 2` the genuine final
+/// codeword has 4 symbols, all equal to the sumcheck's final value, so flipping one breaks the
+/// uniformity `verify_opening` checks before it ever reaches the query phase.
+///
+/// The tampered index is 1, not 0: index 0 also serves as `final_value` in the final check's
+/// product clause, so tampering it would be caught by that clause alone and this test would
+/// still pass with the uniformity check deleted. Tampering index 1 leaves `final_value`
+/// correct, so only the uniformity check can catch it.
+#[test]
+fn tampered_final_codeword_symbol_is_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 1);
+
+    let symbol = &mut proof.final_codeword.as_mut_slice()[1];
+    *symbol += F::ONE;
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::FinalCheck),
+        "expected FinalCheck, got {err:?}"
+    );
+}
+
+/// A tampered `opened_values` entry in an intermediate round breaks that round's Merkle
+/// multiproof, which is checked before the fold-consistency chain that reads the row's content.
+#[test]
+fn tampered_round_opened_value_is_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 2);
+
+    assert!(!proof.rounds.is_empty());
+    proof.rounds[0].opened_values[0][0] += F::ONE;
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::MerkleFailed { round: 1, .. }),
+        "expected MerkleFailed at round 1, got {err:?}"
+    );
+}
+
+/// A truncated `rounds` vector is rejected by a structural check — `proof.rounds.len()` against
+/// `config.num_fold_rounds() - 1` — that runs before any transcript operation. `verify_at` is
+/// used rather than `verify` because `verify` unconditionally observes the commitment as its
+/// first step regardless of the proof's validity; `verify_at` leaves that to the caller, so a
+/// challenger that never called it is the correct "untouched" baseline to compare against.
+#[test]
+fn truncated_rounds_vector_is_rejected_without_touching_the_challenger() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 3);
+
+    let expected_rounds = proof.rounds.len();
+    assert!(expected_rounds > 0);
+    proof.rounds.truncate(expected_rounds - 1);
+
+    let points = [Point::<F>::rand(
+        &mut SmallRng::seed_from_u64(4),
+        NUM_VARIABLES,
+    )];
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify_at(
+            &commitment,
+            &proof,
+            &protocol,
+            &points,
+            &mut verifier_challenger,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BinaryPcsError::RoundCountMismatch { expected, actual }
+                if expected == expected_rounds && actual == expected_rounds - 1
+        ),
+        "expected RoundCountMismatch, got {err:?}"
+    );
+
+    // The rejection above must not have touched `verifier_challenger` at all: sampling from it
+    // now must agree with sampling from a challenger that never saw `verify_at` in the first
+    // place, and disagree only if some transcript operation ran before the structural check.
+    let actual: F = verifier_challenger.sample_algebra_element();
+    let expected: F = challenger().sample_algebra_element();
+    assert_eq!(
+        actual, expected,
+        "a malformed proof must not become a transcript oracle"
+    );
+}
+
+/// A proof verified against a different, equally valid `OpeningProtocol` of the same table
+/// shape — opening column 1 of a two-column table instead of column 0 — must not verify: the
+/// evaluations the proof actually carries are claims about the wrong column.
+#[test]
+fn a_proof_checked_against_a_different_protocol_is_rejected() {
+    // A two-column table costs one selector bit for the extra column, so its per-column arity
+    // must be one less than the committed witness's `num_variables` for the two to match.
+    let column_arity = NUM_VARIABLES - 1;
+    let mut rng = SmallRng::seed_from_u64(5);
+    let table = Table::rand(&mut rng, 2, column_arity);
+    let witness = SuffixProver::<F, F>::new_witness(vec![table], 0);
+
+    let opens_column = |col: usize| {
+        OpeningProtocol::new(vec![TableSpec::new(
+            TableShape::new(column_arity, 2),
+            vec![OpeningBatch::new(vec![col], Vec::new())],
+        )])
+    };
+    let protocol_a = opens_column(0);
+    let protocol_b = opens_column(1);
+
+    let config = BinaryPcsConfig::try_new::<F, F>(
+        NUM_VARIABLES,
+        params(LOG_INV_RATE, POW_BITS, SECURITY_LEVEL),
+    )
+    .unwrap();
+    let pcs: MyPcs = BinaryPcs::new(config, mmcs(), mmcs()).unwrap();
+
+    let mut prover_challenger = challenger();
+    let (commitment, prover_data) = pcs.commit(witness, &mut prover_challenger).unwrap();
+    let proof = pcs
+        .open(prover_data, protocol_a, &mut prover_challenger)
+        .unwrap();
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol_b)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::FinalCheck),
+        "expected FinalCheck, got {err:?}"
+    );
+}
+
+/// A proof verified against the commitment of a different polynomial must not verify: the
+/// commitment the verifier observes drives the batching challenge and the query positions, so a
+/// swapped commitment desyncs both from what the proof actually carries.
+#[test]
+fn a_proof_checked_against_a_different_commitment_is_rejected() {
+    let (pcs, _commitment, proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 6);
+
+    let mut rng = SmallRng::seed_from_u64(7);
+    let other_table = Table::rand(&mut rng, 1, NUM_VARIABLES);
+    let other_witness = SuffixProver::<F, F>::new_witness(vec![other_table], 0);
+    let mut other_challenger = challenger();
+    let (other_commitment, _other_prover_data) =
+        pcs.commit(other_witness, &mut other_challenger).unwrap();
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(
+            &other_commitment,
+            &proof,
+            &mut verifier_challenger,
+            protocol,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::FinalCheck),
+        "expected FinalCheck, got {err:?}"
+    );
+}
+
+/// `pow_bits > 0` with a corrupted `pow_witness` is rejected by the grinding check. The
+/// witness is corrupted by perturbing the genuine one, never by grinding a second time: under
+/// `--features parallel`, `GrindingChallenger::grind`'s search can legitimately return a
+/// different valid witness on a second call, which would make a re-grinding test
+/// non-deterministic for a reason unrelated to what it is checking.
+#[test]
+fn corrupted_pow_witness_is_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 8);
+
+    proof.pow_witness += F::ONE;
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::InvalidPowWitness),
+        "expected InvalidPowWitness, got {err:?}"
+    );
+}
+
+#[test]
+fn a_noncanonical_pow_witness_at_zero_difficulty_is_rejected() {
+    // Fixture state: pow_bits = 0, so the grind is a no-op on both sides.
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, 0, SECURITY_LEVEL, 12);
+
+    // Invariant: a zero budget makes zero the one witness an honest prover emits.
+    assert_eq!(proof.pow_witness, F::ZERO);
+
+    // Mutation: any other value.
+    //
+    //     prover  : grind at 0 bits -> zero witness, sponge untouched
+    //     verifier: check at 0 bits -> accepts,      sponge untouched
+    //
+    // Nothing in the transcript binds the field, so only a canonical-value check rejects
+    // this second encoding of the same statement.
+    proof.pow_witness = F::ONE;
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BinaryPcsError::NonCanonicalPowWitness { actual } if actual == F::ONE
+        ),
+        "expected NonCanonicalPowWitness, got {err:?}"
+    );
+}
+
+/// A proof carrying PoW witnesses is rejected outright: every fold round replays with a
+/// freshly built, always-empty `pow_witnesses` vector (see `BinaryPcs::verify_opening`), so
+/// nothing in the proof's own transcript reads or binds the ones this test appends. Without
+/// this guard such a proof would still verify, so a third party could mutate those bytes and
+/// keep a valid proof.
+#[test]
+fn nonempty_sumcheck_pow_witnesses_are_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 10);
+
+    proof.sumcheck.pow_witnesses.push(F::ONE);
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::NonEmptyPowWitnesses { actual: 1 }),
+        "expected NonEmptyPowWitnesses, got {err:?}"
+    );
+}
+
+/// An honest proof whose intermediate round entries are permuted must not verify.
+///
+/// Every intermediate round's commitment is observed into the transcript between two
+/// sumcheck-round replays (`verify_opening` interleaves them), so permuting `proof.rounds`
+/// changes which commitment is observed at which point in the sequence and desyncs every fold
+/// challenge sampled afterwards. That surfaces at the final check — the sumcheck's claimed sum
+/// no longer matches the alpha-batched weight polynomial evaluated at the (now wrong) fold
+/// point — before the query phase, where `FoldMismatch` lives, is ever reached.
+///
+/// `FoldMismatch` itself guards a different failure mode: a prover who commits genuinely
+/// inconsistent codewords from round to round while still producing sumcheck messages and a
+/// final codeword that satisfy the final check on their own. That is a property of what gets
+/// committed, not of the order proof fields are read back in, so no post-hoc permutation of an
+/// otherwise honest proof reaches it: swapping whole `RoundProof` entries (this test) desyncs
+/// the transcript and lands on `FinalCheck`; swapping only the opened values and multiproof
+/// between two rounds while leaving commitments in place instead breaks that round's own Merkle
+/// check, landing on `MerkleFailed`.
+#[test]
+fn permuted_round_commitments_are_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 9);
+
+    assert!(proof.rounds.len() >= 2);
+    proof.rounds.swap(0, 1);
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::FinalCheck),
+        "expected FinalCheck, got {err:?}"
+    );
+}
+
+/// Commits a random single-column table against a **zero-claim** `OpeningProtocol` —
+/// `TableSpec::new(shape, Vec::new())`, legal on the public API — and returns everything a test
+/// needs to replay or mutate the proof.
+///
+/// With no claim recorded, `Verifier::constraint`'s alpha-batched weight has no terms, so
+/// `claimed_sum` and its evaluation at the fold point both collapse to zero; the final check's
+/// product clause, `claimed_sum == w(r) * final_value`, then reads `0 == 0` regardless of what
+/// `final_value` is. The only thing standing between a proximity-only commitment and an
+/// arbitrary uniform final codeword in that branch is the transcript-bound query phase
+/// and the fold-consistency chain `verify_query_paths` walks.
+fn zero_claim_lifecycle(
+    num_variables: usize,
+    seed: u64,
+    log_folding_factor: usize,
+) -> (
+    MyPcs,
+    <MyMmcs as Mmcs<F>>::Commitment,
+    MyProof,
+    OpeningProtocol,
+) {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let table = Table::rand(&mut rng, 1, num_variables);
+    let witness = SuffixProver::<F, F>::new_witness(vec![table], 0);
+
+    let protocol = OpeningProtocol::new(vec![TableSpec::new(
+        TableShape::new(num_variables, 1),
+        Vec::new(),
+    )]);
+
+    let config = BinaryPcsConfig::try_new::<F, F>(
+        num_variables,
+        params(LOG_INV_RATE, POW_BITS, SECURITY_LEVEL),
+    )
+    .unwrap()
+    .try_with_folding(log_folding_factor)
+    .unwrap();
+    let pcs = BinaryPcs::new(config, mmcs(), mmcs()).unwrap();
+
+    let mut prover_challenger = challenger();
+    let (commitment, prover_data) = pcs.commit(witness, &mut prover_challenger).unwrap();
+    let proof = pcs
+        .open(prover_data, protocol.clone(), &mut prover_challenger)
+        .unwrap();
+
+    (pcs, commitment, proof, protocol)
+}
+
+/// A single tampered final-codeword symbol is caught by the final check's uniformity clause
+/// even with a zero-claim protocol, independent of the (here vacuous) product clause — the
+/// zero-claim configuration alone is not what is under test.
+///
+/// Shifting every symbol by the same constant instead keeps the codeword uniform, so both the
+/// product clause and the uniformity check pass. Binding that word before queries now makes
+/// the old grinding witness or Merkle paths fail first; if those still match (e.g. exhaustive
+/// queries), the final fold-consistency check rejects the shifted value.
+#[test]
+fn a_zero_claim_proof_with_a_uniformly_shifted_final_codeword_is_rejected() {
+    let (pcs, commitment, proof, protocol) = zero_claim_lifecycle(NUM_VARIABLES, 11, 1);
+
+    let mut honest_challenger = challenger();
+    pcs.verify(
+        &commitment,
+        &proof,
+        &mut honest_challenger,
+        protocol.clone(),
+    )
+    .unwrap();
+
+    let mut single_symbol = proof.clone();
+    single_symbol.final_codeword.as_mut_slice()[1] += F::ONE;
+    let mut single_symbol_challenger = challenger();
+    let err = pcs
+        .verify(
+            &commitment,
+            &single_symbol,
+            &mut single_symbol_challenger,
+            protocol.clone(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::FinalCheck),
+        "expected FinalCheck, got {err:?}"
+    );
+
+    let mut uniform_shift = proof;
+    for v in uniform_shift.final_codeword.as_mut_slice() {
+        *v += F::ONE;
+    }
+    let mut uniform_shift_challenger = challenger();
+    let err = pcs
+        .verify(
+            &commitment,
+            &uniform_shift,
+            &mut uniform_shift_challenger,
+            protocol,
+        )
+        .unwrap_err();
+    match err {
+        BinaryPcsError::InvalidPowWitness | BinaryPcsError::MerkleFailed { round: 0, .. } => {}
+        BinaryPcsError::FoldMismatch { round, query: 0 } => assert_eq!(round, NUM_VARIABLES),
+        err => panic!("expected rejection in the query phase, got {err:?}"),
+    }
+}
+
+/// With no opening claims, the sumcheck's final product check is vacuous. Batched query
+/// verification must still tie the uniform final word to the authenticated base cosets.
+#[test]
+fn batched_zero_claim_proofs_reject_a_shifted_final_codeword() {
+    for arity in [2, 3, NUM_VARIABLES] {
+        let (pcs, commitment, mut proof, protocol) =
+            zero_claim_lifecycle(NUM_VARIABLES, 0xBA7C, arity);
+        pcs.verify(&commitment, &proof, &mut challenger(), protocol.clone())
+            .unwrap();
+        for symbol in proof.final_codeword.as_mut_slice() {
+            *symbol += F::ONE;
+        }
+        let expected_round = NUM_VARIABLES.div_ceil(arity);
+        let err = pcs
+            .verify(&commitment, &proof, &mut challenger(), protocol)
+            .unwrap_err();
+        match err {
+            BinaryPcsError::InvalidPowWitness | BinaryPcsError::MerkleFailed { round: 0, .. } => {}
+            BinaryPcsError::FoldMismatch { round, query: 0 } => assert_eq!(round, expected_round),
+            err => panic!("expected rejection in the query phase, got {err:?}"),
+        }
+    }
+}
+
+/// The different-commitment test desyncs the whole transcript, so `FinalCheck` fires long
+/// before the base Merkle check ever runs — it proves transcript binding, not commitment
+/// binding. Tampering an opened value directly is what exercises `verify_multi_batch` against
+/// the base commitment itself.
+#[test]
+fn tampered_base_opened_value_is_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 12);
+
+    proof.base_opened_values[0][0] += F::ONE;
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::MerkleFailed { round: 0, .. }),
+        "expected MerkleFailed at round 0, got {err:?}"
+    );
+}
+
+/// A `base_opened_values` entry short of what the sampled query count demands is rejected by
+/// the structural row-count check.
+#[test]
+fn a_short_base_opened_values_is_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 13);
+
+    proof.base_opened_values.pop();
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::OpeningCountMismatch { round: 0, .. }),
+        "expected OpeningCountMismatch at round 0, got {err:?}"
+    );
+}
+
+/// An opened base row wider than the width-1 codeword every round commits is rejected before
+/// the fold chain ever reads it.
+#[test]
+fn a_wide_base_opened_row_is_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 14);
+
+    proof.base_opened_values[0].push(F::ONE);
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::RowWidthMismatch { round: 0, .. }),
+        "expected RowWidthMismatch at round 0, got {err:?}"
+    );
+}
+
+/// A final codeword of the wrong length is rejected before any transcript operation the proof
+/// could otherwise ride along with.
+#[test]
+fn a_wrong_length_final_codeword_is_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 15);
+
+    proof.final_codeword = Poly::new(vec![F::ZERO; 8]);
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BinaryPcsError::FinalCodewordLengthMismatch {
+                expected: 4,
+                actual: 8
+            }
+        ),
+        "expected FinalCodewordLengthMismatch, got {err:?}"
+    );
+}
+
+/// Fewer evaluation batches than the protocol schedules is rejected before any claim is
+/// recorded against the transcript.
+#[test]
+fn a_short_evals_vector_is_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 16);
+
+    proof.evals.pop();
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BinaryPcsError::OpeningBatchCountMismatch {
+                expected: 1,
+                actual: 0
+            }
+        ),
+        "expected OpeningBatchCountMismatch, got {err:?}"
+    );
+}
+
+/// The evaluation claim is what makes this a commitment and not merely a proximity test, and
+/// this is the test that holds it to that: a proof carrying a wrong evaluation of the committed
+/// polynomial must be rejected.
+///
+/// Nothing else in this file covers it. Every other negative test perturbs the proof's
+/// *structure* — a codeword symbol, an opened row, a round count, a witness — and the closest
+/// one, `a_proof_checked_against_a_different_protocol_is_rejected`, swaps which column is
+/// opened rather than what it evaluates to. Deleting the final check's product clause would
+/// leave all of them passing.
+///
+/// The claimed evaluations are absorbed as each claim is recorded, so tampering one both
+/// desyncs every challenge drawn afterwards and breaks the claim the sumcheck rounds reduce.
+/// The final check is where the reduced claim meets the codeword, and so where it surfaces.
+#[test]
+fn a_false_evaluation_claim_is_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 17);
+
+    let genuine = proof.evals[0].current()[0];
+    proof.evals[0] = OpeningEvals::new(vec![genuine + F::ONE], Vec::new());
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::FinalCheck),
+        "expected FinalCheck, got {err:?}"
+    );
+}
+
+/// A tampered sumcheck round message must be rejected. The sumcheck is the leg that reduces
+/// the opening claim to a single scalar, so a prover free to rewrite a round message is free to
+/// reduce a false claim to a true one.
+///
+/// Each round's `[h(0), h(inf)]` pair is observed before that round's challenge is sampled, so
+/// altering one both changes every later fold challenge and breaks the running claim. Round 3
+/// is interior — neither the first, which no earlier round feeds, nor the last, which the final
+/// check reads directly — so the rejection cannot be an artifact of a boundary the round loop
+/// treats specially.
+#[test]
+fn a_tampered_sumcheck_round_message_is_rejected() {
+    let (pcs, commitment, mut proof, protocol) =
+        run_lifecycle(NUM_VARIABLES, LOG_INV_RATE, POW_BITS, SECURITY_LEVEL, 18);
+
+    assert!(proof.sumcheck.num_rounds() > 4);
+    proof.sumcheck.polynomial_evaluations[3][0] += F::ONE;
+
+    let mut verifier_challenger = challenger();
+    let err = pcs
+        .verify(&commitment, &proof, &mut verifier_challenger, protocol)
+        .unwrap_err();
+    assert!(
+        matches!(err, BinaryPcsError::FinalCheck),
+        "expected FinalCheck, got {err:?}"
+    );
+}
+
+/// The commit phase must bind the root the verifier binds, and bind it once.
+///
+/// A prover binds its root while producing it; a verifier never produces one, so it binds
+/// through `observe_commitment`. Nothing checks that the two absorb the same thing, and a
+/// mismatch does not surface as a wrong answer: both sides follow their own code correctly
+/// and the proof is rejected for no stated reason.
+#[test]
+fn commit_binds_what_the_verifier_binds() {
+    let mut rng = SmallRng::seed_from_u64(0xB1D);
+    let config =
+        BinaryPcsConfig::try_new::<F, F>(NUM_VARIABLES, params(LOG_INV_RATE, POW_BITS, 40))
+            .unwrap();
+    let pcs = BinaryPcs::new(config, mmcs(), mmcs()).unwrap();
+
+    let witness = |rng: &mut SmallRng| {
+        SuffixProver::<F, F>::new_witness(vec![Table::rand(rng, 1, NUM_VARIABLES)], 0)
+    };
+    assert_multilinear_commit_contract::<_, F, _>(
+        &pcs,
+        &challenger(),
+        witness(&mut rng),
+        witness(&mut rng),
+    );
+}

@@ -1,0 +1,1780 @@
+//! Factored equality polynomial for space-efficient multilinear operations.
+//!
+//! # Mathematical Background
+//!
+//! The equality polynomial eq(z, x) for z in F^k evaluates to 1 when x = z
+//! on the boolean hypercube and 0 elsewhere. Materializing the full table
+//! requires 2^k space.
+//!
+//! This module splits z at the midpoint into (z_prefix, z_suffix) and exploits:
+//!
+//! ```text
+//! eq(z, x) = eq(z_prefix, x_prefix) * eq(z_suffix, x_suffix)
+//! ```
+//!
+//! By storing eq(z_prefix, .) and eq(z_suffix, .) separately, the total space
+//! is 2 * 2^{k/2} instead of 2^k.
+//!
+//! The suffix-half table (eq1) may be stored in SIMD-packed form
+//! for faster inner-loop throughput on supported architectures.
+
+pub mod eq;
+mod packed_kernel;
+mod spread;
+
+use eq::EqMaybePacked;
+use itertools::Itertools;
+use p3_field::{Algebra, ExtensionField, Field, PackedField, PackedFieldExtension, PackedValue};
+use p3_maybe_rayon::prelude::*;
+use p3_util::log2_strict_usize;
+use spread::SpreadWeights;
+
+use crate::point::Point;
+use crate::poly::{Poly, PolyView, tensor_packed, tensor_unpacked};
+
+/// Extension widths one extension-by-extension multiply-accumulate is charged as.
+///
+/// These contractions do one such step per element they read.
+///
+/// So pricing them by the bytes they move undercharges them by an order of magnitude.
+///
+/// Measured per multiplied element, degree-4 extension over a 4-byte prime field:
+///
+/// ```text
+///     x86-64, scalar packing  : 6.0 ns
+///     aarch64, NEON packing   : 2.5 to 3.5 ns
+///     three widths at 100 ps  : 4.8 ns
+/// ```
+pub(crate) const MUL_ACC_BYTES: usize = 3;
+
+/// Largest tensored weight table the suffix compression builds, in bytes.
+///
+/// Every output row rereads the whole table, so every worker pulls all of it into its own cache.
+///
+/// Past a core's near cache, that traffic costs more than the short dots the table replaces.
+///
+/// Measured on x86-64 (AVX-512) with BabyBear and EF4, tensored / factored time over 2 to 1024 rows:
+///
+/// ```text
+///     table     1 thread        32 threads
+///     16 KiB    0.17 to 0.52    0.17 to 0.79
+///     64 KiB    0.32 to 0.91    0.36 to 1.39
+///     256 KiB   0.40 to 1.41    0.85 to 2.7
+///     1 MiB     0.65 to 1.82    1.4 to 4.7
+/// ```
+const TENSOR_MAX_TABLE_BYTES: usize = 64 << 10;
+
+/// Fewest output rows the suffix compression tensors for.
+///
+/// Building the table costs about one extension multiply per suffix row.
+///
+/// Each output row then saves the factored scaling of its short dots.
+///
+/// Below eight rows that saving does not repay the build on NEON (Apple M4).
+///
+/// Measured there with 2 rows, the tensored path is 1.3x to 1.9x slower at m = 10 to 12.
+///
+/// With 4 rows it is still 1.1x to 1.3x slower at m = 11 and 12.
+///
+/// From 8 rows it breaks even or wins for BabyBear/EF4, Goldilocks/EF2 and GHASH.
+const TENSOR_MIN_ROWS: usize = 8;
+
+/// A 16 KiB tile leaves room in a 32 KiB L1 data cache for source rows and weights.
+const PREFIX_TILE_BYTES: usize = 16 << 10;
+
+/// Minimum output size for tiling, providing at least four target-sized tiles to distribute.
+const PREFIX_TILE_MIN_OUTPUT_BYTES: usize = 64 << 10;
+
+/// Limit each tile to 256 source-row visits so long contractions retain whole-output locality.
+const PREFIX_TILE_MAX_VARIABLES: usize = 8;
+
+/// EPYC 9R45 measurements favor whole-output folds from 32 MiB for a single compressed variable.
+const PREFIX_TILE_X86_MAX_SINGLE_VAR_OUTPUT_BYTES: usize = 32 << 20;
+
+/// Extension widths one base-by-extension multiply-accumulate is charged as, per lane.
+///
+/// A base element times an extension weight is a handful of base multiplies.
+///
+/// Two extension elements cost the square of that.
+///
+/// So the base step earns the smaller charge.
+///
+/// Measured per element multiplied one at a time.
+///
+/// Taken across the contractions that read a base polynomial:
+///
+/// ```text
+///     x86-64, scalar packing  : 1.3 to 5.5 ns
+///     two widths at 100 ps    : 3.2 ns
+/// ```
+///
+/// This prices one lane.
+///
+/// A kernel that multiplies several at once divides by the count it multiplies.
+/// SIMD scales the arithmetic a body does, and not the bytes it moves.
+const BASE_MUL_ACC_BYTES: usize = 2;
+
+/// Bytes one item is charged for multiply-accumulating `count` base elements.
+///
+/// # Arguments
+///
+/// * `count` - base elements one item multiplies
+/// * `lanes` - base elements the kernel multiplies per instruction
+///
+/// Leaving `lanes` out of the charge overprices a vectorized kernel by the packing width,
+/// which is unsafe in both directions the cost model has:
+///
+/// ```text
+///     the gate drops by that factor    ->  a loop splits on 1 / lanes of the work it needs
+///     a task's budget buys 1 / lanes   ->  the split walks back toward one item per task
+/// ```
+///
+/// Break-even for a loop that only just crosses the gate is an overcharge of 1.56 on Linux.
+///
+/// That is the 0.625 us gate divided down to the 0.4 us a dispatch costs per worker.
+///
+/// On macOS the same break-even is 1.25 to 1.5, from a 2.5 us gate over 1.7 to 2.0 us dispatches.
+///
+/// Undercharging instead leaves such a loop whole.
+///
+/// It cannot cut a split loop below one task per worker.
+///
+/// The charge rounds up, so no item is ever priced at nothing and left looking free.
+const fn base_mul_acc_bytes<EF>(count: usize, lanes: usize) -> usize {
+    (BASE_MUL_ACC_BYTES * count * size_of::<EF>()).div_ceil(lanes)
+}
+
+/// Bytes one prefix-fold item is charged.
+///
+/// Such an item folds one block of `count` base elements into an accumulator over the inner
+/// variables, which it reads and rewrites in full.
+///
+/// # Arguments
+///
+/// * `count` - base elements one item multiplies
+/// * `lanes` - base elements the kernel multiplies per instruction
+/// * `inner_evals` - accumulator entries one item reads and writes
+///
+/// The accumulator is really a per-task cost billed per item, since one task allocates one
+/// accumulator however many items it covers.
+///
+/// Billing it per item prices the loop as more expensive the more tasks it would make, which
+/// reads as "this loop is worth splitting" where it actually says "splitting this loop is
+/// expensive".
+///
+/// The model has no way to state a per-task cost, so the term is deliberately mis-attributed.
+const fn prefix_fold_bytes<EF, ACC>(count: usize, lanes: usize, inner_evals: usize) -> usize {
+    base_mul_acc_bytes::<EF>(count, lanes) + 2 * inner_evals * size_of::<ACC>()
+}
+
+/// Factored eq polynomial table for scale * eq(z, .).
+///
+/// Splits the evaluation point z at the midpoint into (z_prefix, z_suffix):
+/// - eq0 stores scale * eq(z_prefix, .) over {0,1}^{k/2}
+/// - eq1 stores eq(z_suffix, .) over {0,1}^{k - k/2}, optionally SIMD-packed
+///
+/// # Memory Layout
+///
+/// ```text
+/// Full table:    2^k extension-field elements
+/// Factored:      2^{k/2} (eq0) + 2^{k - k/2} (eq1)
+/// ```
+///
+/// For k = 20, this is 2 * 1024 instead of 1_048_576 elements.
+#[derive(Debug, Clone)]
+pub struct SplitEq<F: Field, EF: ExtensionField<F>> {
+    /// Prefix-half eq table: scale * eq(z_prefix, .) with 2^{k/2} entries.
+    pub(crate) eq0: Poly<EF>,
+    /// Suffix-half eq table: eq(z_suffix, .), scalar or SIMD-packed.
+    pub(crate) eq1: EqMaybePacked<F, EF>,
+}
+
+impl<F: Field, EF: ExtensionField<F>> SplitEq<F, EF> {
+    /// Creates a factored eq table with a scalar (unpacked) suffix-half.
+    ///
+    /// The evaluation point is split at the midpoint.
+    /// The scale factor is absorbed into the prefix-half table.
+    pub fn new_unpacked(point: &Point<EF>, scale: EF) -> Self {
+        // Split z into (z_prefix, z_suffix) at the midpoint.
+        let (z0, z1) = point.split_at(point.num_variables() / 2);
+        // Build eq0 = scale * eq(z_prefix, .) and eq1 = eq(z_suffix, .).
+        let eq0 = Poly::new_from_point_over::<F>(z0.as_slice(), scale);
+        let eq1 = EqMaybePacked::new_unpacked(&z1);
+        Self { eq0, eq1 }
+    }
+
+    /// Creates a factored eq table, using SIMD packing for the suffix-half when possible.
+    ///
+    /// Falls back to scalar if the suffix-half has fewer variables than log_2(W).
+    /// The scale factor is absorbed into the prefix-half table.
+    pub fn new_packed(point: &Point<EF>, scale: EF) -> Self {
+        // Split z into (z_prefix, z_suffix) at the midpoint.
+        let (z0, z1) = point.split_at(point.num_variables() / 2);
+        // Build eq0 with scale, and attempt SIMD packing for eq1.
+        let eq0 = Poly::new_from_point_over::<F>(z0.as_slice(), scale);
+        let eq1 = EqMaybePacked::new_packed(&z1);
+        Self { eq0, eq1 }
+    }
+
+    /// Converts the factored equality table to an unpacked table in another field.
+    ///
+    /// Each factor is mapped elementwise without materializing the full equality table. The
+    /// caller must provide an `R::from(EF)` map that is a field homomorphism, as required by
+    /// the representation prover; this method preserves the factored layout only.
+    pub fn to_field<R>(&self) -> SplitEq<R, R>
+    where
+        R: Field + From<EF>,
+    {
+        let eq0 = Poly::new(self.eq0.iter().copied().map(R::from).collect());
+        let eq1 = self.eq1.to_field();
+        SplitEq { eq0, eq1 }
+    }
+
+    /// Total number of variables: k = k_prefix + k_suffix.
+    pub fn num_variables(&self) -> usize {
+        self.eq0.num_variables() + self.eq1.num_variables()
+    }
+
+    /// Returns the prefix-half eq table.
+    pub const fn eq0(&self) -> &Poly<EF> {
+        &self.eq0
+    }
+
+    /// Returns the suffix-half eq table.
+    pub const fn eq1(&self) -> &EqMaybePacked<F, EF> {
+        &self.eq1
+    }
+
+    /// Base elements the prefix folds multiply per instruction.
+    ///
+    /// Every prefix fold runs `acc[j] += w * chunk[j]` over one inner block.
+    /// That loop vectorizes whichever way the suffix-half table is stored.
+    ///
+    /// The packing width is what the target vectorizes base-field arithmetic at.
+    const FOLD_LANES: usize = F::Packing::WIDTH;
+
+    /// Base elements the eq1-dot kernels multiply per instruction.
+    ///
+    /// The base chunk is read as packed elements only when the suffix-half table is packed.
+    /// A scalar table dots one element at a time.
+    const fn dot_lanes(&self) -> usize {
+        if self.eq1.is_packed() {
+            F::Packing::WIDTH
+        } else {
+            1
+        }
+    }
+
+    /// Evaluates a base-field polynomial against the factored eq table.
+    ///
+    /// Computes:
+    /// ```text
+    /// sum_{x in {0,1}^k} eq(z, x) * poly(x)
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the polynomial and eq table have different numbers of variables.
+    pub fn eval_base(&self, poly: PolyView<'_, F>) -> EF {
+        assert_eq!(poly.num_variables(), self.num_variables());
+
+        // Short-circuit: a constant polynomial meets the table's total weight.
+        // With no variable, the prefix half is one entry, the scale absorbed at construction.
+        if let Some(constant) = poly.as_constant() {
+            return self.eq0.as_slice()[0] * constant;
+        }
+
+        // Number of scalar elements per eq1 block.
+        let cs = self.eq1.num_scalar_evals();
+        // One item dots one suffix block of base evals, then scales by one prefix weight.
+        // A block is priced by its multiply-accumulates, which cost far more than its reads.
+        poly.as_slice()
+            .par_chunks(cs)
+            .zip_eq(self.eq0.as_slice().par_iter())
+            .with_min_task_bytes(base_mul_acc_bytes::<EF>(cs, self.dot_lanes()))
+            .map(|(chunk, &w0)| self.eq1.dot_with_base(chunk) * w0)
+            .sum::<EF>()
+    }
+
+    /// Evaluates an extension-field polynomial against the factored eq table.
+    ///
+    /// Computes:
+    /// ```text
+    /// sum_{x in {0,1}^k} eq(z, x) * poly(x)
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the polynomial and eq table have different numbers of variables.
+    pub fn eval_ext(&self, poly: PolyView<'_, EF>) -> EF {
+        assert_eq!(poly.num_variables(), self.num_variables());
+
+        // Short-circuit: a constant polynomial meets the table's total weight, the scale.
+        if let Some(constant) = poly.as_constant() {
+            return self.eq0.as_slice()[0] * constant;
+        }
+
+        let cs = self.eq1.num_scalar_evals();
+        let item_bytes = MUL_ACC_BYTES * cs * size_of::<EF>();
+
+        // Spread the suffix weights once, so no block of values is transposed.
+        if let Some(spread) = SpreadWeights::<F, EF>::new(&self.eq1.to_scalars()) {
+            return poly
+                .as_slice()
+                .par_chunks(cs)
+                .zip_eq(self.eq0.as_slice().par_iter())
+                .with_min_task_bytes(item_bytes)
+                .map(|(chunk, &w0)| spread.dot(chunk) * w0)
+                .sum();
+        }
+
+        // One item dots one suffix block of extension evals, scaled by one prefix weight.
+        // A block is priced by its multiply-accumulates, which cost far more than its reads.
+        poly.as_slice()
+            .par_chunks(cs)
+            .zip_eq(self.eq0.as_slice().par_iter())
+            .with_min_task_bytes(item_bytes)
+            .map(|(chunk, &w0)| self.eq1.dot_with_ext(chunk) * w0)
+            .sum::<EF>()
+    }
+
+    /// Evaluates a SIMD-packed extension-field polynomial against the factored eq table.
+    ///
+    /// Computes:
+    /// ```text
+    /// sum_{x in {0,1}^k} eq(z, x) * poly(x)
+    /// ```
+    ///
+    /// The polynomial has k - log_2(W) packed entries representing k variables.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the packed polynomial size is inconsistent with the eq table.
+    pub fn eval_packed(&self, poly: PolyView<'_, EF::ExtensionPacking>) -> EF {
+        assert_eq!(
+            poly.num_variables() + log2_strict_usize(F::Packing::WIDTH),
+            self.num_variables()
+        );
+        // One packed eq1 block per eq0 entry, when eq1 is packed at all.
+        let Some(cs) = self.eq1.packed_len() else {
+            // eq1 is scalar; unpack the polynomial and delegate to the scalar path.
+            return self.eval_ext(poly.unpack().as_view());
+        };
+
+        // Both polynomial and eq1 are packed; use packed dot product kernel.
+        // One item dots one suffix block of packed evals, scaled by one prefix weight.
+        // A block is priced by its multiply-accumulates, which cost far more than its reads.
+        poly.as_slice()
+            .par_chunks(cs)
+            .zip_eq(self.eq0.as_slice().par_iter())
+            .with_min_task_bytes(MUL_ACC_BYTES * cs * size_of::<EF::ExtensionPacking>())
+            .map(|(chunk, &w0)| self.eq1.dot_with_ext_packed(chunk) * w0)
+            .sum::<EF>()
+    }
+
+    /// Adds the factored eq table into a scalar output buffer.
+    ///
+    /// ```text
+    /// out[x] += scale * eq(point, x)   for all x in {0,1}^k
+    /// ```
+    ///
+    /// When scale is None, uses 1.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the output buffer length is not 2^k.
+    pub fn accumulate_into(&self, out: &mut [EF], scale: Option<EF>) {
+        assert_eq!(log2_strict_usize(out.len()), self.num_variables());
+        // Collapse optional scale into a single weight; identity if absent.
+        let w_scale = scale.unwrap_or(EF::ONE);
+        let cs = self.eq1.num_scalar_evals();
+        // One item reads one suffix block of weights and rewrites the matching output.
+        out.par_chunks_mut(cs)
+            .zip(self.eq0.as_slice().par_iter())
+            .with_min_task_bytes(MUL_ACC_BYTES * cs * size_of::<EF>())
+            .for_each(|(chunk, &w0)| {
+                self.eq1.accumulate_scalar_into(chunk, w0 * w_scale);
+            });
+    }
+
+    /// Materializes the full eq table as a polynomial.
+    ///
+    /// A packed suffix half writes the table as one tensor product, each entry stored once.
+    pub fn materialize(&self) -> Poly<EF> {
+        if let Some(eq1) = self.eq1.as_packed() {
+            return Poly::new(tensor_unpacked::<F, EF>(self.eq0.as_slice(), eq1));
+        }
+        let mut out = Poly::zero(self.num_variables());
+        self.accumulate_into(out.as_mut_slice(), None);
+        out
+    }
+
+    /// Adds the factored eq table into a SIMD-packed output buffer.
+    ///
+    /// Same semantics as the scalar version, but the output is in packed form.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the output buffer length * W != 2^k.
+    pub fn accumulate_into_packed(&self, out: &mut [EF::ExtensionPacking], scale: Option<EF>) {
+        assert_eq!(
+            log2_strict_usize(F::Packing::WIDTH * out.len()),
+            self.num_variables()
+        );
+        let w_scale = scale.unwrap_or(EF::ONE);
+
+        // Apply naive method if number of variables is too small
+        if log2_strict_usize(F::Packing::WIDTH) * 2 > self.num_variables() {
+            out.iter_mut()
+                .zip_eq(self.materialize().0.chunks(F::Packing::WIDTH))
+                .for_each(|(out, chunk)| {
+                    *out += EF::ExtensionPacking::from_ext_slice(chunk) * w_scale;
+                });
+        } else {
+            // Chunk size in packed elements (scalar chunk size / W).
+            let cs = self.eq1.num_scalar_evals() / F::Packing::WIDTH;
+            // One item reads one suffix block of weights and rewrites the matching output.
+            out.par_chunks_mut(cs)
+                .zip(self.eq0.as_slice().par_iter())
+                .with_min_task_bytes(MUL_ACC_BYTES * cs * size_of::<EF::ExtensionPacking>())
+                .for_each(|(chunk, &w0)| {
+                    self.eq1.accumulate_packed_into(chunk, w0 * w_scale);
+                });
+        }
+    }
+
+    /// Fixes the prefix variables by summing against the factored eq table.
+    ///
+    /// Given a polynomial with n variables and this eq table with m <= n variables,
+    /// computes:
+    /// ```text
+    /// out(x_suffix) = sum_{y_prefix in {0,1}^m} eq(point, y_prefix) * poly(y_prefix, x_suffix)
+    /// ```
+    ///
+    /// The result has n - m variables.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the eq table has more variables than the polynomial.
+    pub fn compress_prefix(&self, poly: PolyView<'_, F>) -> Poly<EF> {
+        assert!(self.num_variables() <= poly.num_variables());
+        // Number of remaining (output) variables.
+        let k_inner = poly.num_variables() - self.num_variables();
+        // Number of base-field elements per eq0 entry.
+        let size_outer = poly.num_evals() / self.eq0.num_evals();
+
+        // An inner block that fills whole lane groups accumulates packed, then unpacks once.
+        //
+        // The scalar accumulator would multiply one extension lane at a time.
+        //
+        // A packing that multiplies lane by lane gains nothing from it, and pays the pack and unpack.
+        if F::Packing::MUL_LANES > 1
+            && k_inner >= log2_strict_usize(F::Packing::WIDTH)
+            && self.eq1.is_packed()
+        {
+            return self.compress_prefix_to_packed(poly).unpack::<F, EF>();
+        }
+
+        if let Some((tile_len, item_bytes)) = self.prefix_tile_len::<EF>(1 << k_inner) {
+            return self.compress_prefix_tiled(poly, k_inner, tile_len, item_bytes);
+        }
+
+        // One item folds one prefix block of base evals into a whole inner accumulator.
+        //
+        // The sequential pass accumulates into one shared buffer, which no split can do.
+        // Only a loop worth splitting pays for the per-task accumulators a split needs.
+        let item_bytes = prefix_fold_bytes::<EF, EF>(size_outer, Self::FOLD_LANES, 1 << k_inner);
+        if should_split(self.eq0.num_evals(), item_bytes) {
+            self.compress_prefix_split(poly, k_inner, size_outer, item_bytes)
+        } else {
+            self.compress_prefix_whole(poly, k_inner, size_outer)
+        }
+    }
+
+    /// Choose output ownership only for a short contraction with enough output work to split.
+    /// Return the tile length and its item charge so the gate and iterator use the same cost.
+    /// A one-worker pool and the serial backend keep the existing path.
+    fn prefix_tile_len<ACC>(&self, output_len: usize) -> Option<(usize, usize)> {
+        let output_bytes = output_len.saturating_mul(size_of::<ACC>());
+        if self.num_variables() > PREFIX_TILE_MAX_VARIABLES
+            || output_bytes < PREFIX_TILE_MIN_OUTPUT_BYTES
+        {
+            return None;
+        }
+        if cfg!(target_arch = "x86_64")
+            && self.num_variables() == 1
+            && output_bytes >= PREFIX_TILE_X86_MAX_SINGLE_VAR_OUTPUT_BYTES
+        {
+            return None;
+        }
+        let tile_len = (PREFIX_TILE_BYTES / size_of::<ACC>()).max(1);
+        let rows = 1 << self.num_variables();
+        let item_bytes = base_mul_acc_bytes::<EF>(
+            rows * tile_len * size_of::<ACC>() / size_of::<EF>(),
+            Self::FOLD_LANES,
+        );
+        should_split(output_len.div_ceil(tile_len), item_bytes).then_some((tile_len, item_bytes))
+    }
+
+    /// Each task owns a disjoint output tile and visits every prefix row.
+    /// There are no full-output task accumulators and no element-wise reduction pass.
+    fn compress_prefix_tiled(
+        &self,
+        poly: PolyView<'_, F>,
+        k_inner: usize,
+        tile_len: usize,
+        item_bytes: usize,
+    ) -> Poly<EF> {
+        let mut out = Poly::<EF>::zero(k_inner);
+        let inner_stride = out.num_evals();
+        let size_outer = poly.num_evals() / self.eq0.num_evals();
+        out.as_mut_slice()
+            .par_chunks_mut(tile_len)
+            .enumerate()
+            .with_min_task_bytes(item_bytes)
+            .for_each(|(tile, out)| {
+                let offset = tile * tile_len;
+                for (chunk, &w0) in poly.as_slice().chunks(size_outer).zip(self.eq0.iter()) {
+                    self.eq1
+                        .compress_prefix_strided_into(out, &chunk[offset..], w0, inner_stride);
+                }
+            });
+        out
+    }
+
+    /// The prefix compression as one pass, accumulating into a single shared buffer.
+    fn compress_prefix_whole(
+        &self,
+        poly: PolyView<'_, F>,
+        k_inner: usize,
+        size_outer: usize,
+    ) -> Poly<EF> {
+        // Every block adds into the same output, so the order it visits them in is free.
+        let mut out = Poly::<EF>::zero(k_inner);
+        poly.as_slice()
+            .chunks(size_outer)
+            .zip_eq(self.eq0.iter())
+            .for_each(|(chunk, &w0)| {
+                // Delegate inner-loop accumulation to the eq1 kernel.
+                self.eq1.compress_prefix_into(out.as_mut_slice(), chunk, w0);
+            });
+        out
+    }
+
+    /// The prefix compression as a split, with one accumulator per task summed at the end.
+    fn compress_prefix_split(
+        &self,
+        poly: PolyView<'_, F>,
+        k_inner: usize,
+        size_outer: usize,
+        item_bytes: usize,
+    ) -> Poly<EF> {
+        // Each task accumulates into a local buffer, then the buffers are added together.
+        poly.as_slice()
+            .par_chunks(size_outer)
+            .zip_eq(self.eq0.as_slice().par_iter())
+            .with_min_task_bytes(item_bytes)
+            .par_fold_reduce(
+                || Poly::<EF>::zero(k_inner),
+                |mut acc, (chunk, &w0)| {
+                    self.eq1.compress_prefix_into(acc.as_mut_slice(), chunk, w0);
+                    acc
+                },
+                // Merge thread-local accumulators by element-wise addition.
+                |mut acc, part| {
+                    acc.0
+                        .iter_mut()
+                        .zip_eq(part.iter())
+                        .for_each(|(acc, &part)| *acc += part);
+                    acc
+                },
+            )
+    }
+
+    /// Fixes the prefix variables into a SIMD-packed output.
+    ///
+    /// Same operation as the scalar compression, but the result is in packed form.
+    /// Requires n - m >= log_2(W) so at least one full packed element is produced.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the eq table has more variables than the polynomial.
+    /// - Panics if the remaining variables are fewer than log_2(W).
+    pub fn compress_prefix_to_packed(&self, poly: PolyView<'_, F>) -> Poly<EF::ExtensionPacking> {
+        assert!(self.num_variables() <= poly.num_variables());
+        assert!(
+            poly.num_variables() >= (self.num_variables() + log2_strict_usize(F::Packing::WIDTH))
+        );
+        let k_pack = log2_strict_usize(F::Packing::WIDTH);
+        // Output has k_inner packed variables (each packed element holds W scalars).
+        let k_inner = poly.num_variables() - self.num_variables() - k_pack;
+        let size_outer = poly.num_evals() / self.eq0.num_evals();
+
+        if let Some((tile_len, item_bytes)) =
+            self.prefix_tile_len::<EF::ExtensionPacking>(1 << k_inner)
+        {
+            return self.compress_prefix_to_packed_tiled(poly, k_inner, tile_len, item_bytes);
+        }
+
+        // One item folds one prefix block of base evals into a whole inner accumulator.
+        //
+        // The sequential pass accumulates into one shared buffer, which no split can do.
+        let item_bytes = prefix_fold_bytes::<EF, EF::ExtensionPacking>(
+            size_outer,
+            Self::FOLD_LANES,
+            1 << k_inner,
+        );
+        if should_split(self.eq0.num_evals(), item_bytes) {
+            self.compress_prefix_to_packed_split(poly, k_inner, size_outer, item_bytes)
+        } else {
+            self.compress_prefix_to_packed_whole(poly, k_inner, size_outer)
+        }
+    }
+
+    /// Packed counterpart of the disjoint output-tile contraction.
+    fn compress_prefix_to_packed_tiled(
+        &self,
+        poly: PolyView<'_, F>,
+        k_inner: usize,
+        tile_len: usize,
+        item_bytes: usize,
+    ) -> Poly<EF::ExtensionPacking> {
+        let mut out = Poly::<EF::ExtensionPacking>::zero(k_inner);
+        let inner_stride = out.num_evals() * F::Packing::WIDTH;
+        let size_outer = poly.num_evals() / self.eq0.num_evals();
+        out.as_mut_slice()
+            .par_chunks_mut(tile_len)
+            .enumerate()
+            .with_min_task_bytes(item_bytes)
+            .for_each(|(tile, out)| {
+                let offset = tile * tile_len * F::Packing::WIDTH;
+                for (chunk, &w0) in poly.as_slice().chunks(size_outer).zip(self.eq0.iter()) {
+                    self.eq1.compress_prefix_to_packed_strided_into(
+                        out,
+                        &chunk[offset..],
+                        w0,
+                        inner_stride,
+                    );
+                }
+            });
+        out
+    }
+
+    /// The packed prefix compression as one pass, accumulating into a single shared buffer.
+    fn compress_prefix_to_packed_whole(
+        &self,
+        poly: PolyView<'_, F>,
+        k_inner: usize,
+        size_outer: usize,
+    ) -> Poly<EF::ExtensionPacking> {
+        // Every block adds into the same output, so the order it visits them in is free.
+        let mut out = Poly::<EF::ExtensionPacking>::zero(k_inner);
+        poly.as_slice()
+            .chunks(size_outer)
+            .zip_eq(self.eq0.iter())
+            .for_each(|(chunk, &w0)| {
+                self.eq1
+                    .compress_prefix_to_packed_into(out.as_mut_slice(), chunk, w0);
+            });
+        out
+    }
+
+    /// The packed prefix compression as a split, with one accumulator per task.
+    fn compress_prefix_to_packed_split(
+        &self,
+        poly: PolyView<'_, F>,
+        k_inner: usize,
+        size_outer: usize,
+        item_bytes: usize,
+    ) -> Poly<EF::ExtensionPacking> {
+        // Each task accumulates into a local buffer, then the buffers are added together.
+        poly.as_slice()
+            .par_chunks(size_outer)
+            .zip_eq(self.eq0.as_slice().par_iter())
+            .with_min_task_bytes(item_bytes)
+            .par_fold_reduce(
+                || Poly::zero(k_inner),
+                |mut acc, (chunk, &w0)| {
+                    self.eq1
+                        .compress_prefix_to_packed_into(acc.as_mut_slice(), chunk, w0);
+                    acc
+                },
+                |mut acc, part| {
+                    acc.0
+                        .iter_mut()
+                        .zip_eq(part.iter())
+                        .for_each(|(acc, &part)| *acc += part);
+                    acc
+                },
+            )
+    }
+
+    /// Fixes the suffix variables by summing against the factored eq table.
+    ///
+    /// Given a polynomial with n variables and this eq table with m <= n variables,
+    /// computes:
+    /// ```text
+    /// out(x_prefix) = sum_{y_suffix in {0,1}^m} eq(point, y_suffix) * poly(x_prefix, y_suffix)
+    /// ```
+    ///
+    /// The result has n - m variables.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the eq table has more variables than the polynomial.
+    pub fn compress_suffix(&self, poly: PolyView<'_, F>) -> Poly<EF> {
+        // Check before subtracting, so a too-small polynomial cannot wrap the output size.
+        assert!(self.num_variables() <= poly.num_variables());
+
+        // Allocate output and delegate to the in-place version.
+        let mut out = Poly::zero(poly.num_variables() - self.num_variables());
+        self.compress_suffix_into(out.as_mut_slice(), poly);
+        out
+    }
+
+    /// Fixes the suffix variables into a pre-allocated buffer.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the eq table has more variables than the polynomial.
+    /// - Panics if the output buffer length != 2^{n-m}.
+    pub fn compress_suffix_into(&self, out: &mut [EF], poly: PolyView<'_, F>) {
+        assert!(self.num_variables() <= poly.num_variables());
+        assert_eq!(out.len(), poly.num_evals() >> self.num_variables());
+
+        let suffix_rows = 1 << self.num_variables();
+
+        // Every output row dots against the same suffix weights.
+        //
+        //     factored : |eq0| short dots per row, each one extension multiply to scale
+        //     tensored : one dot of 2^m per row, against a table built once
+        //
+        // Every row rereads the whole table, so the table must stay small.
+        //
+        // The table is built once, so enough rows must share it to repay the build.
+        //
+        // A one-lane packing has no vector dot to gain, so it keeps the factored form.
+        let tensored = F::Packing::WIDTH > 1
+            && out.len() >= TENSOR_MIN_ROWS
+            && size_of::<EF>() * suffix_rows <= TENSOR_MAX_TABLE_BYTES;
+        if let Some(eq1) = self.eq1.as_packed()
+            && tensored
+        {
+            let table = tensor_packed::<F, EF>(self.eq0.as_slice(), eq1);
+            out.par_iter_mut()
+                .zip(poly.as_slice().par_chunks_exact(suffix_rows))
+                .with_min_task_bytes(base_mul_acc_bytes::<EF>(suffix_rows, F::Packing::WIDTH))
+                .for_each(|(out, row)| {
+                    let sum =
+                        <EF::ExtensionPacking as Algebra<F::Packing>>::batched_linear_combination(
+                            &table,
+                            F::Packing::pack_slice(row),
+                        );
+                    *out = EF::ExtensionPacking::to_ext_iter([sum]).sum();
+                });
+            return;
+        }
+
+        // One item dots one suffix block of base evals into a single output entry.
+        // A block is priced by its multiply-accumulates, which cost far more than its reads.
+        out.par_iter_mut()
+            .zip(poly.as_slice().par_chunks(suffix_rows))
+            .with_min_task_bytes(base_mul_acc_bytes::<EF>(suffix_rows, self.dot_lanes()))
+            .for_each(|(out, chunk)| {
+                *out = self.eq1.compress_suffix_dot(chunk, &self.eq0);
+            });
+    }
+
+    /// Evaluates a base-field polynomial against the repeat-last successor weights.
+    ///
+    /// Each hypercube row is read at its successor, with the maximal row repeating itself:
+    /// ```text
+    /// sum_{x in {0,1}^k} eq(point, x) * poly(succ_repeat_last(x))
+    /// ```
+    ///
+    /// The factored equality table is contracted directly, so the shifted
+    /// polynomial is never materialized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the polynomial and the equality table have different numbers of variables.
+    pub fn eval_next_base(&self, poly: PolyView<'_, F>) -> EF {
+        // The contraction pairs one polynomial row with one equality weight.
+        assert_eq!(poly.num_variables(), self.num_variables());
+
+        // A constant table has a single row, and its successor is itself.
+        // The shift leaves the value unchanged, and only the table's total weight remains.
+        //
+        // With no variable, the prefix half is one entry, the scale absorbed at construction.
+        if let Some(constant) = poly.as_constant() {
+            return self.eq0.as_slice()[0] * constant;
+        }
+
+        // With a single variable the successor of row 0 is row 1, and row 1 repeats.
+        // Both successor reads land on row 1, so the value is that entry times the total weight.
+        //
+        // The split puts the only variable in the suffix half.
+        // So the prefix half is still the scale.
+        if poly.num_variables() == 1 {
+            return self.eq0.as_slice()[0] * poly.as_slice()[1];
+        }
+
+        let evals = poly.as_slice();
+        // The maximal row repeats instead of wrapping, so handle it separately below.
+        let last = *evals.last().unwrap();
+        // Each prefix weight pairs with one contiguous suffix block of this length.
+        let cs = self.eq1.num_scalar_evals();
+        // Successor shift: dropping the first eval aligns row x with successor x + 1.
+        //
+        //     evals     : [ e0, e1, e2, ..., e_{last} ]
+        //     evals[1..]: [     e1, e2, ..., e_{last} ]
+        //
+        // Each outer (prefix) weight then dots its suffix block against the
+        // suffix-half equality table starting one row early.
+        // One item dots one suffix block of base evals, scaled by one prefix weight.
+        let mut sum = self
+            .eq0
+            .as_slice()
+            .par_iter()
+            .zip_eq(evals[1..].par_chunks(cs))
+            .with_min_task_bytes(base_mul_acc_bytes::<EF>(cs, self.dot_lanes()))
+            .map(|(&w0, chunk)| self.eq1.dot_with_base_shifted(chunk) * w0)
+            .sum::<EF>();
+
+        // Boundary term: the all-ones equality weight times the repeated maximal row.
+        sum += *self.eq0.as_slice().last().unwrap() * self.eq1.last_scalar() * last;
+        sum
+    }
+
+    /// Fixes the prefix variables against the shifted equality table.
+    ///
+    /// The shifted table reads each prefix row at its predecessor:
+    /// ```text
+    /// T = [0, eq[0], ..., eq[last - 1]]
+    /// ```
+    ///
+    /// The result is a polynomial over the remaining inner variables:
+    /// ```text
+    /// out(x_suffix) = sum_{y_prefix != 0}
+    ///     eq(point, y_prefix - 1) * poly(y_prefix, x_suffix)
+    /// ```
+    pub fn compress_prefix_shifted(&self, poly: PolyView<'_, F>) -> Poly<EF> {
+        // The prefix variables fixed here must be a subset of the polynomial's variables.
+        assert!(self.num_variables() <= poly.num_variables());
+
+        // Inner variables are the ones left free after fixing the prefix.
+        let k_inner = poly.num_variables() - self.num_variables();
+        let inner_size = 1 << k_inner;
+        // One outer chunk per prefix row; each spans all suffix-times-inner evals.
+        let size_outer = poly.num_evals() / self.eq0.num_evals();
+        let out = Poly::<EF>::zero(k_inner);
+
+        // No prefix variables means nothing to fix, so the shifted sum is empty.
+        if self.num_variables() == 0 {
+            return out;
+        }
+
+        // One item folds one prefix block of base evals into a whole inner accumulator.
+        //
+        // The sequential pass threads a carry from block to block, which no split can do.
+        // Only a loop worth splitting pays to rebuild each boundary from its own index.
+        let item_bytes = prefix_fold_bytes::<EF, EF>(size_outer, Self::FOLD_LANES, inner_size);
+        if should_split(self.eq0.num_evals(), item_bytes) {
+            self.compress_prefix_shifted_split(poly, k_inner, size_outer, inner_size, item_bytes)
+        } else {
+            self.compress_prefix_shifted_whole(poly, out, size_outer, inner_size)
+        }
+    }
+
+    /// The shifted prefix compression as one pass, threading the boundary as a running carry.
+    fn compress_prefix_shifted_whole(
+        &self,
+        poly: PolyView<'_, F>,
+        mut out: Poly<EF>,
+        size_outer: usize,
+        inner_size: usize,
+    ) -> Poly<EF> {
+        // The shift means each prefix row also receives its predecessor's last suffix weight,
+        // which lives in the previous chunk.
+        let mut prev_last = EF::ZERO;
+        let eq1_last = self.eq1.last_scalar();
+        poly.as_slice()
+            .chunks(size_outer)
+            .zip_eq(self.eq0.iter())
+            .for_each(|(chunk, &w0)| {
+                // Boundary contribution from the previous chunk's last suffix row.
+                out.as_mut_slice()
+                    .iter_mut()
+                    .zip_eq(chunk[..inner_size].iter())
+                    .for_each(|(out, &value)| *out += prev_last * value);
+                // Add this chunk's interior shifted-suffix contributions.
+                self.eq1
+                    .compress_prefix_shifted_into(out.as_mut_slice(), chunk, w0);
+                // Carry this prefix weight times the last suffix weight to the next chunk.
+                prev_last = w0 * eq1_last;
+            });
+        out
+    }
+
+    /// The shifted prefix compression as a split, rebuilding each boundary from its own index.
+    fn compress_prefix_shifted_split(
+        &self,
+        poly: PolyView<'_, F>,
+        k_inner: usize,
+        size_outer: usize,
+        inner_size: usize,
+        item_bytes: usize,
+    ) -> Poly<EF> {
+        // Threads cannot share the sequential carry, so each chunk recomputes its own.
+        let eq0 = self.eq0.as_slice();
+        let eq1_last = self.eq1.last_scalar();
+        poly.as_slice()
+            .par_chunks(size_outer)
+            .enumerate()
+            .zip_eq(eq0.par_iter())
+            .with_min_task_bytes(item_bytes)
+            .par_fold_reduce(
+                // Per-thread accumulator over the inner variables.
+                || Poly::<EF>::zero(k_inner),
+                |mut acc, ((idx, chunk), &w0)| {
+                    // Reconstruct the cross-chunk boundary from the predecessor
+                    // prefix weight, except for the very first chunk which has none.
+                    if idx > 0 {
+                        let boundary = eq0[idx - 1] * eq1_last;
+                        acc.as_mut_slice()
+                            .iter_mut()
+                            .zip_eq(chunk[..inner_size].iter())
+                            .for_each(|(out, &value)| *out += boundary * value);
+                    }
+                    // Add this chunk's interior shifted-suffix contributions.
+                    self.eq1
+                        .compress_prefix_shifted_into(acc.as_mut_slice(), chunk, w0);
+                    acc
+                },
+                // Merge two partial accumulators element-wise.
+                |mut acc, part| {
+                    acc.as_mut_slice()
+                        .iter_mut()
+                        .zip_eq(part.iter())
+                        .for_each(|(acc, &part)| *acc += part);
+                    acc
+                },
+            )
+    }
+
+    /// Fixes the suffix variables against the shifted equality table.
+    ///
+    /// The shifted table reads each suffix row at its predecessor:
+    /// ```text
+    /// T = [0, eq[0], ..., eq[last - 1]]
+    /// ```
+    ///
+    /// The result is a polynomial over the remaining prefix variables:
+    /// ```text
+    /// out(x_prefix) = sum_{y_suffix != 0}
+    ///     eq(point, y_suffix - 1) * poly(x_prefix, y_suffix)
+    /// ```
+    pub fn compress_suffix_shifted(&self, poly: PolyView<'_, F>) -> Poly<EF> {
+        // The suffix variables fixed here must be a subset of the polynomial's variables.
+        assert!(self.num_variables() <= poly.num_variables());
+
+        // One contiguous block of suffix rows per prefix row.
+        let suffix_rows = 1 << self.num_variables();
+        let out_len = poly.num_evals() >> self.num_variables();
+        let mut out = EF::zero_vec(out_len);
+        // Each prefix-half weight pairs with one suffix block of this length.
+        let cs = self.eq1.num_scalar_evals();
+
+        // No suffix variables means nothing to fix, so the shifted sum is empty.
+        if self.num_variables() == 0 {
+            return Poly::new(out);
+        }
+
+        // One item contracts one suffix block of base evals into a single output entry.
+        // A block is priced by its multiply-accumulates, which cost far more than its reads.
+        out.par_iter_mut()
+            .zip_eq(poly.as_slice().par_chunks(suffix_rows))
+            .with_min_task_bytes(base_mul_acc_bytes::<EF>(suffix_rows, self.dot_lanes()))
+            .for_each(|(out, chunk)| {
+                // Drop the first suffix row so row y reads its predecessor y - 1,
+                // then split the prefix-half weights across the suffix sub-blocks.
+                *out = self
+                    .eq0
+                    .iter()
+                    .zip_eq(chunk[1..].chunks(cs))
+                    .map(|(&w0, chunk)| self.eq1.dot_with_base_shifted(chunk) * w0)
+                    .sum();
+            });
+
+        Poly::new(out)
+    }
+
+    /// Returns the all-ones entry of the factored equality table.
+    ///
+    /// With unit scale this equals the product of the point coordinates.
+    /// It is the boundary weight that the repeated maximal row carries in the successor decomposition.
+    pub fn last_scalar(&self) -> EF {
+        // The factored table stores eq as a product of a prefix half and a suffix
+        // half, so the all-ones entry is the product of each half's last entry.
+        *self.eq0.as_slice().last().unwrap() * self.eq1.last_scalar()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use p3_baby_bear::BabyBear;
+    use p3_field::extension::BinomialExtensionField;
+    use p3_field::{PrimeCharacteristicRing, dot_product};
+    use proptest::prelude::*;
+    use rand::rngs::SmallRng;
+    use rand::{RngExt, SeedableRng};
+
+    use super::*;
+
+    type F = BabyBear;
+    type PackedF = <F as Field>::Packing;
+    type EF = BinomialExtensionField<F, 4>;
+
+    /// Minimum number of variables required for SIMD packing.
+    const K_PACK: usize = log2_strict_usize(PackedF::WIDTH);
+
+    /// Item charge that drives a split arm down to one item per task.
+    ///
+    /// The price saturates, so the per-task cap floors at a single item.
+    ///
+    /// A split arm handed the gate's own charge would run these small shapes as one task,
+    /// leaving the merge that joins two tasks untested.
+    const SPLIT_EVERY_ITEM: usize = usize::MAX;
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn compress_suffix_rejects_a_polynomial_smaller_than_the_table() {
+        // Fixture state: a 3-variable eq table against a 2-variable polynomial.
+        //
+        //     output variables = 2 - 3  ->  underflows, so the bound is checked first
+        let point = Point::<EF>::rand(&mut SmallRng::seed_from_u64(1), 3);
+        let poly = Poly::<F>::zero(2);
+        let _ = SplitEq::<F, EF>::new_unpacked(&point, EF::ONE).compress_suffix(poly.as_view());
+    }
+
+    // A wrong source-row stride, tile offset, eq split, or lost scale changes the
+    // result against this full-table contraction, independently of the tiled kernels.
+    fn check_tiled_prefix<F: Field, EF: ExtensionField<F>>()
+    where
+        rand::distr::StandardUniform: rand::distr::Distribution<F> + rand::distr::Distribution<EF>,
+    {
+        let mut rng = SmallRng::seed_from_u64(0x0070_6566_6978);
+        let k_pack = log2_strict_usize(F::Packing::WIDTH);
+        let inner_vars = k_pack + 4;
+        let inner_len = 1 << inner_vars;
+        for m in [0, 1, 2, 4, 8] {
+            let point = Point::<EF>::rand(&mut rng, m);
+            let poly = Poly::<F>::rand(&mut rng, inner_vars + m);
+            for scale in [EF::ZERO, rng.random()] {
+                let weights = Poly::new_from_point_over::<F>(point.as_slice(), scale);
+                let expected = Poly::new(
+                    (0..inner_len)
+                        .map(|i| {
+                            weights
+                                .iter()
+                                .enumerate()
+                                .map(|(row, &w)| w * poly.as_slice()[row * inner_len + i])
+                                .sum::<EF>()
+                        })
+                        .collect(),
+                );
+                for split in 0..=m {
+                    if m == 8 && ![0, 4, 8].contains(&split) {
+                        continue;
+                    }
+                    let (z0, z1) = point.split_at(split);
+                    for packed in [false, true] {
+                        let eq = SplitEq::<F, EF> {
+                            eq0: Poly::new_from_point_over::<F>(z0.as_slice(), scale),
+                            eq1: if packed {
+                                EqMaybePacked::new_packed(&z1)
+                            } else {
+                                EqMaybePacked::new_unpacked(&z1)
+                            },
+                        };
+                        let size_outer = poly.num_evals() / eq.eq0.num_evals();
+                        assert_eq!(
+                            expected,
+                            eq.compress_prefix_whole(poly.as_view(), inner_vars, size_outer)
+                        );
+                        assert_eq!(expected, eq.compress_prefix(poly.as_view()));
+                        for tile_len in [1, 3, 17] {
+                            assert_eq!(
+                                expected,
+                                eq.compress_prefix_tiled(
+                                    poly.as_view(),
+                                    inner_vars,
+                                    tile_len,
+                                    SPLIT_EVERY_ITEM,
+                                )
+                            );
+                            assert_eq!(
+                                expected,
+                                eq.compress_prefix_to_packed_tiled(
+                                    poly.as_view(),
+                                    inner_vars - k_pack,
+                                    tile_len,
+                                    SPLIT_EVERY_ITEM,
+                                )
+                                .unpack::<F, EF>()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_prefix_preserves_strides_splits_and_scales() {
+        check_tiled_prefix::<F, F>();
+        check_tiled_prefix::<F, EF>();
+        check_tiled_prefix::<
+            p3_goldilocks::Goldilocks,
+            BinomialExtensionField<p3_goldilocks::Goldilocks, 2>,
+        >();
+        check_tiled_prefix::<p3_binary_field::Ghash128, p3_binary_field::Ghash128>();
+    }
+
+    #[test]
+    fn tiled_prefix_dispatch_matches_whole() {
+        let mut rng = SmallRng::seed_from_u64(0x7469_6c65);
+        // Large outputs may tile depending on the pool; long prefixes use the fallback.
+        // The direct kernel test above forces tiles independently of the pool.
+        // Cover both scalar and packed equality storage.
+        for m in [1, 2, 4, 8, 10] {
+            let inner_vars = 13;
+            let poly = Poly::<F>::rand(&mut rng, inner_vars + m);
+            let point = Point::<EF>::rand(&mut rng, m);
+            let scale = rng.random();
+            for eq in [
+                SplitEq::<F, EF>::new_unpacked(&point, scale),
+                SplitEq::<F, EF>::new_packed(&point, scale),
+            ] {
+                let size_outer = poly.num_evals() / eq.eq0.num_evals();
+                let expected = eq.compress_prefix_whole(poly.as_view(), inner_vars, size_outer);
+                assert_eq!(expected, eq.compress_prefix(poly.as_view()));
+                assert_eq!(
+                    expected,
+                    eq.compress_prefix_to_packed(poly.as_view())
+                        .unpack::<F, EF>()
+                );
+            }
+        }
+    }
+
+    /// Naive multilinear evaluation by materializing the full eq table.
+    fn eval_reference<F: Field, EF: ExtensionField<F>>(evals: &[F], point: &[EF]) -> EF {
+        let eq = Poly::new_from_point(point, EF::ONE);
+        dot_product(eq.iter().copied(), evals.iter().copied())
+    }
+
+    /// Naive accumulation by materializing the full eq table.
+    fn accumulate_reference(out: &mut [EF], point: &Point<EF>, scale: EF) {
+        let eq = Poly::new_from_point(point.as_slice(), scale);
+        out.iter_mut().zip(eq.iter()).for_each(|(o, &e)| *o += e);
+    }
+
+    // Eval: unpacked == packed == reference
+
+    proptest! {
+        #[test]
+        fn prop_eval_base_matches_reference(k in 0usize..=14, seed in any::<u64>()) {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let poly = Poly::<F>::rand(&mut rng, k);
+            let point = Point::<EF>::rand(&mut rng, k);
+            // Compute the expected result via naive full-table evaluation.
+            let expected = eval_reference(poly.as_slice(), point.as_slice());
+
+            // Both scalar and packed construction must match the reference.
+            prop_assert_eq!(
+                expected,
+                SplitEq::<F, EF>::new_unpacked(&point, EF::ONE).eval_base(poly.as_view()),
+            );
+            prop_assert_eq!(
+                expected,
+                SplitEq::<F, EF>::new_packed(&point, EF::ONE).eval_base(poly.as_view()),
+            );
+        }
+
+        #[test]
+        fn prop_both_prefix_arms_agree(
+            split_vars in 1usize..=6,
+            inner_vars in 0usize..=6,
+            seed in any::<u64>(),
+        ) {
+            // Invariant: the gate that picks an arm moves with the pool and with the
+            // element width, so both arms run in production on some host.
+            //
+            // They must therefore agree on every input, not merely on the ones a given
+            // machine happens to route to the arm under test.
+            //
+            // Calling the halves directly forces both at the same input, which growing a
+            // fixture until the host splits cannot do.
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let point = Point::<EF>::rand(&mut rng, split_vars);
+            let poly = Poly::<F>::rand(&mut rng, split_vars + inner_vars);
+
+            // Shapes the two halves need, derived exactly as the public entry points do.
+            let eq = SplitEq::<F, EF>::new_packed(&point, EF::ONE);
+            let k_inner = poly.num_variables() - eq.num_variables();
+            let size_outer = poly.num_evals() / eq.eq0.num_evals();
+
+            // Plain prefix compression: shared accumulator against per-task accumulators.
+            prop_assert_eq!(
+                eq.compress_prefix_whole(poly.as_view(), k_inner, size_outer),
+                eq.compress_prefix_split(poly.as_view(), k_inner, size_outer, SPLIT_EVERY_ITEM),
+            );
+
+            // Shifted prefix compression: threaded carry against rebuilt boundaries.
+            let inner_size = 1 << k_inner;
+            prop_assert_eq!(
+                eq.compress_prefix_shifted_whole(
+                    poly.as_view(),
+                    Poly::<EF>::zero(k_inner),
+                    size_outer,
+                    inner_size,
+                ),
+                eq.compress_prefix_shifted_split(
+                    poly.as_view(),
+                    k_inner,
+                    size_outer,
+                    inner_size,
+                    SPLIT_EVERY_ITEM,
+                ),
+            );
+        }
+
+        #[test]
+        fn prop_both_packed_prefix_arms_agree(
+            split_vars in 1usize..=6,
+            extra_vars in 0usize..=5,
+            seed in any::<u64>(),
+        ) {
+            // The packed compression needs at least one whole packed element of output.
+            let k_pack = log2_strict_usize(<F as Field>::Packing::WIDTH);
+            let inner_vars = extra_vars + k_pack;
+
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let point = Point::<EF>::rand(&mut rng, split_vars);
+            let poly = Poly::<F>::rand(&mut rng, split_vars + inner_vars);
+
+            let eq = SplitEq::<F, EF>::new_packed(&point, EF::ONE);
+            let k_inner = poly.num_variables() - eq.num_variables() - k_pack;
+            let size_outer = poly.num_evals() / eq.eq0.num_evals();
+
+            prop_assert_eq!(
+                eq.compress_prefix_to_packed_whole(poly.as_view(), k_inner, size_outer),
+                eq.compress_prefix_to_packed_split(
+                    poly.as_view(),
+                    k_inner,
+                    size_outer,
+                    SPLIT_EVERY_ITEM,
+                ),
+            );
+        }
+
+        #[test]
+        fn prop_eval_ext_matches_reference(k in 0usize..=14, seed in any::<u64>()) {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let poly = Poly::<EF>::rand(&mut rng, k);
+            let point = Point::<EF>::rand(&mut rng, k);
+            let expected = eval_reference(poly.as_slice(), point.as_slice());
+
+            prop_assert_eq!(
+                expected,
+                SplitEq::<F, EF>::new_unpacked(&point, EF::ONE).eval_ext(poly.as_view()),
+            );
+            prop_assert_eq!(
+                expected,
+                SplitEq::<F, EF>::new_packed(&point, EF::ONE).eval_ext(poly.as_view()),
+            );
+        }
+
+        #[test]
+        fn prop_eval_packed_matches_reference(
+            k in K_PACK..=14usize,
+            seed in any::<u64>(),
+        ) {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let poly = Poly::<EF>::rand(&mut rng, k);
+            let point = Point::<EF>::rand(&mut rng, k);
+            let expected = eval_reference(poly.as_slice(), point.as_slice());
+            // Convert to packed representation.
+            let packed = poly.pack::<F, EF>();
+
+            // Both packed and unpacked eq tables must produce the same result.
+            prop_assert_eq!(
+                expected,
+                SplitEq::<F, EF>::new_packed(&point, EF::ONE).eval_packed(packed.as_view()),
+            );
+            prop_assert_eq!(
+                expected,
+                SplitEq::<F, EF>::new_unpacked(&point, EF::ONE).eval_packed(packed.as_view()),
+            );
+        }
+    }
+
+    #[test]
+    fn factored_conversion_preserves_scalar_and_packed_layouts() {
+        let mut rng = SmallRng::seed_from_u64(0xC0FFEE);
+        for (num_variables, packed) in [(K_PACK, false), (2 * K_PACK, true)] {
+            let point = Point::<EF>::rand(&mut rng, num_variables);
+            let scale: EF = rng.random();
+            let split = if packed {
+                SplitEq::<F, EF>::new_packed(&point, scale)
+            } else {
+                SplitEq::<F, EF>::new_unpacked(&point, scale)
+            };
+            let converted = split.to_field::<EF>();
+
+            assert_eq!(converted.num_variables(), split.num_variables());
+            assert_eq!(converted.materialize(), split.materialize());
+        }
+    }
+
+    // Accumulate: reference vs unpacked vs packed, scale in ctor vs argument
+
+    proptest! {
+        #[test]
+        fn prop_accumulate_matches_reference(k in 0usize..=14, seed in any::<u64>()) {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let input = Poly::<EF>::rand(&mut rng, k);
+            let point = Point::<EF>::rand(&mut rng, k);
+            let alpha: EF = rng.random();
+
+            // Reference: full eq table materialization.
+            let mut expected = input.clone();
+            accumulate_reference(expected.as_mut_slice(), &point, alpha);
+
+            // Scale passed as argument, unpacked path.
+            let mut out = input.clone();
+            SplitEq::<F, EF>::new_unpacked(&point, EF::ONE)
+                .accumulate_into(out.as_mut_slice(), Some(alpha));
+            prop_assert_eq!(&expected, &out);
+
+            // Scale baked into constructor, unpacked path.
+            let mut out = input.clone();
+            SplitEq::<F, EF>::new_unpacked(&point, alpha)
+                .accumulate_into(out.as_mut_slice(), None);
+            prop_assert_eq!(&expected, &out);
+
+            // Scale as argument, packed path.
+            let mut out = input.clone();
+            SplitEq::<F, EF>::new_packed(&point, EF::ONE)
+                .accumulate_into(out.as_mut_slice(), Some(alpha));
+            prop_assert_eq!(&expected, &out);
+
+            // Scale in constructor, packed path.
+            let mut out = input;
+            SplitEq::<F, EF>::new_packed(&point, alpha)
+                .accumulate_into(out.as_mut_slice(), None);
+            prop_assert_eq!(&expected, &out);
+        }
+
+        #[test]
+        fn prop_accumulate_into_packed_matches_scalar(
+            k in K_PACK..=14usize,
+            seed in any::<u64>(),
+        ) {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let input = Poly::<EF>::rand(&mut rng, k);
+            let point = Point::<EF>::rand(&mut rng, k);
+            let alpha: EF = rng.random();
+
+            // Scalar reference via full eq table.
+            let mut expected = input.clone();
+            accumulate_reference(expected.as_mut_slice(), &point, alpha);
+
+            // Scale as argument into packed output.
+            let mut out = input.pack::<F, EF>();
+            SplitEq::<F, EF>::new_packed(&point, EF::ONE)
+                .accumulate_into_packed(out.as_mut_slice(), Some(alpha));
+            prop_assert_eq!(&expected, &out.unpack::<F, EF>());
+
+            // Scale in constructor into packed output.
+            let mut out = input.pack::<F, EF>();
+            SplitEq::<F, EF>::new_packed(&point, alpha)
+                .accumulate_into_packed(out.as_mut_slice(), None);
+            prop_assert_eq!(&expected, &out.unpack::<F, EF>());
+        }
+    }
+
+    // Compress roundtrip: compress then eval == direct eval
+
+    proptest! {
+        #[test]
+        fn prop_compress_prefix_roundtrip(
+            k in 0usize..=14,
+            point_k_ratio in 0.0f64..=1.0,
+            seed in any::<u64>(),
+        ) {
+            // Split the point at a random position determined by the ratio.
+            let point_k = ((k as f64) * point_k_ratio) as usize;
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let poly = Poly::<F>::rand(&mut rng, k);
+            let point = Point::<EF>::rand(&mut rng, k);
+            // Ground truth: direct naive evaluation.
+            let expected = eval_reference(poly.as_slice(), point.as_slice());
+
+            // Split the point and create two factored tables.
+            let (point_lo, point_hi) = point.split_at(point_k);
+            let split_lo = SplitEq::<F, EF>::new_unpacked(&point_lo, EF::ONE);
+            let split_hi = SplitEq::<F, EF>::new_unpacked(&point_hi, EF::ONE);
+
+            // Compress prefix variables, then evaluate the remainder.
+            let compressed = split_lo.compress_prefix(poly.as_view());
+            prop_assert_eq!(expected, split_hi.eval_ext(compressed.as_view()));
+        }
+
+        #[test]
+        fn prop_compress_packed_roundtrip(
+            k in (2 * K_PACK)..=14usize,
+            seed in any::<u64>(),
+        ) {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let poly = Poly::<F>::rand(&mut rng, k);
+            let point = Point::<EF>::rand(&mut rng, k);
+            let expected = eval_reference(poly.as_slice(), point.as_slice());
+
+            // Split at midpoint so both halves have enough vars for packing.
+            let point_k = k / 2;
+            prop_assume!(k >= point_k + K_PACK);
+
+            let (point_lo, point_hi) = point.split_at(point_k);
+            let split_lo = SplitEq::<F, EF>::new_packed(&point_lo, EF::ONE);
+            let split_hi = SplitEq::<F, EF>::new_packed(&point_hi, EF::ONE);
+
+            // Scalar compress then eval.
+            let compressed = split_lo.compress_prefix(poly.as_view());
+            prop_assert_eq!(expected, split_hi.eval_ext(compressed.as_view()));
+
+            // Packed compress, unpack, then eval.
+            let compressed = split_lo
+                .compress_prefix_to_packed(poly.as_view())
+                .unpack::<F, EF>();
+            prop_assert_eq!(expected, split_hi.eval_ext(compressed.as_view()));
+
+            // Compress suffix variables, then evaluate in the other direction.
+            let compressed = split_hi.compress_suffix(poly.as_view());
+            prop_assert_eq!(expected, split_lo.eval_ext(compressed.as_view()));
+        }
+    }
+
+    // Edge cases
+
+    #[test]
+    fn test_eval_constant_poly() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        for k in 0..=4 {
+            let point = Point::<EF>::rand(&mut rng, k);
+            // All evaluations are 2; eq(z,.) sums to 1, so the result should be 2.
+            let poly = Poly::new(vec![F::TWO; 1 << k]);
+            let result = SplitEq::<F, EF>::new_packed(&point, EF::ONE).eval_base(poly.as_view());
+            assert_eq!(result, EF::TWO);
+        }
+    }
+
+    #[test]
+    fn scaled_table_meets_constant_polynomial() {
+        // Invariant: every evaluation of a scaled table equals scale * f~(z).
+        //
+        // Fixture state: no variable, scale 3, constant polynomial 5.
+        //
+        //     table           [3]
+        //     expected        3 * 5 = 15
+        //
+        // Mutation: returning the constant itself gives 5.
+        let scale = EF::from(F::from_u32(3));
+        let constant = F::from_u32(5);
+        let split = SplitEq::<F, EF>::new_packed(&Point::new(vec![]), scale);
+        let expected = split.materialize().as_slice()[0] * constant;
+        assert_eq!(expected, scale * constant);
+
+        let poly = Poly::new(vec![constant]);
+        assert_eq!(split.eval_base(poly.as_view()), expected);
+
+        let poly = Poly::new(vec![EF::from(constant)]);
+        assert_eq!(split.eval_ext(poly.as_view()), expected);
+
+        let poly = Poly::new(vec![constant]);
+        assert_eq!(split.eval_next_base(poly.as_view()), expected);
+    }
+
+    #[test]
+    fn scaled_table_meets_one_variable_successor() {
+        // Invariant: the successor contraction of a scaled table is scale times the unscaled one.
+        //
+        // Fixture state: one variable p_0 = 7, scale 3, polynomial [5, 11].
+        //
+        //     row 0 reads row 1, row 1 repeats    ->  sum of the weights times 11
+        //     weights sum to the scale            ->  3 * 11 = 33
+        //
+        // Mutation: dropping the scale gives 11.
+        let scale = EF::from(F::from_u32(3));
+        let p0 = EF::from(F::from_u32(7));
+        let split = SplitEq::<F, EF>::new_packed(&Point::new(vec![p0]), scale);
+        let poly = Poly::new(vec![F::from_u32(5), F::from_u32(11)]);
+        assert_eq!(
+            split.eval_next_base(poly.as_view()),
+            scale * F::from_u32(11)
+        );
+    }
+
+    #[test]
+    fn test_accumulate_zero_scale() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let k = 6;
+        let input = Poly::<EF>::rand(&mut rng, k);
+        let point = Point::<EF>::rand(&mut rng, k);
+
+        // Accumulating with zero scale should be a no-op.
+        let mut out = input.clone();
+        SplitEq::<F, EF>::new_packed(&point, EF::ZERO).accumulate_into(out.as_mut_slice(), None);
+        assert_eq!(input, out);
+    }
+
+    #[test]
+    fn test_compress_prefix_full_point_yields_scalar() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let k = 8;
+        let poly = Poly::<F>::rand(&mut rng, k);
+        let point = Point::<EF>::rand(&mut rng, k);
+        let expected = eval_reference(poly.as_slice(), point.as_slice());
+
+        // Compressing all variables should produce a 0-variable (scalar) result.
+        let split = SplitEq::<F, EF>::new_unpacked(&point, EF::ONE);
+        let compressed = split.compress_prefix(poly.as_view());
+        assert_eq!(compressed.num_variables(), 0);
+        assert_eq!(compressed.as_constant().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_compress_suffix_no_vars_is_identity() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let k = 8;
+        let poly = Poly::<F>::rand(&mut rng, k);
+        // Zero-variable point: eq table is trivially 1.
+        let point = Point::<EF>::rand(&mut rng, 0);
+
+        // Compressing zero variables should return the polynomial lifted to the extension field.
+        let split = SplitEq::<F, EF>::new_unpacked(&point, EF::ONE);
+        let compressed = split.compress_suffix(poly.as_view());
+        assert_eq!(compressed.num_variables(), k);
+        // Each element should equal its base-field counterpart promoted to the extension.
+        for (c, &p) in compressed.iter().zip(poly.iter()) {
+            assert_eq!(*c, EF::from(p));
+        }
+    }
+
+    // Dense reference: fix the prefix variables with the shifted weight table
+    // T = [0, eq[0], ..., eq[last - 1]] built from the trusted equality table.
+    fn compress_prefix_shifted_poly_reference<F: Field, EF: ExtensionField<F>>(
+        poly: &Poly<F>,
+        point: &Point<EF>,
+    ) -> Poly<EF> {
+        assert!(point.num_variables() <= poly.num_variables());
+        let inner_rows = 1 << (poly.num_variables() - point.num_variables());
+        let split_rows = 1 << point.num_variables();
+
+        // Shift the equality table down one row, leading with a zero, so prefix
+        // row y carries the weight of its predecessor row y - 1.
+        let eq = Poly::new_from_point(point.as_slice(), EF::ONE);
+        let mut weights = vec![EF::ZERO; split_rows];
+        weights[1..].copy_from_slice(&eq.as_slice()[..split_rows - 1]);
+
+        // Weighted sum of each prefix block into the inner-variable output.
+        let mut out = Poly::<EF>::zero(poly.num_variables() - point.num_variables());
+        for (y, &weight) in weights.iter().enumerate() {
+            let block = &poly.as_slice()[y * inner_rows..(y + 1) * inner_rows];
+            for (out, &value) in out.as_mut_slice().iter_mut().zip(block.iter()) {
+                *out += weight * value;
+            }
+        }
+        out
+    }
+
+    // Dense reference: fix the suffix variables with the shifted weight table
+    // T = [0, eq[0], ..., eq[last - 1]] built from the trusted equality table.
+    fn compress_suffix_shifted_reference<F: Field, EF: ExtensionField<F>>(
+        poly: &Poly<F>,
+        point: &Point<EF>,
+    ) -> Poly<EF> {
+        assert!(point.num_variables() <= poly.num_variables());
+        let suffix_vars = point.num_variables();
+        let suffix_rows = 1 << suffix_vars;
+        let prefix_rows = poly.num_evals() >> suffix_vars;
+
+        // Shift the equality table down one row so each suffix row carries the
+        // weight of its predecessor; the leading row has none.
+        let eq = Poly::new_from_point(point.as_slice(), EF::ONE);
+        let mut weights = vec![EF::ZERO; suffix_rows];
+        weights[1..].copy_from_slice(&eq.as_slice()[..suffix_rows - 1]);
+
+        // Weighted sum within each prefix block.
+        let mut out = Poly::<EF>::zero(poly.num_variables() - suffix_vars);
+        for prefix_idx in 0..prefix_rows {
+            for (suffix_idx, &weight) in weights.iter().enumerate() {
+                let value = poly.as_slice()[(prefix_idx << suffix_vars) | suffix_idx];
+                out.as_mut_slice()[prefix_idx] += weight * value;
+            }
+        }
+        out
+    }
+
+    proptest! {
+        #[test]
+        fn prop_eval_next_base_matches_shifted_poly_reference(k in 0usize..=14, seed in any::<u64>()) {
+            // Invariant: the split-form successor evaluation equals the dense
+            // shifted-table reference, for both scalar and packed storage.
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let poly = Poly::<F>::rand(&mut rng, k);
+            let point = Point::<EF>::rand(&mut rng, k);
+            // Golden value: read each row at its successor, repeat the
+            // maximal row, then evaluate the rebuilt table the plain way.
+            let mut shifted = poly.as_slice().to_vec();
+            let last = *shifted.last().unwrap();
+            shifted.rotate_left(1);
+            *shifted.last_mut().unwrap() = last;
+            let expected = eval_reference(&shifted, point.as_slice());
+
+            // Scalar storage must match the golden value.
+            prop_assert_eq!(
+                expected,
+                SplitEq::<F, EF>::new_unpacked(&point, EF::ONE).eval_next_base(poly.as_view()),
+            );
+            // Packed storage must match the golden value.
+            prop_assert_eq!(
+                expected,
+                SplitEq::<F, EF>::new_packed(&point, EF::ONE).eval_next_base(poly.as_view()),
+            );
+        }
+
+        #[test]
+        fn prop_compress_prefix_shifted_matches_reference(
+            split_vars in 0usize..=8,
+            inner_vars in 0usize..=8,
+            seed in any::<u64>(),
+        ) {
+            // Invariant: prefix compression with shifted weights matches the
+            // dense reference, for both base-field and extension-field polynomials.
+            let mut rng = SmallRng::seed_from_u64(seed);
+            // Total variables = fixed prefix variables + remaining inner variables.
+            let total_vars = split_vars + inner_vars;
+            let point = Point::<EF>::rand(&mut rng, split_vars);
+
+            // Base-field input: coefficients in the base field.
+            let base_poly = Poly::<F>::rand(&mut rng, total_vars);
+            let expected = compress_prefix_shifted_poly_reference(&base_poly, &point);
+            prop_assert_eq!(
+                expected,
+                SplitEq::<F, EF>::new_packed(&point, EF::ONE)
+                    .compress_prefix_shifted(base_poly.as_view()),
+            );
+
+            // Extension-field input: exercises the all-extension storage path.
+            let ext_poly = Poly::<EF>::rand(&mut rng, total_vars);
+            let expected = compress_prefix_shifted_poly_reference(&ext_poly, &point);
+            prop_assert_eq!(
+                expected,
+                SplitEq::<EF, EF>::new_packed(&point, EF::ONE)
+                    .compress_prefix_shifted(ext_poly.as_view()),
+            );
+        }
+
+        #[test]
+        fn prop_compress_suffix_shifted_matches_reference(
+            suffix_vars in 0usize..=8,
+            prefix_vars in 0usize..=6,
+            seed in any::<u64>(),
+        ) {
+            // Invariant: suffix compression with shifted weights matches the
+            // dense reference, for both base-field and extension-field polynomials.
+            let mut rng = SmallRng::seed_from_u64(seed);
+            // Total variables = fixed suffix variables + remaining prefix variables.
+            let total_vars = suffix_vars + prefix_vars;
+            let point = Point::<EF>::rand(&mut rng, suffix_vars);
+
+            // Base-field input: coefficients in the base field.
+            let base_poly = Poly::<F>::rand(&mut rng, total_vars);
+            let expected = compress_suffix_shifted_reference(&base_poly, &point);
+            prop_assert_eq!(
+                expected,
+                SplitEq::<F, EF>::new_packed(&point, EF::ONE)
+                    .compress_suffix_shifted(base_poly.as_view()),
+            );
+
+            // Extension-field input: exercises the all-extension storage path.
+            let ext_poly = Poly::<EF>::rand(&mut rng, total_vars);
+            let expected = compress_suffix_shifted_reference(&ext_poly, &point);
+            prop_assert_eq!(
+                expected,
+                SplitEq::<EF, EF>::new_packed(&point, EF::ONE)
+                    .compress_suffix_shifted(ext_poly.as_view()),
+            );
+        }
+    }
+
+    #[test]
+    fn compress_prefix_shifted_rebuilds_boundaries_when_split() {
+        // The two arms of this contraction differ in more than how the work is divided.
+        //
+        //     one task   : threads a carry from one prefix block to the next
+        //     many tasks : rebuilds each block's boundary from its own index
+        //
+        // The property test covers the carry-threading arm across its whole range.
+        //
+        // It only brushes the other arm, in its top corner.
+        // This pins the boundary-rebuilding arm at a shape that splits on a wide pool.
+        let mut rng = SmallRng::seed_from_u64(0xB0117);
+        let split_vars = 8;
+
+        // A pool of one worker never splits, so there is no second arm to reach.
+        // That covers a serial build and a single-vCPU runner alike.
+        if current_num_threads() == 1 {
+            return;
+        }
+
+        // Fixture state: the shape the contraction hands to the shared policy.
+        //
+        //     prefix blocks : 2^(split_vars / 2)
+        //     block width   : 2^(split_vars + inner_vars) / prefix blocks
+        //     accumulator   : 2^inner_vars, read and written once per block
+        let prefix_blocks = 1 << (split_vars / 2);
+        let item_bytes = |inner_vars: usize| {
+            let size_outer = (1 << (split_vars + inner_vars)) / prefix_blocks;
+            // The kernel's own charge, so the fixture cannot drift away from the gate it aims at.
+            prefix_fold_bytes::<EF, EF>(size_outer, SplitEq::<F, EF>::FOLD_LANES, 1 << inner_vars)
+        };
+
+        // The gate scales with the pool, and the charge scales down with the packing width.
+        //
+        // So no fixed shape splits on every host.
+        // Grow the inner block until this one does.
+        let mut inner_vars = 12;
+        while !should_split(prefix_blocks, item_bytes(inner_vars)) {
+            // A forced never-split budget must not grow the fixture without bound.
+            if split_vars + inner_vars == 24 {
+                return;
+            }
+            inner_vars += 1;
+        }
+
+        let point = Point::<EF>::rand(&mut rng, split_vars);
+        let poly = Poly::<F>::rand(&mut rng, split_vars + inner_vars);
+
+        // The split arm must still agree with the dense reference.
+        let expected = compress_prefix_shifted_poly_reference(&poly, &point);
+        assert_eq!(
+            expected,
+            SplitEq::<F, EF>::new_packed(&point, EF::ONE).compress_prefix_shifted(poly.as_view()),
+        );
+    }
+}

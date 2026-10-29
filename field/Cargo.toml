@@ -1,18 +1,43 @@
 [package]
 name = "p3-field"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "A modular framework for finite fields, including support for generic binomial extensions, SIMD-packed field arithmetic."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+parallel = ["p3-maybe-rayon/parallel"]
 
 [dependencies]
-p3-util.workspace = true
 p3-maybe-rayon.workspace = true
-num-bigint.workspace = true
-num-traits.workspace = true
-num-integer.workspace = true
-nums.workspace = true
-tracing.workspace = true
+p3-util.workspace = true
 
 itertools.workspace = true
+num-bigint.workspace = true
+paste.workspace = true
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
+tracing.workspace = true
+
+[dev-dependencies]
+p3-baby-bear = { path = "../baby-bear" }
+p3-field-testing = { path = "../field-testing" }
+p3-goldilocks = { path = "../goldilocks" }
+p3-koala-bear = { path = "../koala-bear" }
+p3-mersenne-31 = { path = "../mersenne-31" }
+
+criterion.workspace = true
+proptest.workspace = true
+rayon.workspace = true
+
+[[bench]]
+name = "batch_inverse"
+path = "benches/batch_inverse.rs"
+harness = false
+
+[lints]
+workspace = true

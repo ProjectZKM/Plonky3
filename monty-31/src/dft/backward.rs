@@ -1,21 +1,23 @@
+#![allow(clippy::use_self)]
+
 //! Discrete Fourier Transform, in-place, decimation-in-time
 //!
 //! Straightforward recursive algorithm, "unrolled" up to size 256.
 //!
-//! Inspired by Bernstein's djbfft: https://cr.yp.to/djbfft.html
+//! Inspired by Bernstein's djbfft: <https://cr.yp.to/djbfft.html>.
 
 extern crate alloc;
 use alloc::vec::Vec;
 
 use itertools::izip;
-use p3_field::{Field, FieldAlgebra, PackedFieldPow2, PackedValue};
+use p3_field::{Field, PackedFieldPow2, PackedValue, PrimeCharacteristicRing};
 use p3_util::log2_strict_usize;
 
 use crate::utils::monty_reduce;
 use crate::{FieldParameters, MontyField31, TwoAdicData};
 
 #[inline(always)]
-fn backward_butterfly<T: FieldAlgebra + Copy>(x: T, y: T, roots: T) -> (T, T) {
+fn backward_butterfly<T: PrimeCharacteristicRing + Copy>(x: T, y: T, roots: T) -> (T, T) {
     let t = y * roots;
     (x + t, x - t)
 }
@@ -64,7 +66,7 @@ fn backward_iterative_packed<const HALF_RADIX: usize, T: PackedFieldPow2>(
     // roots <-- [1, roots[1], ..., roots[HALF_RADIX-1], 1, roots[1], ...]
     let roots = T::from_fn(|i| roots[i % HALF_RADIX]);
 
-    input.chunks_exact_mut(2).for_each(|pair| {
+    input.as_chunks_mut::<2>().0.iter_mut().for_each(|pair| {
         let (x, y) = backward_butterfly_interleaved::<HALF_RADIX, _>(pair[0], pair[1], roots);
         pair[0] = x;
         pair[1] = y;
@@ -73,7 +75,7 @@ fn backward_iterative_packed<const HALF_RADIX: usize, T: PackedFieldPow2>(
 
 #[inline]
 fn backward_iterative_packed_radix_2<T: PackedFieldPow2>(input: &mut [T]) {
-    input.chunks_exact_mut(2).for_each(|pair| {
+    input.as_chunks_mut::<2>().0.iter_mut().for_each(|pair| {
         let x = pair[0];
         let y = pair[1];
         let (mut x, y) = x.interleave(y, 1);
@@ -146,6 +148,7 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
         let packing_width = <Self as Field>::Packing::WIDTH;
         let n = packed_input.len() * packing_width;
         let lg_n = log2_strict_usize(n);
+        debug_assert_eq!(root_table.len(), lg_n - 1);
 
         // Start loop after doing radix 16 separately. This value is determined by the largest
         // packing width we will encounter, which is 16 at the moment for AVX512. Specifically
@@ -162,17 +165,16 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
         Self::backward_iterative_packed_radix_16(packed_input);
 
         for lg_m in FIRST_LOOP_LAYER..(lg_n - NUM_SPECIALISATIONS) {
-            let s = lg_n - lg_m - 1;
             let m = 1 << lg_m;
 
-            let roots = &root_table[s];
+            let roots = &root_table[lg_m - 1];
             debug_assert_eq!(roots.len(), m);
 
             Self::backward_iterative_layer(packed_input, roots, m);
         }
         // Specialise the last few iterations; improves performance a little.
-        backward_iterative_layer_1(packed_input, &root_table[1]); // lg_m == lg_n - 2, s == 1
-        backward_pass_packed(packed_input, &root_table[0]); // lg_m == lg_n - 1, s == 0
+        backward_iterative_layer_1(packed_input, &root_table[lg_n - 3]); // lg_m == lg_n - 2, s == 1
+        backward_pass_packed(packed_input, &root_table[lg_n - 2]); // lg_m == lg_n - 1, s == 0
     }
 
     #[inline]
@@ -180,7 +182,7 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
         let half_n = input.len() / 2;
         assert_eq!(roots.len(), half_n);
 
-        // Safe because 0 <= half_n < a.len()
+        // Safe because 0 <= half_n < input.len()
         let (xs, ys) = unsafe { input.split_at_mut_unchecked(half_n) };
 
         let s = xs[0] + ys[0];
@@ -215,7 +217,7 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
 
         // Expanding the calculation of t3 saves one instruction
         let t1 = MP::PRIME + a1.value - a3.value;
-        let t3 = MontyField31::new_monty(monty_reduce::<MP>(
+        let t3 = Self::new_monty(monty_reduce::<MP>(
             t1 as u64 * MP::INV_ROOTS_8.as_ref()[2].value as u64,
         ));
         let t5 = a1 + a3;
@@ -261,7 +263,7 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
         Self::backward_16(a0);
         Self::backward_16(a1);
 
-        Self::backward_pass(a, &root_table[0]);
+        Self::backward_pass(a, &root_table[root_table.len() - 1]);
     }
 
     /// Assumes `input.len() >= 64`.
@@ -278,10 +280,10 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
 
             // Safe because input.len() > ITERATIVE_FFT_THRESHOLD
             let (a0, a1) = unsafe { input.split_at_mut_unchecked(input.len() / 2) };
-            Self::backward_fft_recur(a0, &root_table[1..]);
-            Self::backward_fft_recur(a1, &root_table[1..]);
+            Self::backward_fft_recur(a0, &root_table[..root_table.len() - 1]);
+            Self::backward_fft_recur(a1, &root_table[..root_table.len() - 1]);
 
-            backward_pass_packed(input, &root_table[0]);
+            backward_pass_packed(input, &root_table[root_table.len() - 1]);
         }
     }
 
@@ -301,7 +303,7 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
             2 => Self::backward_2(input),
             _ => {
                 let packed_input = <Self as Field>::Packing::pack_slice_mut(input);
-                Self::backward_fft_recur(packed_input, root_table)
+                Self::backward_fft_recur(packed_input, root_table);
             }
         }
     }

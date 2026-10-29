@@ -1,0 +1,1680 @@
+//! The Wiedemann tower `GF(2) ⊂ GF(4) ⊂ GF(2^4) ⊂ … ⊂ GF(2^128)`.
+//!
+//! Writing `T_k` for `GF(2^(2^k))`, the tower is defined recursively by `T_0 = GF(2)` and
+//!
+//! ```text
+//! T_{k+1} = T_k[X_k] / (X_k² + X_{k−1}·X_k + 1),      X_{−1} = 1.
+//! ```
+//!
+//! An element of `T_{k+1}` is stored in the low `2^{k+1}` bits of an unsigned integer: the low
+//! half holds the `T_k`-coefficient of `1`, the high half the `T_k`-coefficient of `X_k`, and
+//! the splitting repeats down to the individual bits of `GF(2)`.
+
+use alloc::vec::Vec;
+use core::fmt::{self, Debug, Display, Formatter};
+use core::iter::{Product, Sum};
+use core::mem::ManuallyDrop;
+use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+
+use num_bigint::BigUint;
+use p3_field::op_assign_macros::{
+    impl_add_assign, impl_add_base_field, impl_div_methods, impl_mul_methods, impl_sub_assign,
+    impl_sub_base_field, ring_sum,
+};
+use p3_field::{Algebra, Field, Packable, PrimeCharacteristicRing, RawDataSerializable};
+use rand::Rng;
+use rand::distr::{Distribution, StandardUniform};
+use serde::de::Error;
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::clmul::{HAS_HARDWARE_CLMUL, mul_64, mul_128};
+use crate::gf2::characteristic_two_methods;
+use crate::{Gf2, tables};
+
+/// Seals [`TowerLevel`] against implementation outside this crate.
+///
+/// `domain_point`, `AdditiveNtt` and every identity `p3-binary-dft` builds on assume
+/// `cantor_basis` is *the* Cantor basis — `v_0 = 1` and `v_i² + v_i = v_{i−1}` — not merely some
+/// `F_2`-linearly independent sequence. An external implementation satisfying none of that would
+/// fail silently, with wrong evaluations rather than a compile error, wherever those assume it.
+pub(crate) mod private {
+    pub trait Sealed {}
+}
+
+/// One level of the Wiedemann tower, `GF(2^(2^k))`, in whichever basis carries it.
+///
+/// The tower fixes each level as an abstract field, not as a set of bit patterns.
+///
+/// An implementation may hold its elements in any `F_2`-basis of that field.
+/// What it may not do is report a Cantor basis other than the image of the tower's own.
+///
+/// That is what makes every transform agree whichever representation runs it.
+pub trait TowerLevel: Field + private::Sealed {
+    /// The backing integer of an element.
+    type Repr: Copy;
+
+    /// The `k` in `GF(2^(2^k))`.
+    const LOG_BITS: usize;
+    /// Build an element from a bit pattern, discarding the bits above `2^LOG_BITS`.
+    fn from_repr(r: Self::Repr) -> Self;
+    /// The bit pattern of this element, zero above `2^LOG_BITS`.
+    fn to_repr(self) -> Self::Repr;
+    /// Multiply by the tower's generator `X_{k−1}` of this level over the one below.
+    fn mul_alpha(self) -> Self;
+    /// Build an element from the next [`RawDataSerializable::NUM_BYTES`] bytes of a
+    /// little-endian byte stream, discarding the bits above `2^LOG_BITS`.
+    ///
+    /// # Panics
+    /// Panics if the stream ends before a whole element has been read.
+    fn from_le_byte_iter(bytes: impl Iterator<Item = u8>) -> Self;
+    /// The `i`-th vector of the Cantor basis of this level.
+    ///
+    /// # Panics
+    /// Panics if `i` is at least the bit width `2^LOG_BITS` of this level.
+    fn cantor_basis(i: usize) -> Self;
+}
+
+/// The panic message shared by every [`TowerLevel::from_le_byte_iter`] implementation.
+const BYTE_STREAM_ENDED: &str = "byte stream ended before a whole element was read";
+
+impl private::Sealed for Gf2 {}
+
+impl TowerLevel for Gf2 {
+    type Repr = u8;
+
+    const LOG_BITS: usize = 0;
+
+    #[inline]
+    fn from_repr(r: Self::Repr) -> Self {
+        Self::from_bool((r & 1) == 1)
+    }
+
+    #[inline]
+    fn to_repr(self) -> Self::Repr {
+        u8::from(self.is_one())
+    }
+
+    /// `X_{−1} = 1`, so at the base of the tower this is the identity.
+    #[inline]
+    fn mul_alpha(self) -> Self {
+        self
+    }
+
+    #[inline]
+    fn from_le_byte_iter(mut bytes: impl Iterator<Item = u8>) -> Self {
+        Self::from_le_bytes([bytes.next().expect(BYTE_STREAM_ENDED)])
+    }
+
+    /// `GF(2)` holds only `v_0 = 1`.
+    #[inline]
+    fn cantor_basis(i: usize) -> Self {
+        assert!(i < 1, "Cantor basis index out of range");
+        Self::ONE
+    }
+}
+
+/// Define one level of the tower as a quadratic extension of the level below.
+///
+/// The parameters are the name of the level, its bit width, its backing integer, the level
+/// below with that level's backing integer, the bit pattern of a multiplicative generator, and
+/// the methods `Mul`, `square` and `try_inverse` forward to.
+macro_rules! binary_tower_level {
+    ($name:ident, $bits:literal, $repr:ty, $lower:ty, $lower_repr:ty, $generator:literal, $mul:ident, $square:ident, $try_inverse:ident) => {
+        #[doc = concat!("The binary tower field `GF(2^", stringify!($bits), ")`.")]
+        ///
+        #[doc = concat!("A quadratic extension of [`", stringify!($lower), "`] generated by a root `X` of")]
+        /// `X² + αX + 1`, where `α` is the generator of the level below over the one beneath it.
+        /// The low half of the backing integer holds the coefficient of `1`, the high half the
+        /// coefficient of `X`.
+        ///
+        /// The serde encoding is canonical: every field element has exactly one valid byte
+        /// representation (see the manual [`Deserialize`] impl below). `#[serde(transparent)]`
+        /// makes the derived [`Serialize`] emit the backing integer itself, which is what that
+        /// impl reads back.
+        #[derive(Copy, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+        #[serde(transparent)]
+        #[repr(transparent)]
+        #[must_use]
+        pub struct $name($repr);
+
+        impl $name {
+            /// The number of bits of an element.
+            pub(crate) const BITS: usize = $bits;
+
+            /// Selects the bits of a canonical representative.
+            const MASK: $repr = <$repr>::MAX >> (<$repr>::BITS as usize - $bits);
+
+            /// The number of bits of each coefficient over the level below.
+            const HALF_BITS: usize = $bits / 2;
+
+            /// Selects the bits of a canonical representative of the level below.
+            const HALF_MASK: $repr = Self::MASK >> Self::HALF_BITS;
+
+            /// A run of elements read in place as the backing integers they wrap.
+            #[inline]
+            #[must_use]
+            pub const fn as_repr_slice(values: &[Self]) -> &[$repr] {
+                // SAFETY: the level is `#[repr(transparent)]` over its backing integer.
+                //
+                // A run of one is therefore a run of the other, of the same length and alignment.
+                //
+                // The view borrows the same elements for the same lifetime.
+                unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<$repr>(), values.len()) }
+            }
+
+            /// The coefficients `(a0, a1)` of `self = a0 + a1·X`.
+            #[inline]
+            pub(crate) fn split(self) -> ($lower, $lower) {
+                let a0 = (self.0 & Self::HALF_MASK) as $lower_repr;
+                let a1 = (self.0 >> Self::HALF_BITS) as $lower_repr;
+                (<$lower>::from_repr(a0), <$lower>::from_repr(a1))
+            }
+
+            /// The element `a0 + a1·X`.
+            #[inline]
+            pub(crate) fn join(a0: $lower, a1: $lower) -> Self {
+                Self((a0.to_repr() as $repr) | ((a1.to_repr() as $repr) << Self::HALF_BITS))
+            }
+
+            /// Karatsuba multiplication modulo `X² = αX + 1`.
+            ///
+            /// With `z0 = a0·b0`, `z2 = a1·b1` and `z1 = a0·b1 + a1·b0`,
+            /// `a·b = (z0 + z2) + (z1 + α·z2)·X`.
+            ///
+            /// The coefficient products recurse through the level below's `reference_mul`
+            /// rather than its `Mul`, so this stays a self-contained definition of the tower
+            /// product even at the levels whose `Mul` dispatches to a hardware fast path.
+            #[doc(hidden)]
+            #[inline]
+            pub fn reference_mul(self, rhs: Self) -> Self {
+                let (a0, a1) = self.split();
+                let (b0, b1) = rhs.split();
+                let z0 = a0.reference_mul(b0);
+                let z2 = a1.reference_mul(b1);
+                let z1 = (a0 + a1).reference_mul(b0 + b1) + z0 + z2;
+                Self::join(z0 + z2, z1 + z2.mul_alpha())
+            }
+
+            /// Squaring modulo `X² = αX + 1`.
+            ///
+            /// The cross term `2·a0·a1·X` vanishes in characteristic 2, leaving
+            /// `a² = (a0² + a1²) + α·a1²·X`.
+            // The independent definition of squaring, kept at every level and compared
+            // against in the tests even where `square` takes a faster route.
+            #[allow(dead_code)]
+            #[inline]
+            fn reference_square(self) -> Self {
+                let (a0, a1) = self.split();
+                let a0_sq = a0.square();
+                let a1_sq = a1.square();
+                Self::join(a0_sq + a1_sq, a1_sq.mul_alpha())
+            }
+
+            /// Inversion through the norm to the level below.
+            ///
+            /// The conjugate of `a` over the level below is `(a0 + α·a1) + a1·X`, and the
+            /// product of the two, `N = a0² + α·a0·a1 + a1²`, has no `X` component. Hence
+            /// `a⁻¹ = ((a0 + α·a1) + a1·X)·N⁻¹`.
+            // The independent definition of inversion, kept at every level and compared
+            // against in the tests even where `Field::try_inverse` takes a faster route.
+            #[allow(dead_code)]
+            #[inline]
+            fn reference_try_inverse(self) -> Option<Self> {
+                if self.0 == 0 {
+                    return None;
+                }
+                let (a0, a1) = self.split();
+                let norm = a0.square() + (a0 * a1).mul_alpha() + a1.square();
+                let norm_inv = norm
+                    .try_inverse()
+                    .expect("the norm of a nonzero element is nonzero");
+                if HAS_HARDWARE_CLMUL && Self::BITS == 128 {
+                    let (lo, hi) = crate::clmul::mul_pair_64(
+                        (a0 + a1.mul_alpha()).to_repr() as u64,
+                        a1.to_repr() as u64,
+                        norm_inv.to_repr() as u64,
+                    );
+                    return Some(Self::from_repr(lo as $repr | ((hi as $repr) << (Self::BITS / 2))));
+                }
+                Some(Self::join((a0 + a1.mul_alpha()) * norm_inv, a1 * norm_inv))
+            }
+
+            /// Construct a field element from its little-endian byte representation.
+            ///
+            /// Every byte string of the right length is a valid input: `from_repr` masks
+            /// any bits above the canonical range.
+            #[inline]
+            pub fn from_le_bytes(bytes: [u8; core::mem::size_of::<$repr>()]) -> Self {
+                <Self as TowerLevel>::from_repr(<$repr>::from_le_bytes(bytes))
+            }
+        }
+
+        impl private::Sealed for $name {}
+
+        impl TowerLevel for $name {
+            type Repr = $repr;
+
+            const LOG_BITS: usize = Self::BITS.trailing_zeros() as usize;
+
+            #[inline]
+            fn from_repr(r: Self::Repr) -> Self {
+                Self(r & Self::MASK)
+            }
+
+            #[inline]
+            fn to_repr(self) -> Self::Repr {
+                self.0
+            }
+
+            /// `X·(c0 + c1·X) = c1 + (c0 + α·c1)·X`, using `X² = αX + 1`.
+            #[inline]
+            fn mul_alpha(self) -> Self {
+                let (c0, c1) = self.split();
+                Self::join(c1, c0 + c1.mul_alpha())
+            }
+
+            #[inline]
+            fn from_le_byte_iter(mut bytes: impl Iterator<Item = u8>) -> Self {
+                let mut buffer = [0u8; core::mem::size_of::<$repr>()];
+                for byte in &mut buffer {
+                    *byte = bytes.next().expect(BYTE_STREAM_ENDED);
+                }
+                Self::from_le_bytes(buffer)
+            }
+
+            #[inline]
+            fn cantor_basis(i: usize) -> Self {
+                assert!(i < $bits, "Cantor basis index out of range");
+                // `v_i < 2^(2^k)` for `i < 2^k`, so the cast is exact at every level.
+                Self::from_repr(crate::cantor::CANTOR_BASIS_128[i] as $repr)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let val = <$repr>::deserialize(d)?;
+                // Reject non-canonical encodings so a proof cannot be re-encoded without the
+                // witness. Only the low `BITS` bits of the backing integer may be set.
+                if val <= Self::MASK {
+                    Ok(Self(val))
+                } else {
+                    Err(D::Error::custom("Value is out of range"))
+                }
+            }
+        }
+
+        impl Packable for $name {
+            #[inline]
+            fn transpose_owned(input: &[Self], width: usize, height: usize) -> Vec<Self> {
+                // SAFETY: Self is repr(transparent) over its initialized backing integer.
+                unsafe { p3_util::transpose::transpose_words_owned(input, width, height) }
+            }
+
+            #[inline]
+            fn transpose(input: &[Self], output: &mut [Self], width: usize, height: usize) {
+                // SAFETY: Self is repr(transparent) over its initialized backing integer.
+                unsafe { p3_util::transpose::transpose_words(input, output, width, height) };
+            }
+
+            #[inline]
+            fn transpose_rows<'a>(
+                rows: usize,
+                cols: usize,
+                row: impl Fn(usize) -> &'a [Self],
+                dst: &mut [Self],
+            ) {
+                // SAFETY: Self is repr(transparent) over its initialized backing integer.
+                unsafe { p3_util::transpose::transpose_rows_words(rows, cols, row, dst) };
+            }
+        }
+
+        impl Display for $name {
+            fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+                Display::fmt(&self.0, f)
+            }
+        }
+
+        impl Debug for $name {
+            fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+                Debug::fmt(&self.0, f)
+            }
+        }
+
+        impl Distribution<$name> for StandardUniform {
+            #[inline]
+            fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> $name {
+                let mut bytes = [0u8; core::mem::size_of::<$repr>()];
+                rng.fill_bytes(&mut bytes);
+                <$name>::from_repr(<$repr>::from_le_bytes(bytes))
+            }
+        }
+
+        impl PrimeCharacteristicRing for $name {
+            type PrimeSubfield = Gf2;
+
+            const ZERO: Self = Self(0);
+            const ONE: Self = Self(1);
+            // The characteristic is 2, so `TWO = ONE + ONE = ZERO`.
+            const TWO: Self = Self(0);
+            // The characteristic is 2, so `NEG_ONE = ONE`.
+            const NEG_ONE: Self = Self(1);
+
+            #[inline]
+            fn from_prime_subfield(f: Self::PrimeSubfield) -> Self {
+                Self::from_bool(f.is_one())
+            }
+
+            #[inline]
+            fn from_bool(b: bool) -> Self {
+                Self(<$repr>::from(b))
+            }
+
+            characteristic_two_methods!();
+
+            #[inline]
+            fn square(&self) -> Self {
+                if Self::BITS >= 16 {
+                    Self::from_repr(match Self::BITS {
+                        16 => crate::linear::square_16(self.0 as u16) as $repr,
+                        32 => BinaryField32::from_repr(self.0 as u32).byte_square().to_repr() as $repr,
+                        64 => crate::linear::square_64(self.0 as u64) as $repr,
+                        128 => crate::linear::square_128(self.0 as u128) as $repr,
+                        _ => unreachable!(),
+                    })
+                } else {
+                    self.$square()
+                }
+            }
+
+            #[inline]
+            fn exp_power_of_2(&self, power_log: usize) -> Self {
+                let mut power = power_log % Self::BITS;
+                let mut value = *self;
+                // The nontrivial quadratic automorphism is X -> X + alpha.
+                if power >= Self::BITS / 2 {
+                    let (lo, hi) = value.split();
+                    value = Self::join(lo + hi.mul_alpha(), hi);
+                    power -= Self::BITS / 2;
+                }
+                if power == 1 {
+                    return value.square();
+                }
+                if Self::BITS >= 16 {
+                    Self::from_repr(match Self::BITS {
+                        16 => crate::linear::frobenius_16(value.0 as u16, power) as $repr,
+                        32 => crate::linear::frobenius_32(value.0 as u32, power) as $repr,
+                        64 => crate::linear::frobenius_64(value.0 as u64, power) as $repr,
+                        128 => crate::linear::frobenius_128(value.0 as u128, power) as $repr,
+                        _ => unreachable!(),
+                    })
+                } else {
+                    for _ in 0..power { value = value.square(); }
+                    value
+                }
+            }
+
+            #[inline]
+            fn dot_product<const N: usize>(u: &[Self; N], v: &[Self; N]) -> Self {
+                if N == 0 { return Self::ZERO; }
+                if N == 1 { return u[0] * v[0]; }
+                if HAS_HARDWARE_CLMUL && Self::BITS == 32 {
+                    Self::from_repr(crate::clmul::dot_product_32(
+                        u.iter().zip(v).map(|(a, b)| (a.0 as u32, b.0 as u32)),
+                    ) as $repr)
+                } else if HAS_HARDWARE_CLMUL && Self::BITS == 64 {
+                    Self::from_repr(crate::clmul::dot_product_64(
+                        u.iter().zip(v).map(|(a, b)| (a.0 as u64, b.0 as u64)),
+                    ) as $repr)
+                } else if HAS_HARDWARE_CLMUL && Self::BITS == 128 {
+                    Self::from_repr(crate::clmul::dot_product_128(
+                        u.iter().zip(v).map(|(a, b)| (a.0 as u128, b.0 as u128)),
+                    ) as $repr)
+                } else {
+                    u.iter().zip(v).map(|(&a, &b)| a * b).sum()
+                }
+            }
+
+            #[inline]
+            fn zero_vec(len: usize) -> Vec<Self> {
+                let mut values = ManuallyDrop::new(alloc::vec![0 as $repr; len]);
+                // SAFETY: the transparent wrapper has exactly the integer's layout, and
+                // zero is canonical. The allocation retains its original size and alignment.
+                unsafe {
+                    Vec::from_raw_parts(values.as_mut_ptr().cast(), values.len(), values.capacity())
+                }
+            }
+
+            /// `x·(x - 1) = x² - x = x² + x` in characteristic 2, and squaring is a linear
+            /// map here, so this avoids the tower/polynomial basis changes a general product
+            /// pays for.
+            #[inline]
+            fn bool_check(&self) -> Self {
+                self.square() + *self
+            }
+        }
+
+        impl Field for $name {
+            type Packing = Self;
+
+            const GENERATOR: Self = Self($generator);
+
+            #[inline]
+            fn try_inverse(&self) -> Option<Self> {
+                self.$try_inverse()
+            }
+
+            #[inline]
+            fn try_sqrt(&self) -> Option<Self> {
+                // Squaring is the Frobenius, of order `BITS`, so `a^(2^(BITS - 1))` squares to `a`.
+                if Self::BITS >= 16 {
+                    Some(Self::from_repr(match Self::BITS {
+                        16 => crate::linear::sqrt_16(self.0 as u16) as $repr,
+                        32 => crate::linear::sqrt_32(self.0 as u32) as $repr,
+                        64 => crate::linear::sqrt_64(self.0 as u64) as $repr,
+                        128 => crate::linear::sqrt_128(self.0 as u128) as $repr,
+                        _ => unreachable!(),
+                    }))
+                } else {
+                    Some(self.exp_power_of_2(Self::BITS - 1))
+                }
+            }
+
+            #[inline]
+            fn order() -> BigUint {
+                BigUint::from(1u8) << (1usize << <Self as TowerLevel>::LOG_BITS)
+            }
+
+            /// The enumeration by bit pattern: `interpolation_node(i)` is the element whose
+            /// coefficients over `GF(2)` are the bits of `i`. It is injective for `i < 2^BITS`.
+            ///
+            /// # Panics
+            /// Panics if `i >= 2^BITS`. `from_repr` masks, so an out-of-range index would
+            /// otherwise alias an earlier node in release builds and break an interpolation
+            /// argument silently; the check is paid once per node at setup, never in a loop.
+            #[inline]
+            fn interpolation_node(i: usize) -> Self {
+                assert!(
+                    usize::BITS as usize <= Self::BITS || i < (1usize << Self::BITS),
+                    "interpolation node index out of range"
+                );
+                Self::from_repr(i as $repr)
+            }
+
+            /// An element of `GF(2^n)` is exactly `n` bits wide.
+            #[inline]
+            fn bits() -> usize {
+                Self::BITS
+            }
+        }
+
+        impl RawDataSerializable for $name {
+            const NUM_BYTES: usize = core::mem::size_of::<$repr>();
+
+            #[allow(refining_impl_trait)]
+            #[inline]
+            fn into_bytes(self) -> [u8; core::mem::size_of::<$repr>()] {
+                self.0.to_le_bytes()
+            }
+
+            #[cfg(target_endian = "little")]
+            #[inline]
+            fn as_serialized_bytes(input: &[Self]) -> Option<&[u8]> {
+                // SAFETY: the transparent integer wrapper has no padding or uninitialized
+                // bytes. On this target its memory order is exactly `to_le_bytes`. The byte
+                // slice borrows the same initialized region and needs no stronger alignment.
+                Some(unsafe {
+                    core::slice::from_raw_parts(
+                        input.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(input),
+                    )
+                })
+            }
+
+            #[inline]
+            fn into_parallel_byte_streams<const N: usize>(
+                input: impl IntoIterator<Item = [Self; N]>,
+            ) -> impl IntoIterator<Item = [u8; N]> {
+                input.into_iter().flat_map(|vector| {
+                    let bytes = vector.map(Self::into_bytes);
+                    (0..Self::NUM_BYTES).map(move |i| core::array::from_fn(|j| bytes[j][i]))
+                })
+            }
+
+            #[inline]
+            fn into_u64_stream(input: impl IntoIterator<Item = Self>) -> impl IntoIterator<Item = u64> {
+                Self::into_parallel_u64_streams(input.into_iter().map(|elem| [elem]))
+                    .into_iter()
+                    .map(|[word]| word)
+            }
+
+            #[inline]
+            fn into_parallel_u64_streams<const N: usize>(
+                input: impl IntoIterator<Item = [Self; N]>,
+            ) -> impl IntoIterator<Item = [u64; N]> {
+                // A backing integer of at least 64 bits fills one or two whole words, low word
+                // first. Narrower backing integers pack little-endian into one word, zero-padded
+                // at the end.
+                let mut input = input.into_iter();
+                let mut high: Option<[u64; N]> = None;
+                core::iter::from_fn(move || {
+                    if let Some(word) = high.take() {
+                        return Some(word);
+                    }
+                    let first = input.next()?;
+                    if Self::NUM_BYTES >= 8 {
+                        let wide = first.map(|elem| elem.0 as u128);
+                        if Self::NUM_BYTES == 16 {
+                            high = Some(wide.map(|value| (value >> 64) as u64));
+                        }
+                        return Some(wide.map(|value| value as u64));
+                    }
+                    let bits = 8 * Self::NUM_BYTES;
+                    let mut word = first.map(|elem| elem.0 as u64);
+                    let mut shift = bits;
+                    while shift < 64 {
+                        let Some(next) = input.next() else { break };
+                        for (lane, elem) in word.iter_mut().zip(next) {
+                            *lane |= (elem.0 as u64) << shift;
+                        }
+                        shift += bits;
+                    }
+                    Some(word)
+                })
+            }
+        }
+
+        impl Add for $name {
+            type Output = Self;
+
+            #[inline]
+            #[allow(clippy::suspicious_arithmetic_impl)]
+            fn add(self, rhs: Self) -> Self {
+                // Addition in characteristic 2 is `XOR`.
+                Self(self.0 ^ rhs.0)
+            }
+        }
+
+        impl Sub for $name {
+            type Output = Self;
+
+            #[inline]
+            #[allow(clippy::suspicious_arithmetic_impl)]
+            fn sub(self, rhs: Self) -> Self {
+                // Subtraction coincides with addition in characteristic 2.
+                self + rhs
+            }
+        }
+
+        impl Neg for $name {
+            type Output = Self;
+
+            #[inline]
+            fn neg(self) -> Self::Output {
+                // `-x = x` in characteristic 2.
+                self
+            }
+        }
+
+        impl Mul for $name {
+            type Output = Self;
+
+            #[inline]
+            fn mul(self, rhs: Self) -> Self {
+                self.$mul(rhs)
+            }
+        }
+
+        impl_add_assign!($name);
+        impl_sub_assign!($name);
+        impl_mul_methods!($name);
+        impl_div_methods!($name, $name);
+        ring_sum!($name);
+
+        impl From<Gf2> for $name {
+            /// `GF(2)` is the prime subfield of every level, embedded as `{ZERO, ONE}`.
+            #[inline]
+            fn from(x: Gf2) -> Self {
+                Self::from_prime_subfield(x)
+            }
+        }
+
+        impl_add_base_field!($name, Gf2);
+        impl_sub_base_field!($name, Gf2);
+        impl Mul<Gf2> for $name {
+            type Output = Self;
+
+            #[inline]
+            #[allow(clippy::suspicious_arithmetic_impl)]
+            fn mul(self, rhs: Gf2) -> Self {
+                Self(self.0 & (0 as $repr).wrapping_sub(rhs.to_repr() as $repr))
+            }
+        }
+
+        impl Mul<$name> for Gf2 {
+            type Output = $name;
+
+            #[inline]
+            fn mul(self, rhs: $name) -> $name {
+                rhs * self
+            }
+        }
+
+        impl Algebra<Gf2> for $name {}
+    };
+}
+
+binary_tower_level!(
+    BinaryField2,
+    2,
+    u8,
+    Gf2,
+    u8,
+    2,
+    reference_mul,
+    reference_square,
+    reference_try_inverse
+);
+binary_tower_level!(
+    BinaryField4,
+    4,
+    u8,
+    BinaryField2,
+    u8,
+    5,
+    reference_mul,
+    reference_square,
+    reference_try_inverse
+);
+binary_tower_level!(
+    BinaryField8,
+    8,
+    u8,
+    BinaryField4,
+    u8,
+    19,
+    table_mul,
+    table_square,
+    table_try_inverse
+);
+binary_tower_level!(
+    BinaryField16,
+    16,
+    u16,
+    BinaryField8,
+    u8,
+    258,
+    karatsuba_mul,
+    reference_square,
+    reference_try_inverse
+);
+binary_tower_level!(
+    BinaryField32,
+    32,
+    u32,
+    BinaryField16,
+    u16,
+    65541,
+    karatsuba_mul,
+    reference_square,
+    reference_try_inverse
+);
+binary_tower_level!(
+    BinaryField64,
+    64,
+    u64,
+    BinaryField32,
+    u32,
+    4294967300,
+    dispatched_mul,
+    table_square,
+    reference_try_inverse
+);
+binary_tower_level!(
+    BinaryField128,
+    128,
+    u128,
+    BinaryField64,
+    u64,
+    18446744073709551621,
+    dispatched_mul,
+    table_square,
+    reference_try_inverse
+);
+
+/// A mutable integer view, for each level whose backing integer has no spare bits.
+///
+/// Every integer of such a width is a canonical element, so no write through the view breaks one.
+///
+/// The narrower levels keep spare high bits clear, so they get no mutable view.
+macro_rules! full_width_repr_view {
+    ($($name:ident: $repr:ty),* $(,)?) => {$(
+        impl $name {
+            /// A run of elements written in place as the backing integers they wrap.
+            #[inline]
+            #[must_use]
+            pub const fn as_repr_slice_mut(values: &mut [Self]) -> &mut [$repr] {
+                const { assert!(Self::BITS == <$repr>::BITS as usize) };
+                // SAFETY: the level is `#[repr(transparent)]` over its backing integer.
+                //
+                // A run of one is therefore a run of the other, of the same length and alignment.
+                //
+                // The integer has exactly the level's width, so any integer written back is a canonical element.
+                //
+                // The view borrows the same elements exclusively for the same lifetime.
+                unsafe {
+                    core::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<$repr>(), values.len())
+                }
+            }
+        }
+    )*};
+}
+
+full_width_repr_view!(
+    BinaryField8: u8,
+    BinaryField16: u16,
+    BinaryField32: u32,
+    BinaryField64: u64,
+    BinaryField128: u128,
+);
+
+impl BinaryField8 {
+    /// Multiplication through the `GF(2^8)` log and exponential tables.
+    #[inline]
+    const fn table_mul(self, rhs: Self) -> Self {
+        Self(tables::mul(self.0, rhs.0))
+    }
+
+    /// Squaring through the direct `GF(2^8)` table.
+    #[inline]
+    const fn table_square(self) -> Self {
+        Self(tables::square(self.0))
+    }
+
+    /// Inversion through the direct `GF(2^8)` table.
+    #[inline]
+    const fn table_try_inverse(self) -> Option<Self> {
+        match tables::try_inverse(self.0) {
+            Some(inverse) => Some(Self(inverse)),
+            None => None,
+        }
+    }
+}
+
+impl BinaryField32 {
+    /// Square the two quadratic levels above GF256 using its compact byte table.
+    #[inline]
+    fn byte_square(self) -> Self {
+        let (a0, a1) = self.split();
+        let a0_sq = a0.reference_square();
+        let a1_sq = a1.reference_square();
+        Self::join(a0_sq + a1_sq, a1_sq.mul_alpha())
+    }
+}
+
+/// Give a level Karatsuba multiplication over the `Mul` of the level below.
+///
+/// The recurrence is the one [`binary_tower_level`] documents on `reference_mul`, but the
+/// coefficient products go through the level below's operator, so the recursion stops as soon
+/// as it reaches a level with a fast path instead of running to the bottom of the tower.
+macro_rules! karatsuba_over_the_level_below {
+    ($name:ident) => {
+        impl $name {
+            /// Karatsuba multiplication modulo `X² = αX + 1`.
+            ///
+            /// With `z0 = a0·b0`, `z2 = a1·b1` and `z1 = a0·b1 + a1·b0`,
+            /// `a·b = (z0 + z2) + (z1 + α·z2)·X`.
+            #[inline]
+            fn karatsuba_mul(self, rhs: Self) -> Self {
+                let (a0, a1) = self.split();
+                let (b0, b1) = rhs.split();
+                let z0 = a0 * b0;
+                let z2 = a1 * b1;
+                let z1 = (a0 + a1) * (b0 + b1) + z0 + z2;
+                Self::join(z0 + z2, z1 + z2.mul_alpha())
+            }
+        }
+    };
+}
+
+karatsuba_over_the_level_below!(BinaryField16);
+karatsuba_over_the_level_below!(BinaryField32);
+karatsuba_over_the_level_below!(BinaryField64);
+karatsuba_over_the_level_below!(BinaryField128);
+
+impl BinaryField64 {
+    /// The carryless-multiply fast path where the target has the instruction for it, and the
+    /// recursive tower multiplication otherwise.
+    ///
+    /// [`HAS_HARDWARE_CLMUL`] is a constant, so only the chosen arm survives compilation.
+    #[inline]
+    fn dispatched_mul(self, rhs: Self) -> Self {
+        if HAS_HARDWARE_CLMUL {
+            Self(mul_64(self.0, rhs.0))
+        } else {
+            self.karatsuba_mul(rhs)
+        }
+    }
+
+    /// Squaring through the tower-basis matrix, which is a lookup table on every target.
+    #[inline]
+    fn table_square(self) -> Self {
+        Self(crate::clmul::square_64(self.0))
+    }
+}
+
+impl BinaryField128 {
+    /// The carryless-multiply fast path where the target has the instruction for it, and the
+    /// recursive tower multiplication otherwise.
+    ///
+    /// [`HAS_HARDWARE_CLMUL`] is a constant, so only the chosen arm survives compilation.
+    #[inline]
+    fn dispatched_mul(self, rhs: Self) -> Self {
+        if HAS_HARDWARE_CLMUL {
+            Self(mul_128(self.0, rhs.0))
+        } else {
+            self.karatsuba_mul(rhs)
+        }
+    }
+
+    /// Squaring through the tower-basis matrix, which is a lookup table on every target.
+    #[inline]
+    fn table_square(self) -> Self {
+        Self(crate::clmul::square_128(self.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use std::println;
+    use std::vec::Vec;
+
+    use p3_field::{Field, PrimeCharacteristicRing, RawDataSerializable};
+    use proptest::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn a_run_read_as_integers_is_its_elements_backing_integers() {
+        macro_rules! check {
+            ($field:ty) => {
+                let values = (0..9u8)
+                    .map(|i| <$field>::from_u8(i.wrapping_mul(37)))
+                    .collect::<Vec<_>>();
+                let reprs = values.iter().map(|x| x.to_repr()).collect::<Vec<_>>();
+                assert_eq!(<$field>::as_repr_slice(&values), reprs.as_slice());
+            };
+        }
+        check!(BinaryField8);
+        check!(BinaryField16);
+        check!(BinaryField32);
+        check!(BinaryField64);
+        check!(BinaryField128);
+    }
+
+    #[test]
+    fn a_run_written_as_integers_holds_the_elements_of_those_integers() {
+        macro_rules! check {
+            ($field:ty, $repr:ty) => {
+                let mut values = <$field>::zero_vec(9);
+
+                // Every integer written through the view, the top bit included, is the element read back.
+                for (i, word) in <$field>::as_repr_slice_mut(&mut values).iter_mut().enumerate() {
+                    *word = <$repr>::MAX.wrapping_mul(i as $repr).rotate_left(i as u32);
+                }
+                for (i, value) in values.iter().enumerate() {
+                    let expected = <$repr>::MAX.wrapping_mul(i as $repr).rotate_left(i as u32);
+                    assert_eq!(value.to_repr(), expected);
+                }
+            };
+        }
+        check!(BinaryField8, u8);
+        check!(BinaryField16, u16);
+        check!(BinaryField32, u32);
+        check!(BinaryField64, u64);
+        check!(BinaryField128, u128);
+    }
+
+    #[test]
+    fn zero_vectors_preserve_layout_and_support_growth() {
+        macro_rules! check {
+            ($field:ty) => {
+                for len in [0, 1, 33, 1024] {
+                    let mut values = <$field>::zero_vec(len);
+                    assert_eq!(values.len(), len);
+                    assert!(values.iter().all(|x| *x == <$field>::ZERO));
+                    values.push(<$field>::ONE);
+                    values.reserve(100);
+                    assert_eq!(values.pop(), Some(<$field>::ONE));
+                }
+            };
+        }
+        check!(BinaryField2);
+        check!(BinaryField4);
+        check!(BinaryField8);
+        check!(BinaryField16);
+        check!(BinaryField32);
+        check!(BinaryField64);
+        check!(BinaryField128);
+    }
+
+    #[test]
+    fn fused_dot_products_match_reference_for_arbitrary_lengths() {
+        fn check<const N: usize>() {
+            let u: [BinaryField128; N] = core::array::from_fn(|i| {
+                BinaryField128::from_repr(
+                    (i as u128 + 1).wrapping_mul(0xfeed_dead_beef_9876_0123_4567_cafe_dcba),
+                )
+            });
+            let v = core::array::from_fn(|i| u[N - 1 - i] + BinaryField128::ONE);
+            let expected = u
+                .iter()
+                .zip(&v)
+                .map(|(&a, &b)| a.reference_mul(b))
+                .sum::<BinaryField128>();
+            assert_eq!(BinaryField128::dot_product(&u, &v), expected);
+            let u32 = u.map(|x| BinaryField32::from_repr(x.to_repr() as u32));
+            let v32 = v.map(|x| BinaryField32::from_repr(x.to_repr() as u32));
+            assert_eq!(
+                BinaryField32::dot_product(&u32, &v32),
+                u32.iter()
+                    .zip(&v32)
+                    .map(|(&a, &b)| a.reference_mul(b))
+                    .sum()
+            );
+            let u = u.map(|x| BinaryField64::from_repr(x.to_repr() as u64));
+            let v = v.map(|x| BinaryField64::from_repr(x.to_repr() as u64));
+            assert_eq!(
+                BinaryField64::dot_product(&u, &v),
+                u.iter().zip(&v).map(|(&a, &b)| a.reference_mul(b)).sum()
+            );
+        }
+        check::<0>();
+        check::<1>();
+        check::<2>();
+        check::<3>();
+        check::<7>();
+        check::<8>();
+        check::<9>();
+        check::<16>();
+        check::<33>();
+        check::<128>();
+    }
+
+    #[test]
+    fn prime_subfield_scaling_is_selection() {
+        macro_rules! check {
+            ($field:ty, $value:expr) => {{
+                let x = <$field>::from_repr($value);
+                assert_eq!(x * Gf2::ZERO, <$field>::ZERO);
+                assert_eq!(Gf2::ZERO * x, <$field>::ZERO);
+                assert_eq!(x * Gf2::ONE, x);
+                assert_eq!(Gf2::ONE * x, x);
+            }};
+        }
+        check!(BinaryField2, 3);
+        check!(BinaryField4, 15);
+        check!(BinaryField8, 255);
+        check!(BinaryField16, 0xdead);
+        check!(BinaryField32, 0xdead_beef);
+        check!(BinaryField64, 0xdead_beef_cafe_8765);
+        check!(BinaryField128, 0xdead_beef_cafe_8765_0123_4567_89ab_cdef);
+    }
+
+    /// The prime factors of `2^n − 1` for each level `n` of the tower.
+    const FACTORS_2: [u128; 1] = [3];
+    const FACTORS_4: [u128; 2] = [3, 5];
+    const FACTORS_8: [u128; 3] = [3, 5, 17];
+    const FACTORS_16: [u128; 4] = [3, 5, 17, 257];
+    const FACTORS_32: [u128; 5] = [3, 5, 17, 257, 65537];
+    const FACTORS_64: [u128; 7] = [3, 5, 17, 257, 641, 65537, 6700417];
+    const FACTORS_128: [u128; 9] = [3, 5, 17, 257, 641, 65537, 274177, 6700417, 67280421310721];
+
+    /// The order `2^bits − 1` of the multiplicative group of `GF(2^bits)`.
+    const fn group_order(bits: u32) -> u128 {
+        if bits == 128 {
+            u128::MAX
+        } else {
+            (1u128 << bits) - 1
+        }
+    }
+
+    /// `base^exp`, with an exponent too large for [`PrimeCharacteristicRing::exp_u64`].
+    fn pow_u128<F: Field>(base: F, mut exp: u128) -> F {
+        let mut acc = F::ONE;
+        let mut cur = base;
+        while exp != 0 {
+            if exp & 1 == 1 {
+                acc *= cur;
+            }
+            cur = cur.square();
+            exp >>= 1;
+        }
+        acc
+    }
+
+    /// Whether `g` generates the whole multiplicative group of `GF(2^bits)`.
+    ///
+    /// `g` has full order exactly when `g^((2^bits − 1)/q) != 1` for every prime `q`
+    /// dividing `2^bits − 1`.
+    fn has_full_order<F: Field>(g: F, bits: u32, factors: &[u128]) -> bool {
+        let order = group_order(bits);
+        factors.iter().all(|&q| pow_u128(g, order / q) != F::ONE)
+    }
+
+    macro_rules! assert_full_order {
+        ($t:ty, $bits:expr, $factors:expr) => {
+            assert!(
+                has_full_order(<$t>::GENERATOR, $bits, &$factors),
+                concat!(
+                    stringify!($t),
+                    "::GENERATOR does not generate the multiplicative group"
+                )
+            );
+        };
+    }
+
+    macro_rules! assert_defining_relation {
+        ($t:ty, $repr:ty, $bits:expr) => {{
+            // `X` is the generator of this level over the one below (bit `bits/2`) and
+            // `alpha` the generator of the level below over the one beneath it (bit `bits/4`),
+            // which is `1` at the bottom of the tower.
+            let x = <$t>::from_repr((1 as $repr) << ($bits / 2));
+            let alpha = <$t>::from_repr((1 as $repr) << ($bits / 4));
+            assert_eq!(
+                x.square(),
+                alpha * x + <$t>::ONE,
+                concat!(stringify!($t), " does not satisfy X^2 = alpha*X + 1")
+            );
+        }};
+    }
+
+    macro_rules! search_generator {
+        ($t:ty, $repr:ty, $bits:expr, $factors:expr) => {{
+            // A bit pattern below `2^(bits/2)` has a zero coefficient on `X` and so lies in the
+            // proper subfield `GF(2^(bits/2))`; the smallest generator is above that.
+            let start = 1u128 << ($bits / 2);
+            let found = (start..start + 1024)
+                .map(|cand| (cand, <$t>::from_repr(cand as $repr)))
+                .find(|&(_, g)| has_full_order(g, $bits, &$factors));
+            println!(
+                "{}: GENERATOR = {:?}",
+                stringify!($t),
+                found.map(|(cand, _)| cand)
+            );
+        }};
+    }
+
+    #[test]
+    fn gf4_multiplication_table() {
+        // Elements of GF(4) = GF(2)[X]/(X^2 + X + 1) as bit patterns: 0, 1, X = 2, X + 1 = 3.
+        let x = BinaryField2::from_repr(2);
+        assert_eq!(x * x, x + BinaryField2::ONE); // X^2 = X + 1
+        assert_eq!(x * (x + BinaryField2::ONE), BinaryField2::ONE); // X(X + 1) = 1
+        assert_eq!(x.inverse(), x + BinaryField2::ONE);
+    }
+
+    #[test]
+    fn frobenius_fixes_every_element_of_each_level() {
+        for r in 0..=u8::MAX {
+            let a = BinaryField8::from_repr(r);
+            assert_eq!(a.exp_power_of_2(8), a); // a^(2^8) = a
+        }
+        for r in 0..=u8::MAX {
+            let a = BinaryField4::from_repr(r & 0x0f);
+            assert_eq!(a.exp_power_of_2(4), a); // a^(2^4) = a
+        }
+    }
+
+    /// The table squaring at `GF(2^8)` must reproduce the recursion that runs to the bottom of
+    /// the tower.
+    #[test]
+    fn the_table_square_agrees_with_the_recursive_squaring_on_gf256() {
+        for r in 0..=u8::MAX {
+            let a = BinaryField8::from_repr(r);
+            assert_eq!(a.table_square(), a.reference_square(), "square({r})");
+        }
+    }
+
+    /// The table inversion at `GF(2^8)` must reproduce the recursion through the norm, which
+    /// is the definition of the inverse in this tower.
+    #[test]
+    fn the_table_inverse_agrees_with_the_recursive_inverse_on_gf256() {
+        for r in 0..=u8::MAX {
+            let a = BinaryField8::from_repr(r);
+            assert_eq!(
+                a.table_try_inverse(),
+                a.reference_try_inverse(),
+                "inverse({r})"
+            );
+        }
+    }
+
+    /// Karatsuba over the level below's operator must reproduce the recursion that runs to the
+    /// bottom of the tower, over every `GF(2^16)` left operand.
+    #[test]
+    fn karatsuba_agrees_with_the_recursive_product_over_every_gf16_operand() {
+        let others = [0u16, 1, 2, 0x00ff, 0x0100, 0x1234, 0xfffe, 0xffff];
+        for r in 0..=u16::MAX {
+            let a = BinaryField16::from_repr(r);
+            for other in others {
+                let b = BinaryField16::from_repr(other);
+                assert_eq!(a.karatsuba_mul(b), a.reference_mul(b), "mul({r}, {other})");
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_agrees_with_fermat_on_gf256() {
+        for r in 1..=u8::MAX {
+            let a = BinaryField8::from_repr(r);
+            assert_eq!(a.inverse(), a.exp_u64(254));
+            assert_eq!(a * a.inverse(), BinaryField8::ONE);
+        }
+    }
+
+    #[test]
+    fn square_roots_square_back_to_the_input() {
+        for r in 0..=u8::MAX {
+            let a = BinaryField8::from_repr(r);
+            assert_eq!(a.try_sqrt().unwrap().square(), a);
+        }
+        let a = BinaryField128::from_repr(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+        assert_eq!(a.try_sqrt().unwrap().square(), a);
+    }
+
+    /// The sub-byte levels store fewer bits than their backing integer holds, so a decoder that
+    /// accepted any byte could build an element whose high bits are set. Such a value compares
+    /// and hashes differently from the canonical representative of the same field element.
+    #[test]
+    fn serde_round_trip_rejects_non_canonical_encodings() {
+        assert_eq!(
+            serde_json::to_string(&BinaryField4::from_repr(9)).unwrap(),
+            "9"
+        );
+        assert_eq!(
+            serde_json::from_str::<BinaryField4>("9").unwrap(),
+            BinaryField4::from_repr(9)
+        );
+
+        // `GF(4)` uses 2 bits and `GF(16)` 4 bits of their `u8`; the rest must be rejected,
+        // not silently truncated into range.
+        assert!(serde_json::from_str::<BinaryField2>("3").is_ok());
+        assert!(serde_json::from_str::<BinaryField2>("4").is_err());
+        assert!(serde_json::from_str::<BinaryField4>("15").is_ok());
+        assert!(serde_json::from_str::<BinaryField4>("16").is_err());
+
+        // The levels that fill their backing integer accept every value of it.
+        assert!(serde_json::from_str::<BinaryField8>("255").is_ok());
+        assert!(serde_json::from_str::<BinaryField8>("256").is_err());
+    }
+
+    #[test]
+    fn bytes_round_trip_and_postcard() {
+        let a = BinaryField128::from_repr(0x8000_0000_0000_0000_0000_0000_0000_0001);
+        let bytes: Vec<u8> = a.into_bytes().into_iter().collect();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(BinaryField128::from_le_bytes(bytes.try_into().unwrap()), a);
+
+        let encoded = postcard::to_allocvec(&a).unwrap();
+        assert_eq!(postcard::from_bytes::<BinaryField128>(&encoded).unwrap(), a);
+    }
+
+    /// Every byte string of the right length round-trips to a field element for every level,
+    /// since [`RawDataSerializable::into_bytes`] and `from_le_bytes` are inverses on the full
+    /// `NUM_BYTES`-byte space, not just on canonical representatives.
+    #[test]
+    fn from_le_bytes_round_trips_every_level() {
+        macro_rules! assert_bytes_round_trip {
+            ($t:ty, $repr:ty, $val:expr) => {{
+                let a = <$t>::from_repr($val as $repr);
+                let bytes: Vec<u8> = a.into_bytes().into_iter().collect();
+                assert_eq!(bytes.len(), core::mem::size_of::<$repr>());
+                assert_eq!(<$t>::from_le_bytes(bytes.try_into().unwrap()), a);
+            }};
+        }
+
+        assert_bytes_round_trip!(BinaryField2, u8, 0b11);
+        assert_bytes_round_trip!(BinaryField4, u8, 0b1001);
+        assert_bytes_round_trip!(BinaryField8, u8, 0xab);
+        assert_bytes_round_trip!(BinaryField16, u16, 0x1234);
+        assert_bytes_round_trip!(BinaryField32, u32, 0x1234_5678);
+        assert_bytes_round_trip!(BinaryField64, u64, 0x0123_4567_89ab_cdef);
+        assert_bytes_round_trip!(
+            BinaryField128,
+            u128,
+            0x8000_0000_0000_0000_0000_0000_0000_0001
+        );
+    }
+
+    /// `from_le_bytes` must be total: every byte string of the right length is a valid
+    /// element, not just the ones a masked-already `from_repr` call would ever feed it. The
+    /// sub-byte levels store fewer bits than their `u8` backing integer holds, so a decoder
+    /// that skipped masking could construct a value whose high bits are set and diverge from
+    /// the canonical representative of the same field element.
+    #[test]
+    fn from_le_bytes_masks_out_of_range_high_bits() {
+        assert_eq!(
+            BinaryField2::from_le_bytes([0xff]),
+            BinaryField2::from_repr(0b11)
+        );
+        assert_eq!(
+            BinaryField2::from_le_bytes([0b1010_0110]),
+            BinaryField2::from_repr(0b10)
+        );
+        assert_eq!(
+            BinaryField4::from_le_bytes([0xff]),
+            BinaryField4::from_repr(0b1111)
+        );
+        assert_eq!(
+            BinaryField4::from_le_bytes([0b1010_0111]),
+            BinaryField4::from_repr(0b0111)
+        );
+    }
+
+    /// `from_le_byte_iter` reads exactly `NUM_BYTES` bytes off the front of the stream and
+    /// agrees with `from_le_bytes` on them, leaving the rest for the next element.
+    #[test]
+    fn from_le_byte_iter_consumes_one_element_worth_of_bytes() {
+        macro_rules! assert_reads_one_element {
+            ($t:ty, $repr:ty) => {{
+                let width = core::mem::size_of::<$repr>();
+                let stream: Vec<u8> = (0..2 * width as u8).map(|i| i.wrapping_mul(37)).collect();
+
+                let mut iter = stream.iter().copied();
+                let first = <$t as TowerLevel>::from_le_byte_iter(&mut iter);
+                let second = <$t as TowerLevel>::from_le_byte_iter(&mut iter);
+
+                assert_eq!(iter.next(), None, "the stream must be fully consumed");
+                assert_eq!(
+                    first,
+                    <$t>::from_le_bytes(stream[..width].try_into().unwrap())
+                );
+                assert_eq!(
+                    second,
+                    <$t>::from_le_bytes(stream[width..].try_into().unwrap())
+                );
+            }};
+        }
+
+        assert_reads_one_element!(Gf2, u8);
+        assert_reads_one_element!(BinaryField2, u8);
+        assert_reads_one_element!(BinaryField4, u8);
+        assert_reads_one_element!(BinaryField8, u8);
+        assert_reads_one_element!(BinaryField16, u16);
+        assert_reads_one_element!(BinaryField32, u32);
+        assert_reads_one_element!(BinaryField64, u64);
+        assert_reads_one_element!(BinaryField128, u128);
+    }
+
+    #[test]
+    #[should_panic = "byte stream ended before a whole element was read"]
+    fn from_le_byte_iter_rejects_a_truncated_stream() {
+        let truncated = [0u8; 15];
+        let _ = BinaryField128::from_le_byte_iter(truncated.into_iter());
+    }
+
+    #[test]
+    fn field_testing_into_stream_matches_every_level() {
+        p3_field_testing::test_into_stream::<BinaryField2>();
+        p3_field_testing::test_into_stream::<BinaryField4>();
+        p3_field_testing::test_into_stream::<BinaryField8>();
+        p3_field_testing::test_into_stream::<BinaryField16>();
+        p3_field_testing::test_into_stream::<BinaryField32>();
+        p3_field_testing::test_into_stream::<BinaryField64>();
+        p3_field_testing::test_into_stream::<BinaryField128>();
+    }
+
+    #[test]
+    fn word_streams_zero_pad_a_partial_final_word_at_every_level() {
+        // Reference: the little-endian byte stream, cut into words and zero-padded.
+        fn words_of(bytes: &[u8]) -> Vec<u64> {
+            bytes
+                .chunks(8)
+                .map(|chunk| {
+                    let mut word = [0u8; 8];
+                    word[..chunk.len()].copy_from_slice(chunk);
+                    u64::from_le_bytes(word)
+                })
+                .collect()
+        }
+
+        macro_rules! check {
+            ($field:ty) => {
+                for len in 0..=17 {
+                    let lanes: Vec<[$field; 3]> = (0..len)
+                        .map(|i| {
+                            core::array::from_fn(|lane| {
+                                <$field>::from_le_bytes(core::array::from_fn(|byte| {
+                                    (i * 31 + lane * 7 + byte * 13 + 1) as u8
+                                }))
+                            })
+                        })
+                        .collect();
+
+                    let lane_words: [Vec<u64>; 3] = core::array::from_fn(|lane| {
+                        let bytes: Vec<u8> = lanes
+                            .iter()
+                            .flat_map(|vector| vector[lane].into_bytes())
+                            .collect();
+                        words_of(&bytes)
+                    });
+
+                    let scalar: Vec<u64> =
+                        <$field>::into_u64_stream(lanes.iter().map(|vector| vector[0]))
+                            .into_iter()
+                            .collect();
+                    assert_eq!(
+                        scalar,
+                        lane_words[0],
+                        "{} scalar, len {len}",
+                        stringify!($field)
+                    );
+
+                    let parallel: Vec<[u64; 3]> =
+                        <$field>::into_parallel_u64_streams(lanes.iter().copied())
+                            .into_iter()
+                            .collect();
+                    let expected: Vec<[u64; 3]> = (0..lane_words[0].len())
+                        .map(|word| core::array::from_fn(|lane| lane_words[lane][word]))
+                        .collect();
+                    assert_eq!(
+                        parallel,
+                        expected,
+                        "{} parallel, len {len}",
+                        stringify!($field)
+                    );
+                }
+            };
+        }
+
+        check!(BinaryField2);
+        check!(BinaryField4);
+        check!(BinaryField8);
+        check!(BinaryField16);
+        check!(BinaryField32);
+        check!(BinaryField64);
+        check!(BinaryField128);
+    }
+
+    #[test]
+    fn order_counts_the_elements_of_each_level() {
+        assert_eq!(BinaryField2::order(), BigUint::from(4u32));
+        assert_eq!(BinaryField4::order(), BigUint::from(16u32));
+        assert_eq!(BinaryField8::order(), BigUint::from(256u32));
+        assert_eq!(BinaryField16::order(), BigUint::from(65536u32));
+        assert_eq!(BinaryField32::order(), BigUint::from(1u64 << 32));
+        assert_eq!(BinaryField64::order(), BigUint::from(1u128 << 64));
+        assert_eq!(BinaryField128::order(), BigUint::from(1u8) << 128usize);
+    }
+
+    #[test]
+    fn interpolation_nodes_are_basis_expansion() {
+        assert_eq!(BinaryField128::interpolation_node(0), BinaryField128::ZERO);
+        assert_eq!(BinaryField128::interpolation_node(1), BinaryField128::ONE);
+        assert_eq!(
+            BinaryField128::interpolation_node(2),
+            BinaryField128::from_repr(2)
+        );
+        assert_eq!(
+            BinaryField128::interpolation_node(5),
+            BinaryField128::from_repr(5)
+        );
+    }
+
+    /// The last index a level can enumerate is `2^BITS - 1`; anything above it would be masked
+    /// back onto an earlier node.
+    #[test]
+    fn interpolation_nodes_cover_the_whole_level() {
+        assert_eq!(
+            BinaryField4::interpolation_node(15),
+            BinaryField4::from_repr(15)
+        );
+        assert_eq!(
+            BinaryField8::interpolation_node(255),
+            BinaryField8::from_repr(255)
+        );
+    }
+
+    #[test]
+    #[should_panic = "interpolation node index out of range"]
+    fn interpolation_node_rejects_an_index_beyond_the_level() {
+        let _node = BinaryField8::interpolation_node(256);
+    }
+
+    #[test]
+    fn each_level_satisfies_the_tower_defining_relation() {
+        assert_defining_relation!(BinaryField2, u8, 2);
+        assert_defining_relation!(BinaryField4, u8, 4);
+        assert_defining_relation!(BinaryField8, u8, 8);
+        assert_defining_relation!(BinaryField16, u16, 16);
+        assert_defining_relation!(BinaryField32, u32, 32);
+        assert_defining_relation!(BinaryField64, u64, 64);
+        assert_defining_relation!(BinaryField128, u128, 128);
+    }
+
+    /// `GF(2)` is the prime subfield of the whole tower, so every level is a `GF(2)`-algebra:
+    /// the embedding is a ring homomorphism and each mixed operator agrees with embedding first.
+    #[test]
+    fn every_level_is_an_algebra_over_gf2() {
+        /// Statically require the full `Algebra<Gf2>` bound, not merely the operators.
+        const fn assert_algebra_over_gf2<T: Algebra<Gf2>>() {}
+
+        macro_rules! assert_gf2_algebra {
+            ($t:ty) => {{
+                assert_algebra_over_gf2::<$t>();
+
+                assert_eq!(<$t>::from(Gf2::ZERO), <$t>::ZERO);
+                assert_eq!(<$t>::from(Gf2::ONE), <$t>::ONE);
+
+                for x in [Gf2::ZERO, Gf2::ONE] {
+                    for y in [Gf2::ZERO, Gf2::ONE] {
+                        assert_eq!(<$t>::from(x + y), <$t>::from(x) + <$t>::from(y));
+                        assert_eq!(<$t>::from(x * y), <$t>::from(x) * <$t>::from(y));
+                    }
+                }
+
+                for a in [
+                    <$t>::ZERO,
+                    <$t>::ONE,
+                    <$t>::GENERATOR,
+                    <$t>::GENERATOR.square(),
+                ] {
+                    for bit in [Gf2::ZERO, Gf2::ONE] {
+                        let embedded = <$t>::from(bit);
+
+                        assert_eq!(a + bit, a + embedded);
+                        assert_eq!(a - bit, a - embedded);
+                        assert_eq!(a * bit, a * embedded);
+                        assert_eq!(bit + a, embedded + a);
+                        assert_eq!(bit - a, embedded - a);
+                        assert_eq!(bit * a, embedded * a);
+
+                        let mut acc = a;
+                        acc += bit;
+                        assert_eq!(acc, a + embedded);
+                        let mut acc = a;
+                        acc -= bit;
+                        assert_eq!(acc, a - embedded);
+                        let mut acc = a;
+                        acc *= bit;
+                        assert_eq!(acc, a * embedded);
+                    }
+                }
+            }};
+        }
+
+        assert_gf2_algebra!(BinaryField2);
+        assert_gf2_algebra!(BinaryField4);
+        assert_gf2_algebra!(BinaryField8);
+        assert_gf2_algebra!(BinaryField16);
+        assert_gf2_algebra!(BinaryField32);
+        assert_gf2_algebra!(BinaryField64);
+        assert_gf2_algebra!(BinaryField128);
+    }
+
+    #[test]
+    fn generators_generate_the_multiplicative_group() {
+        assert_full_order!(BinaryField2, 2, FACTORS_2);
+        assert_full_order!(BinaryField4, 4, FACTORS_4);
+        assert_full_order!(BinaryField8, 8, FACTORS_8);
+        assert_full_order!(BinaryField16, 16, FACTORS_16);
+        assert_full_order!(BinaryField32, 32, FACTORS_32);
+        assert_full_order!(BinaryField64, 64, FACTORS_64);
+        assert_full_order!(BinaryField128, 128, FACTORS_128);
+    }
+
+    /// Scans for the smallest bit pattern generating each level's multiplicative group.
+    ///
+    /// The values it reports are pinned as the `GENERATOR` constants; run with
+    /// `cargo test -p p3-binary-field --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "one-off search used to pin the GENERATOR constants"]
+    fn search_generators() {
+        search_generator!(BinaryField2, u8, 2, FACTORS_2);
+        search_generator!(BinaryField4, u8, 4, FACTORS_4);
+        search_generator!(BinaryField8, u8, 8, FACTORS_8);
+        search_generator!(BinaryField16, u16, 16, FACTORS_16);
+        search_generator!(BinaryField32, u32, 32, FACTORS_32);
+        search_generator!(BinaryField64, u64, 64, FACTORS_64);
+        search_generator!(BinaryField128, u128, 128, FACTORS_128);
+    }
+
+    fn bf128() -> impl Strategy<Value = BinaryField128> {
+        any::<u128>().prop_map(BinaryField128::from_repr)
+    }
+
+    fn bf64() -> impl Strategy<Value = BinaryField64> {
+        any::<u64>().prop_map(BinaryField64::from_repr)
+    }
+
+    fn bf32() -> impl Strategy<Value = BinaryField32> {
+        any::<u32>().prop_map(BinaryField32::from_repr)
+    }
+
+    fn bf16() -> impl Strategy<Value = BinaryField16> {
+        any::<u16>().prop_map(BinaryField16::from_repr)
+    }
+
+    fn bf8() -> impl Strategy<Value = BinaryField8> {
+        any::<u8>().prop_map(BinaryField8::from_repr)
+    }
+
+    fn bf4() -> impl Strategy<Value = BinaryField4> {
+        any::<u8>().prop_map(BinaryField4::from_repr)
+    }
+
+    fn bf2() -> impl Strategy<Value = BinaryField2> {
+        any::<u8>().prop_map(BinaryField2::from_repr)
+    }
+
+    #[test]
+    fn bool_check_matches_the_vanishing_polynomial_at_zero_and_one() {
+        macro_rules! check {
+            ($field:ty) => {
+                for x in [<$field>::ZERO, <$field>::ONE] {
+                    assert_eq!(x.bool_check(), x * (x - <$field>::ONE));
+                }
+            };
+        }
+        check!(BinaryField2);
+        check!(BinaryField4);
+        check!(BinaryField8);
+        check!(BinaryField16);
+        check!(BinaryField32);
+        check!(BinaryField64);
+        check!(BinaryField128);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+
+        #[test]
+        fn mul_is_commutative(a in bf128(), b in bf128()) {
+            prop_assert_eq!(a * b, b * a);
+        }
+
+        #[test]
+        fn mul_is_associative(a in bf128(), b in bf128(), c in bf128()) {
+            prop_assert_eq!((a * b) * c, a * (b * c));
+        }
+
+        #[test]
+        fn mul_distributes_over_addition(a in bf128(), b in bf128(), c in bf128()) {
+            prop_assert_eq!(a * (b + c), a * b + a * c);
+        }
+
+        #[test]
+        fn nonzero_times_its_inverse_is_one(a in bf128()) {
+            prop_assume!(a != BinaryField128::ZERO);
+            prop_assert_eq!(a * a.inverse(), BinaryField128::ONE);
+        }
+
+        /// The levels whose `square` dispatches must agree with the recursive definition.
+        #[test]
+        fn square_agrees_with_the_reference_squaring(a in bf128(), b in bf64()) {
+            prop_assert_eq!(a.square(), a.reference_square());
+            prop_assert_eq!(b.square(), b.reference_square());
+        }
+
+        /// `reference_mul` recurses to the bottom of the tower without dispatching, so squaring
+        /// through it is independent of every fast path.
+        #[test]
+        fn square_agrees_with_the_reference_product(a in bf128(), b in bf64(), c in any::<u32>()) {
+            prop_assert_eq!(a.square(), a.reference_mul(a));
+            prop_assert_eq!(b.square(), b.reference_mul(b));
+            let c = BinaryField32::from_repr(c);
+            prop_assert_eq!(c.square(), c.reference_mul(c));
+        }
+
+        #[test]
+        fn square_agrees_with_self_multiplication(a in bf128(), b in bf64()) {
+            prop_assert_eq!(a.square(), a * a);
+            prop_assert_eq!(b.square(), b * b);
+        }
+
+        /// The levels whose `Mul` recurses through the level below's operator must agree with
+        /// the recursion that runs to the bottom of the tower. At 64 and 128 bits that operator
+        /// is only reached where there is no carryless-multiply instruction, so it is checked
+        /// here on every target rather than only on the ones that dispatch to it.
+        #[test]
+        fn karatsuba_agrees_with_the_recursive_product(
+            a in bf32(),
+            b in bf32(),
+            c in bf16(),
+            d in bf16(),
+            e in bf64(),
+            f in bf64(),
+            g in bf128(),
+            h in bf128(),
+        ) {
+            prop_assert_eq!(a.karatsuba_mul(b), a.reference_mul(b));
+            prop_assert_eq!(c.karatsuba_mul(d), c.reference_mul(d));
+            prop_assert_eq!(e.karatsuba_mul(f), e.reference_mul(f));
+            prop_assert_eq!(g.karatsuba_mul(h), g.reference_mul(h));
+        }
+
+        /// `bool_check` must agree with the vanishing polynomial `x * (x - 1)` at every level,
+        /// computed here through the ordinary `Mul` and `Sub` operators rather than the
+        /// squaring shortcut `bool_check` itself takes.
+        #[test]
+        fn bool_check_agrees_with_the_vanishing_polynomial(
+            a2 in bf2(),
+            a4 in bf4(),
+            a8 in bf8(),
+            a16 in bf16(),
+            a32 in bf32(),
+            a64 in bf64(),
+            a128 in bf128(),
+        ) {
+            prop_assert_eq!(a2.bool_check(), a2 * (a2 - BinaryField2::ONE));
+            prop_assert_eq!(a4.bool_check(), a4 * (a4 - BinaryField4::ONE));
+            prop_assert_eq!(a8.bool_check(), a8 * (a8 - BinaryField8::ONE));
+            prop_assert_eq!(a16.bool_check(), a16 * (a16 - BinaryField16::ONE));
+            prop_assert_eq!(a32.bool_check(), a32 * (a32 - BinaryField32::ONE));
+            prop_assert_eq!(a64.bool_check(), a64 * (a64 - BinaryField64::ONE));
+            prop_assert_eq!(a128.bool_check(), a128 * (a128 - BinaryField128::ONE));
+        }
+    }
+}

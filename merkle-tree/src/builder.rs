@@ -1,0 +1,1929 @@
+//! Planning and parallel construction of the digest layers of a Merkle tree.
+//!
+//! A build runs in two steps.
+//!
+//! - Plan: walk the matrix heights once and fix every layer's arity, injected matrices and size.
+//! - Fill: hash the layers bottom up, whole subtrees at a time.
+//!
+//! A node depends only on a contiguous run of nodes one layer down.
+//!
+//! So a run of nodes at some layer depends on one contiguous run at every layer below it:
+//!
+//! ```text
+//!     layer 2    [   block 0   |   block 1   ]
+//!     layer 1    [ b0  |  b0   |  b1  |  b1  ]
+//!     layer 0    [b0|b0|b0|b0  |b1|b1|b1|b1  ]
+//! ```
+//!
+//! One task builds one such block from the leaves up, with no barrier between its layers.
+//!
+//! Its digests stay in the private caches from the layer that writes them to the one reading them.
+//!
+//! A pass stops at the highest layer where every block still holds a few full vector groups.
+//!
+//! The layers above it are narrow, so the next pass splits them into fewer blocks.
+
+use alloc::vec;
+use alloc::vec::Vec;
+use core::cmp::Reverse;
+use core::marker::PhantomData;
+use core::ops::RangeInclusive;
+use core::{array, mem};
+
+use itertools::Itertools;
+use p3_field::{Packable, PackedValue};
+use p3_matrix::Matrix;
+use p3_maybe_rayon::prelude::*;
+use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
+
+use crate::MerkleTreeError;
+use crate::merkle_tree::select_arity_step;
+use crate::mmcs::validate_commit_reachable_heights;
+
+/// Blocks per worker thread in the first pass.
+///
+/// A pass ends when its last block does, so a block is the unit of load imbalance.
+///
+/// Sixteen blocks per thread bound that tail to about a sixteenth of a thread's share.
+///
+/// That keeps a slow permutation, where one block is milliseconds of work, from idling the rest.
+const BLOCKS_PER_THREAD: usize = 16;
+
+/// Vector groups a block must hold at the top layer of its pass.
+///
+/// One full group per block keeps every vector call at full width.
+const MIN_BLOCK_GROUPS: usize = 1;
+
+/// Nodes of an injecting layer staged at once by the batched arm.
+///
+/// Three buffers of this many digests fit in the mid-level cache on every current core.
+const INJECT_CHUNK_NODES: usize = 1024;
+
+/// Target size in bytes of the buffer holding one group of copied rows.
+///
+/// A batched hasher wants its messages back to back in memory.
+/// A matrix only promises access one row at a time.
+/// So a group of rows is copied in first.
+///
+/// 16 KiB keeps that copy in the first-level cache until the pass that reads it back.
+///
+/// This is a target rather than a cap.
+///
+/// A group is rounded up to a whole lane group.
+///
+/// One row is staged however wide it is.
+///
+/// So the buffer reaches `max(this, lanes * row bytes)`, which at eight lanes is:
+///
+/// ```text
+///     row bytes   staged           the batching consumer
+///        2 KiB     16 KiB   (1x)   groups rows, every lane busy
+///        8 KiB     64 KiB   (4x)   groups rows, every lane busy
+///       64 KiB    512 KiB  (32x)   groups rows, every lane busy
+/// ```
+///
+/// An idle lane costs a whole permutation, far more than the cache level given up.
+pub(crate) const ROW_SCRATCH_BYTES: usize = 16 * 1024;
+
+/// Rows one hash call stages, from the byte target and the hasher's lane count.
+///
+/// # Returns
+///
+/// A count of at least one, always a whole number of lane groups.
+///
+/// It stages at most the target, or one lane group of rows when that is larger.
+///
+/// Zero on either argument is read as one, so every input has an answer.
+pub(crate) fn rows_per_call(row_bytes: usize, lanes: usize) -> usize {
+    // Both divisors are normalized here, so no caller reaches a division by zero.
+    let row_bytes = row_bytes.max(1);
+    let lanes = lanes.max(1);
+
+    // Whole lane groups inside the target, and one group when none fits.
+    (ROW_SCRATCH_BYTES / row_bytes / lanes).max(1) * lanes
+}
+
+/// Allocate a digest layer with every slot set to the default digest.
+///
+/// Hashing overwrites every slot but a short padding tail, so the fill is pure overhead.
+///
+/// A zero-filled allocation makes it free.
+///
+/// The operating system hands back zero pages and faults them in only when hashing writes them.
+///
+/// The standard vector constructor reaches that path only for primitive element types.
+///
+/// It gives up for arrays longer than sixteen elements, the shape of a thirty-two-byte digest.
+///
+/// Building the layer as one flat run of digest words restores it:
+///
+/// ```text
+///     flat:    [ w_0 w_1 ... w_{D-1} | w_D ... w_{2D-1} | ... ]   len * D words
+///     digests: [       digest_0      |     digest_1     | ... ]   len digests
+/// ```
+///
+/// # Panics
+///
+/// Panics if the layer is too large for the address space.
+pub(crate) fn default_digest_layer<W, const DIGEST_ELEMS: usize>(
+    len: usize,
+) -> Vec<[W; DIGEST_ELEMS]>
+where
+    W: Copy + Default,
+{
+    // A layer with no slots, or a digest of no words, owns no allocation worth reinterpreting.
+    if len == 0 || DIGEST_ELEMS == 0 {
+        return vec![[W::default(); DIGEST_ELEMS]; len];
+    }
+
+    // Guard the multiply so a wrapped word count can never under-allocate the layer.
+    let words = len
+        .checked_mul(DIGEST_ELEMS)
+        .expect("digest layer length overflows");
+
+    let mut flat: Vec<W> = vec![W::default(); words];
+
+    // A vector may reserve more than requested, and only an exact allocation converts.
+    if flat.capacity() != words {
+        return vec![[W::default(); DIGEST_ELEMS]; len];
+    }
+
+    let ptr = flat.as_mut_ptr().cast::<[W; DIGEST_ELEMS]>();
+    mem::forget(flat);
+
+    // SAFETY: an array of words has no padding.
+    //
+    // So `len` digests occupy exactly the words allocated above, with the alignment of one word.
+    //
+    // The length equals the reserved capacity.
+    //
+    // So the layout handed back to the allocator on drop is the layout it handed out.
+    //
+    // Every word is initialized, so every digest slot reads as the default digest.
+    unsafe { Vec::from_raw_parts(ptr, len, len) }
+}
+
+/// Geometry of one retained digest layer, before attaching matrices or allocating digests.
+pub(crate) struct LayerShape {
+    pub(crate) arity: usize,
+    pub(crate) computed: usize,
+    pub(crate) padded: usize,
+    pub(crate) injected: usize,
+}
+
+/// Walk heights in descending order using the builder's binary bridges and N-ary steps.
+///
+/// Check the height envelope before any unchecked power-of-two arithmetic in arity selection.
+/// No digest buffers are allocated here.
+pub(crate) fn layer_shapes<const N: usize>(
+    heights: impl Iterator<Item = usize> + Clone,
+) -> Result<Vec<LayerShape>, MerkleTreeError> {
+    let mut heights = heights.peekable();
+    let max_height = heights
+        .peek()
+        .copied()
+        .filter(|&height| height > 0)
+        .ok_or(MerkleTreeError::EmptyBatch)?;
+    let leaf_height_npt = max_height
+        .checked_next_power_of_two()
+        .ok_or(MerkleTreeError::DigestStorageOverflow)?;
+    validate_commit_reachable_heights(heights.clone())?;
+
+    let checked_padding = |computed: usize| {
+        if computed <= 1 {
+            Ok(computed)
+        } else {
+            computed
+                .div_ceil(N)
+                .checked_mul(N)
+                .ok_or(MerkleTreeError::DigestStorageOverflow)
+        }
+    };
+    let mut len = checked_padding(max_height)?;
+    let mut shapes = vec![LayerShape {
+        arity: 0,
+        computed: max_height,
+        padded: len,
+        injected: heights
+            .peeking_take_while(|&height| height == max_height)
+            .count(),
+    }];
+
+    while len > 1 {
+        let arity = select_arity_step::<N>(len, leaf_height_npt, heights.clone())?;
+        let computed = len / arity;
+        let target = computed.next_power_of_two();
+        let injected = heights
+            .peeking_take_while(|height| height.next_power_of_two() == target)
+            .count();
+        len = checked_padding(computed)?;
+        shapes.push(LayerShape {
+            arity,
+            computed,
+            padded: len,
+            injected,
+        });
+    }
+    Ok(shapes)
+}
+
+/// One digest layer, as fixed by the plan before any hashing.
+///
+/// A node at an upper layer is, with `a` its arity and the default digest `0` as filler:
+///
+/// ```text
+///     folded = C(child_{a*i}, ..., child_{a*i + a - 1}, 0, ..., 0)
+///     node_i = folded                                 no injected matrices
+///     node_i = C(folded, H(row_i), 0, ..., 0)         injected matrices, i < their height
+///     node_i = C(folded, 0, 0, ..., 0)                injected matrices, i >= their height
+/// ```
+///
+/// A leaf is the hash of row `i` concatenated across the tallest matrices.
+#[derive(Debug)]
+pub(crate) struct Layer<'a, M> {
+    /// Children folded into each node: zero at the leaves, else two or the full arity.
+    pub(crate) arity: usize,
+
+    /// Matrices whose rows are hashed into this layer, all of one height, in insertion order.
+    pub(crate) matrices: Vec<&'a M>,
+
+    /// Nodes hashed at this layer.
+    ///
+    /// The allocated layer is padded past them with default digests.
+    pub(crate) computed: usize,
+
+    /// Initialized digest slots, including the padding needed by the next fold.
+    pub(crate) padded: usize,
+}
+
+/// Builds every digest layer of one tree.
+///
+/// It holds the plan and the two hash functions, and is shared read-only by every task.
+pub(crate) struct TreeBuilder<'a, P, PW, H, C, M, const N: usize, const DIGEST_ELEMS: usize> {
+    /// Hasher applied to matrix rows.
+    h: &'a H,
+
+    /// Compression function applied to groups of `N` digests.
+    c: &'a C,
+
+    /// Every layer, from the leaves up to the root.
+    layers: Vec<Layer<'a, M>>,
+
+    /// Binds the packed input and digest types used by the vector arms.
+    _packing: PhantomData<(P, PW)>,
+}
+
+impl<'a, P, PW, H, C, M, const N: usize, const DIGEST_ELEMS: usize>
+    TreeBuilder<'a, P, PW, H, C, M, N, DIGEST_ELEMS>
+where
+    P: PackedValue,
+    PW: PackedValue,
+    H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+        + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+        + Sync,
+    C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+        + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+        + Sync,
+    M: Matrix<P::Value>,
+{
+    /// Messages the row hasher takes per call.
+    const HASH_LANES: usize =
+        <H as CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>>::LANES;
+
+    /// Groups the compression function takes per call.
+    const COMPRESS_LANES: usize =
+        <C as PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>>::LANES;
+
+    /// Plan the layers of a tree over a set of matrices.
+    ///
+    /// Heights must sit on the `ceil(max_height / 2^k)` ladder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the heights cannot form a tree or their geometry overflows `usize`.
+    pub(crate) fn new(h: &'a H, c: &'a C, leaves: &'a [M]) -> Self {
+        // Stable sorting preserves insertion order within each injection group.
+        let mut by_height = leaves.iter().sorted_by_key(|m| Reverse(m.height()));
+        let shapes = layer_shapes::<N>(by_height.clone().map(|m| m.height()))
+            .unwrap_or_else(|err| panic!("{err}"));
+        let layers = shapes
+            .into_iter()
+            .map(|shape| Layer {
+                arity: shape.arity,
+                matrices: by_height.by_ref().take(shape.injected).collect(),
+                computed: shape.computed,
+                padded: shape.padded,
+            })
+            .collect();
+
+        Self {
+            h,
+            c,
+            layers,
+            _packing: PhantomData,
+        }
+    }
+
+    /// The compression arity of every layer above the leaves, bottom up.
+    pub(crate) fn arity_schedule(&self) -> Vec<usize> {
+        self.layers[1..].iter().map(|layer| layer.arity).collect()
+    }
+
+    /// Hash every layer and return them, the leaf digests first and the root last.
+    pub(crate) fn build(&self) -> Vec<Vec<[PW::Value; DIGEST_ELEMS]>> {
+        // Every layer is allocated up front, so each pass writes into disjoint pieces of them.
+        let mut digests: Vec<_> = self
+            .layers
+            .iter()
+            .map(|layer| default_digest_layer(layer.padded))
+            .collect();
+
+        // Each pass covers a contiguous band of layers, lowest first.
+        let mut lo = 0;
+        while lo < self.layers.len() {
+            let (blocks, hi) = self.pass_shape(lo);
+            self.run_pass(&mut digests, lo..=hi, blocks);
+            lo = hi + 1;
+        }
+
+        digests
+    }
+
+    /// Hash every layer above leaf digests the caller computed, and return them, the leaf digests first.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless one matrix fills the leaf layer and there is one digest per row of it.
+    pub(crate) fn build_over_leaf_digests(
+        &self,
+        mut leaf_digests: Vec<[PW::Value; DIGEST_ELEMS]>,
+    ) -> Vec<Vec<[PW::Value; DIGEST_ELEMS]>>
+    where
+        PW::Value: Default,
+    {
+        assert_eq!(
+            self.layers[0].matrices.len(),
+            1,
+            "one matrix fills the leaves"
+        );
+        assert!(
+            self.layers[1..]
+                .iter()
+                .all(|layer| layer.matrices.is_empty()),
+            "no matrix is injected above the leaves"
+        );
+        assert_eq!(
+            leaf_digests.len(),
+            self.layers[0].computed,
+            "one digest per row"
+        );
+        leaf_digests.resize(self.layers[0].padded, [PW::Value::default(); DIGEST_ELEMS]);
+
+        let mut digests: Vec<_> = core::iter::once(leaf_digests)
+            .chain(
+                self.layers[1..]
+                    .iter()
+                    .map(|layer| default_digest_layer(layer.padded)),
+            )
+            .collect();
+
+        // The leaf layer is done, so the passes start one layer up.
+        let mut lo = 1;
+        while lo < self.layers.len() {
+            let (blocks, hi) = self.pass_shape(lo);
+            self.run_pass(&mut digests, lo..=hi, blocks);
+            lo = hi + 1;
+        }
+        digests
+    }
+
+    /// Nodes one vector call hashes together.
+    ///
+    /// Blocks are cut on multiples of it, so that only the last block runs a partial group.
+    fn group() -> usize {
+        P::WIDTH.max(Self::HASH_LANES).max(Self::COMPRESS_LANES)
+    }
+
+    /// Choose the block count and the top layer of a pass.
+    ///
+    /// # Arguments
+    ///
+    /// - `lo`: the lowest layer of the pass, the first one not yet built.
+    ///
+    /// # Returns
+    ///
+    /// The block count, and the highest layer where every block holds its minimum of groups.
+    ///
+    /// Once some thread would get no block, one block takes every remaining layer.
+    ///
+    /// Rows still to hash are the exception, when they are worth spreading over the pool.
+    fn pass_shape(&self, lo: usize) -> (usize, usize) {
+        let group = Self::group();
+        let min_block = group * MIN_BLOCK_GROUPS;
+
+        // The first pass carries almost all the work, so it takes many blocks for balance.
+        //
+        // A later pass carries little, so one block per thread lets it climb the highest.
+        let threads = current_num_threads();
+        let per_thread = if lo == 0 { BLOCKS_PER_THREAD } else { 1 };
+
+        // No more blocks than the base layer can fill.
+        let blocks = (self.layers[lo].computed / min_block)
+            .min(per_thread * threads)
+            .max(1);
+
+        // Once some thread would get no block, the layers left are too narrow to share.
+        //
+        // One block then finishes them, cheaper than a dispatch per remaining layer.
+        //
+        // Wide rows break that rule once their bytes clear the pool's own gate.
+        //
+        //     256 rows of 64 KiB, 32 lanes, 32 threads  ->  8 blocks, not 1
+        if blocks == 1 || (blocks < threads && !self.rows_worth_splitting(lo)) {
+            return (1, self.layers.len() - 1);
+        }
+
+        // Climb while the layer still gives every block its minimum.
+        let hi = (lo..self.layers.len())
+            .take_while(|&l| self.layers[l].computed >= blocks * min_block)
+            .last()
+            .unwrap_or(lo);
+        (blocks, hi)
+    }
+
+    /// Whether the rows hashed from a layer up are worth spreading over the pool.
+    ///
+    /// Rows are priced by their bytes, at the rate of a streaming pass over memory.
+    ///
+    /// That rate is what the fastest vectorized byte hashes cost.
+    ///
+    /// A slower hash is priced low, so it splits later than its true cost would allow.
+    ///
+    /// The gate is calibrated on flat loops, and splitting a tree costs more than their dispatch.
+    ///
+    /// Just above the gate, a split can lose on x86, as measured with BLAKE3 on 32 Zen 5 threads:
+    ///
+    /// - 128 rows of 2 KiB: 19 us on one block, 35 us on eight.
+    /// - The same eight blocks break even near 512 KiB, and win 1.3x to 2.3x from 768 KiB up.
+    ///
+    /// Graviton wins 1.7x to 3x on the same small trees, so the gate is kept rather than raised.
+    fn rows_worth_splitting(&self, lo: usize) -> bool {
+        // One item per byte, so the pool's own gate decides.
+        should_split(self.row_bytes(lo), 1)
+    }
+
+    /// Bytes of every row still to hash from a layer up, the leaves and each later injection alike.
+    fn row_bytes(&self, lo: usize) -> usize {
+        self.layers[lo..]
+            .iter()
+            .flat_map(|layer| &layer.matrices)
+            .map(|m| m.height() * m.width())
+            .sum::<usize>()
+            .saturating_mul(size_of::<P::Value>())
+    }
+
+    /// Build a band of layers as independent subtree blocks, one task each.
+    ///
+    /// Block `j` owns nodes from `j * size_l` of layer `l`, where sizes grow by each arity:
+    ///
+    /// ```text
+    ///     size_hi     = group * ceil(computed_hi / (blocks * group))
+    ///     size_{l-1}  = size_l * arity_l
+    /// ```
+    ///
+    /// Its nodes at layer `l` read only its own nodes at layer `l - 1`.
+    ///
+    /// The last block's pieces also hold the padding tails, which stay at the default digest.
+    ///
+    /// # Arguments
+    ///
+    /// - `digests`: every layer, with the ones below the band already built.
+    /// - `band`: the layers this pass builds, bottom to top.
+    /// - `blocks`: the requested block count, before rounding to whole vector groups.
+    fn run_pass(
+        &self,
+        digests: &mut [Vec<[PW::Value; DIGEST_ELEMS]>],
+        band: RangeInclusive<usize>,
+        blocks: usize,
+    ) {
+        let (lo, hi) = (*band.start(), *band.end());
+        let group = Self::group();
+
+        // Block sizes at every layer of the band, top down from the rounded top size.
+        let mut sizes = vec![0; hi - lo + 1];
+        sizes[hi - lo] = group * self.layers[hi].computed.div_ceil(blocks * group);
+        for l in (lo..hi).rev() {
+            sizes[l - lo] = sizes[l + 1 - lo] * self.layers[l + 1].arity;
+        }
+
+        // Layers below the band are finished and read-only; the band is split into pieces.
+        let (below, band_layers) = digests.split_at_mut(lo);
+        let children = below.last().map(Vec::as_slice);
+        let band_layers = &mut band_layers[..=hi - lo];
+
+        // Rounding the top size up can leave fewer non-empty blocks than requested.
+        let count = self.layers[hi].computed.div_ceil(sizes[hi - lo]);
+
+        // Cut every layer into one piece per block, block-major.
+        let mut pieces: Vec<Vec<&mut [[PW::Value; DIGEST_ELEMS]]>> = (0..count)
+            .map(|_| Vec::with_capacity(band_layers.len()))
+            .collect();
+        for (layer, &size) in band_layers.iter_mut().zip(&sizes) {
+            let mut rest = layer.as_mut_slice();
+            for (j, block) in pieces.iter_mut().enumerate() {
+                // The last block also takes the padding tail of every layer below the top.
+                let take = if j + 1 == count {
+                    rest.len()
+                } else {
+                    size.min(rest.len())
+                };
+                let (piece, tail) = mem::take(&mut rest).split_at_mut(take);
+                block.push(piece);
+                rest = tail;
+            }
+        }
+
+        // One set of staging buffers per worker, reused by every block it runs.
+        let fill =
+            |scratch: &mut Scratch<P::Value, PW::Value, N, DIGEST_ELEMS>,
+             (j, mut block): (usize, Vec<&mut [[PW::Value; DIGEST_ELEMS]]>)| {
+                for (offset, l) in (lo..=hi).enumerate() {
+                    let layer = &self.layers[l];
+                    let first = j * sizes[offset];
+
+                    // Only nodes below the computed count are hashed.
+                    //
+                    // The rest is padding.
+                    let (done, rest) = block.split_at_mut(offset);
+                    let out = &mut *rest[0];
+                    let nodes = layer.computed.saturating_sub(first).min(out.len());
+
+                    // A block can start inside the padding tail of a layer.
+                    //
+                    // Its piece there keeps the default digest, and its children may not exist.
+                    //
+                    // That padding still feeds real nodes one layer up, so the block keeps climbing.
+                    if nodes == 0 {
+                        continue;
+                    }
+
+                    // The children of this piece start at `arity * first` one layer down.
+                    let kids: &[_] = match (done.last(), children) {
+                        (Some(piece), _) => piece,
+                        (None, Some(below)) => &below[layer.arity * first..],
+                        (None, None) => &[],
+                    };
+                    self.fill_layer(layer, kids, &mut out[..nodes], first, scratch);
+                }
+            };
+
+        if count == 1 {
+            // One block needs no dispatch.
+            let mut scratch = Scratch::default();
+            pieces
+                .into_iter()
+                .enumerate()
+                .for_each(|block| fill(&mut scratch, block));
+        } else {
+            pieces
+                .into_par_iter()
+                .enumerate()
+                .for_each_init(Scratch::default, fill);
+        }
+    }
+
+    /// Hash a contiguous run of nodes of one layer.
+    ///
+    /// # Arguments
+    ///
+    /// - `layer`: the plan of the layer.
+    /// - `kids`: the layer below, from the first child of the run; empty at the leaves.
+    /// - `out`: one slot per node of the run.
+    /// - `first`: the index in the layer of the run's first node.
+    /// - `scratch`: staging buffers owned by the calling task.
+    fn fill_layer(
+        &self,
+        layer: &Layer<'a, M>,
+        kids: &[[PW::Value; DIGEST_ELEMS]],
+        out: &mut [[PW::Value; DIGEST_ELEMS]],
+        first: usize,
+        scratch: &mut Scratch<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) {
+        let (hash_lanes, compress_lanes) = (Self::HASH_LANES, Self::COMPRESS_LANES);
+
+        // A batched arm reads a node's children as one contiguous group of `N`.
+        //
+        // A binary bridge step below a larger arity breaks that, and takes the packed arm.
+        let full_groups = layer.arity == N;
+        match (layer.arity, layer.matrices.is_empty()) {
+            (0, _) if hash_lanes > 1 => {
+                self.hash_rows_batched(&layer.matrices, first, out, scratch);
+            }
+            (0, _) => self.hash_rows_packed(&layer.matrices, first, out, scratch),
+            (_, true) if full_groups && compress_lanes > 1 => {
+                let (groups, _) = kids[..out.len() * N].as_chunks::<N>();
+                self.c.compress_many(groups, out);
+            }
+            (_, false) if full_groups && compress_lanes > 1 && hash_lanes > 1 => {
+                self.inject_batched(layer, kids, out, first, scratch);
+            }
+            _ => self.fold_packed(layer, kids, out, first, scratch),
+        }
+    }
+
+    /// Hash one leaf per row with a hasher that hashes several messages per call.
+    ///
+    /// The message of a row is that row concatenated across every matrix, in order.
+    ///
+    /// The hasher wants its messages back to back in memory.
+    ///
+    /// A single matrix with adjacent rows already has that layout, so it is hashed in place.
+    ///
+    /// Any other input is copied into a staging buffer first, one group of rows at a time.
+    fn hash_rows_batched(
+        &self,
+        matrices: &[&M],
+        first: usize,
+        out: &mut [[PW::Value; DIGEST_ELEMS]],
+        scratch: &mut Scratch<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) {
+        // Bound the row range once, since the copy loop below skips per-row bounds checks.
+        assert!(
+            matrices.iter().all(|m| m.height() >= first + out.len()),
+            "row range {first}..{} exceeds a matrix height",
+            first + out.len()
+        );
+
+        // One matrix whose rows sit back to back is already one run of equal-length messages.
+        //
+        // Hashing it in place skips a copy of every row, the dominant cost for wide rows.
+        if let [m] = matrices
+            && let Some(rows) = m.contiguous_rows(first..first + out.len())
+        {
+            self.h.hash_many(&rows, out);
+            return;
+        }
+
+        let width: usize = matrices.iter().map(|m| m.width()).sum();
+        let rows_per_group = rows_per_call(width * size_of::<P::Value>(), Self::HASH_LANES);
+
+        for (group, digests) in out.chunks_mut(rows_per_group).enumerate() {
+            let start = first + group * rows_per_group;
+
+            // Lay the group's messages back to back: row by row, matrix by matrix.
+            //
+            // Extending from the row iterator keeps this free of allocation for every matrix type.
+            let rows = &mut scratch.rows;
+            rows.clear();
+            for row in start..start + digests.len() {
+                for m in matrices {
+                    // SAFETY: the assertion above bounds every requested row by every height.
+                    rows.extend(unsafe { m.row_unchecked(row) });
+                }
+            }
+
+            self.h.hash_many(rows, digests);
+        }
+    }
+
+    /// Hash one leaf per row, one row per lane of a packed hasher.
+    fn hash_rows_packed(
+        &self,
+        matrices: &[&M],
+        first: usize,
+        out: &mut [[PW::Value; DIGEST_ELEMS]],
+        scratch: &mut Scratch<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) {
+        let lanes = P::WIDTH;
+        let (groups, tail) = out.split_at_mut(Self::vector_nodes(out.len()));
+
+        // Whole lane groups: one packed hash per group of rows.
+        for (g, digests) in groups.chunks_exact_mut(lanes).enumerate() {
+            // SAFETY: the group ends at or before the last requested row, which every matrix holds.
+            let packed = unsafe { self.hash_packed_rows(matrices, first + g * lanes, scratch) };
+            unpack_digests(&packed, digests);
+        }
+
+        // Tail rows: hash each one alone.
+        let tail_first = first + groups.len();
+        for (offset, digest) in tail.iter_mut().enumerate() {
+            *digest = self.hash_row(matrices, tail_first + offset);
+        }
+    }
+
+    /// Hash one packed group of rows, one row message per lane.
+    ///
+    /// Lane `l` hashes row `l` of the group, concatenated across every matrix in order.
+    ///
+    /// The group is staged column-major so that each packed input is one whole vector:
+    ///
+    /// ```text
+    ///     staged: [ col_0 x W | col_1 x W | ... ]   one block of W lanes per column
+    ///     packed: [   p_0     |   p_1     | ... ]   the same memory, one vector per column
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// Every matrix must hold every row of the group.
+    unsafe fn hash_packed_rows(
+        &self,
+        matrices: &[&M],
+        first: usize,
+        scratch: &mut Scratch<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) -> [PW; DIGEST_ELEMS] {
+        let lanes = P::WIDTH;
+        let width: usize = matrices.iter().map(|m| m.width()).sum();
+
+        // Every group has the same shape, so after the first call this resize is a no-op.
+        //
+        // The transposes overwrite every slot, so stale contents never reach the hasher.
+        let staged = &mut scratch.rows;
+        staged.resize(width * lanes, P::Value::default());
+
+        // Each matrix owns a contiguous run of columns in the staged message.
+        let mut start = 0;
+        for m in matrices {
+            let cols = m.width();
+
+            let block = &mut staged[start * lanes..(start + cols) * lanes];
+            if let Some(rows) = m.contiguous_rows(first..first + lanes) {
+                // Keep the handle alive through the transpose: some matrices return owned rows.
+                // Dense matrices lend this whole group without allocating per-row handles.
+                P::Value::transpose_rows(
+                    lanes,
+                    cols,
+                    |lane| &rows[lane * cols..(lane + 1) * cols],
+                    block,
+                );
+            } else {
+                // Hold every fallback row handle until the transpose has finished reading it.
+                // SAFETY: the caller guarantees rows first .. first + lanes exist.
+                let rows: Vec<_> = (0..lanes)
+                    .map(|lane| unsafe { m.row_slice_unchecked(first + lane) })
+                    .collect();
+                P::Value::transpose_rows(lanes, cols, |lane| &*rows[lane], block);
+            }
+            start += cols;
+        }
+
+        self.h.hash_iter(P::pack_slice(staged).iter().copied())
+    }
+
+    /// Fold children into nodes and inject rows, one node per lane of a packed compression.
+    ///
+    /// A lane group straddling the injected height mixes both kinds of node.
+    ///
+    /// Such a group takes the scalar path.
+    fn fold_packed(
+        &self,
+        layer: &Layer<'a, M>,
+        kids: &[[PW::Value; DIGEST_ELEMS]],
+        out: &mut [[PW::Value; DIGEST_ELEMS]],
+        first: usize,
+        scratch: &mut Scratch<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) {
+        let lanes = PW::WIDTH;
+        let rows = Self::injected_height(layer);
+        let default = [PW::broadcast(PW::Value::default()); DIGEST_ELEMS];
+
+        let (groups, tail) = out.split_at_mut(Self::vector_nodes(out.len()));
+        for (g, digests) in groups.chunks_exact_mut(lanes).enumerate() {
+            let local = g * lanes;
+            let node = first + local;
+
+            // A group is uniform when it lies wholly below or wholly above the injected rows.
+            let injected = !layer.matrices.is_empty() && node < rows;
+            if injected && node + lanes > rows {
+                for (i, digest) in digests.iter_mut().enumerate() {
+                    *digest = self.node(layer, kids, local + i, node + i);
+                }
+                continue;
+            }
+
+            let children = pack_children::<PW, N, DIGEST_ELEMS>(
+                &kids[layer.arity * local..],
+                layer.arity,
+                &mut scratch.digests,
+            );
+            let mut packed = self.c.compress(children);
+
+            // Mix in the row digest, or the default digest past the injected rows.
+            if !layer.matrices.is_empty() {
+                let row = if injected {
+                    // SAFETY: the uniform group lies wholly below the injected height.
+                    unsafe { self.hash_packed_rows(&layer.matrices, node, scratch) }
+                } else {
+                    default
+                };
+                packed = self.c.compress(array::from_fn(|slot| match slot {
+                    0 => packed,
+                    1 => row,
+                    _ => default,
+                }));
+            }
+
+            unpack_digests(&packed, digests);
+        }
+
+        // Tail nodes past the last whole group.
+        let tail_local = groups.len();
+        for (i, digest) in tail.iter_mut().enumerate() {
+            *digest = self.node(layer, kids, tail_local + i, first + tail_local + i);
+        }
+    }
+
+    /// Fold children and inject rows with batched hashing and batched compression.
+    ///
+    /// Each chunk of nodes goes through three passes over small buffers:
+    ///
+    /// ```text
+    ///     pass 1: compress N children            -> out
+    ///     pass 2: hash one row per output node    -> injected
+    ///     pass 3: compress [out, injected]       -> out
+    /// ```
+    ///
+    /// Nodes past the injected height mix in the default digest in place of a row digest.
+    fn inject_batched(
+        &self,
+        layer: &Layer<'a, M>,
+        kids: &[[PW::Value; DIGEST_ELEMS]],
+        out: &mut [[PW::Value; DIGEST_ELEMS]],
+        first: usize,
+        scratch: &mut Scratch<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) {
+        let rows = Self::injected_height(layer);
+        let default = [PW::Value::default(); DIGEST_ELEMS];
+        let (groups, _) = kids[..out.len() * N].as_chunks::<N>();
+
+        // Row hashing borrows all staging buffers, so this one is moved out for the loop and restored after it.
+        let mut injected = mem::take(&mut scratch.injected);
+        for (k, (groups, out)) in groups
+            .chunks(INJECT_CHUNK_NODES)
+            .zip(out.chunks_mut(INJECT_CHUNK_NODES))
+            .enumerate()
+        {
+            let base = first + k * INJECT_CHUNK_NODES;
+            let count = out.len();
+
+            // Pass 1: fold the children of every node in this chunk.
+            self.c.compress_many(groups, out);
+
+            // Pass 2: hash one row per node, for as many nodes as the matrices are tall.
+            let injected_count = count.min(rows.saturating_sub(base));
+            injected.resize(injected_count, default);
+            self.hash_rows_batched(&layer.matrices, base, &mut injected, scratch);
+
+            // Pass 3: copy every folded digest into scratch before overwriting the output.
+            let pairs = &mut scratch.pairs;
+            pairs.resize(count, [default; N]);
+            for (node, pair) in pairs.iter_mut().enumerate() {
+                *pair = array::from_fn(|slot| match slot {
+                    0 => out[node],
+                    1 if node < injected_count => injected[node],
+                    _ => default,
+                });
+            }
+            self.c.compress_many(pairs, out);
+        }
+        scratch.injected = injected;
+    }
+
+    /// Leading nodes of a run that go through whole vector groups; the rest take the scalar path.
+    ///
+    /// A one-lane packing gains nothing from staging, so all of its nodes take the scalar path.
+    const fn vector_nodes(len: usize) -> usize {
+        if P::WIDTH > 1 {
+            len / P::WIDTH * P::WIDTH
+        } else {
+            0
+        }
+    }
+
+    /// Height of the matrices injected into a layer, or zero when there are none.
+    fn injected_height(layer: &Layer<'a, M>) -> usize {
+        layer.matrices.first().map_or(0, |m| m.height())
+    }
+
+    /// Hash one leaf: one row concatenated across every matrix, in order.
+    fn hash_row(&self, matrices: &[&M], row: usize) -> [PW::Value; DIGEST_ELEMS] {
+        // SAFETY: every caller passes a row below the height of every matrix.
+        unsafe {
+            // One matrix: its row iterator alone, free of the flattening adapter's checks.
+            if let [m] = matrices {
+                return self.h.hash_iter(m.row_unchecked(row));
+            }
+            self.h
+                .hash_iter(matrices.iter().flat_map(|m| m.row_unchecked(row)))
+        }
+    }
+
+    /// Hash one upper-layer node on the scalar path.
+    ///
+    /// # Arguments
+    ///
+    /// - `layer`: the plan of the layer.
+    /// - `kids`: the layer below, from the first child of the calling run.
+    /// - `local`: the node's position in that run, which locates its children.
+    /// - `node`: the node's index in the layer, which locates its injected row.
+    fn node(
+        &self,
+        layer: &Layer<'a, M>,
+        kids: &[[PW::Value; DIGEST_ELEMS]],
+        local: usize,
+        node: usize,
+    ) -> [PW::Value; DIGEST_ELEMS] {
+        let default = [PW::Value::default(); DIGEST_ELEMS];
+        let arity = layer.arity;
+
+        // Fold the node's children, padded to the full arity.
+        let folded = self.c.compress(array::from_fn(|slot| {
+            if slot < arity {
+                kids[arity * local + slot]
+            } else {
+                default
+            }
+        }));
+        if layer.matrices.is_empty() {
+            return folded;
+        }
+
+        // Mix in the row digest, or the default digest past the injected rows.
+        let row = if node < Self::injected_height(layer) {
+            self.hash_row(&layer.matrices, node)
+        } else {
+            default
+        };
+        self.c.compress(array::from_fn(|slot| match slot {
+            0 => folded,
+            1 => row,
+            _ => default,
+        }))
+    }
+}
+
+/// Buffers one task reuses across the layers it builds.
+#[derive(Debug, Default)]
+struct Scratch<F, W, const N: usize, const DIGEST_ELEMS: usize> {
+    /// Staged row messages, row-major for batched hashing or column-major for packed hashing.
+    rows: Vec<F>,
+
+    /// Staged children, column-major for packed compression.
+    digests: Vec<W>,
+
+    /// Row digests for batched injection, temporarily taken while row hashing uses this scratch.
+    injected: Vec<[W; DIGEST_ELEMS]>,
+
+    /// Folded children paired with injected row digests for batched compression.
+    pairs: Vec<[[W; DIGEST_ELEMS]; N]>,
+}
+
+/// Pack the children of `P::WIDTH` consecutive nodes into one vector per child word.
+///
+/// Node `l` of the group takes its `a` children from position `a * l` of the layer below.
+///
+/// Those children are contiguous, so each lane reads one run of `arity * D` words:
+///
+/// ```text
+///     lane l reads:   [ child_0 word_0 .. word_{D-1} | child_1 ... ]      D = digest words
+///     packed[n][k]:   word k of child n, across the lanes
+/// ```
+///
+/// Slots `arity .. N` take the default digest, the padding of a binary bridge step.
+fn pack_children<P, const N: usize, const DIGEST_ELEMS: usize>(
+    kids: &[[P::Value; DIGEST_ELEMS]],
+    arity: usize,
+    scratch: &mut Vec<P::Value>,
+) -> [[P; DIGEST_ELEMS]; N]
+where
+    P: PackedValue,
+{
+    let lanes = P::WIDTH;
+    let words = arity * DIGEST_ELEMS;
+
+    // Same shape on every call, so the resize allocates once per task.
+    scratch.resize(lanes * words, P::Value::default());
+    P::Value::transpose_rows(
+        lanes,
+        words,
+        |lane| kids[arity * lane..arity * (lane + 1)].as_flattened(),
+        scratch,
+    );
+
+    // Block n * D + k of the staged buffer is word k of child n.
+    let packed = P::pack_slice(scratch);
+    let default = P::broadcast(P::Value::default());
+    array::from_fn(|n| {
+        array::from_fn(|k| {
+            if n < arity {
+                packed[n * DIGEST_ELEMS + k]
+            } else {
+                default
+            }
+        })
+    })
+}
+
+/// Unpack one digest per lane into consecutive output slots.
+///
+/// Word `k` of lane `l` lands in word `k` of output digest `l`, the transpose of the packing.
+///
+/// # Panics
+///
+/// Panics if the output does not hold exactly one digest per lane.
+fn unpack_digests<P, const DIGEST_ELEMS: usize>(
+    packed: &[P; DIGEST_ELEMS],
+    out: &mut [[P::Value; DIGEST_ELEMS]],
+) where
+    P: PackedValue,
+{
+    let lanes = P::WIDTH;
+
+    // Row k of the source is packed word k, one entry per lane.
+    let words = P::unpack_slice(packed);
+    P::Value::transpose_rows(
+        DIGEST_ELEMS,
+        lanes,
+        |k| &words[k * lanes..(k + 1) * lanes],
+        out.as_flattened_mut(),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::ops::Range;
+
+    use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
+    use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
+    use p3_keccak::{Keccak256Hash, KeccakF, VECTOR_LEN};
+    use p3_matrix::dense::RowMajorMatrix;
+    use p3_symmetric::{
+        CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher, TruncatedPermutation,
+    };
+    use proptest::collection;
+    use proptest::prelude::*;
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+    use spin::Mutex;
+
+    use super::*;
+    use crate::MerkleTree;
+    use crate::merkle_tree::padded_len;
+
+    type F = BabyBear;
+    type Packed = <F as Field>::Packing;
+
+    /// Heights and width of each tree the reference comparison builds.
+    ///
+    /// - One row, and odd heights that leave padding tails.
+    /// - A ragged height ladder, which injects shorter matrices on upper layers.
+    /// - Several matrices sharing the tallest height, so a leaf spans more than one row.
+    /// - Trees tall enough to split into many blocks and to need more than one pass.
+    /// - Rows long enough to take more than one register tile.
+    const SHAPES: &[(&[usize], usize)] = &[
+        (&[1], 1),
+        (&[3], 4),
+        (&[13], 1),
+        (&[8, 8, 4], 3),
+        (&[17, 9, 5, 3], 2),
+        (&[1100], 1),
+        (&[2049, 1025, 513], 5),
+        (&[64], 135),
+        (&[4099, 4099, 2050, 1025, 17], 2),
+        (&[8192, 256], 1),
+        (&[6001], 20),
+    ];
+
+    /// Build every digest layer straight from the node definitions, one node at a time.
+    ///
+    /// Only the planning helpers are shared with the builder.
+    ///
+    /// Hashing, packing, batching and blocking are all independent of it.
+    fn reference_layers<H, C, const N: usize, const D: usize>(
+        h: &H,
+        c: &C,
+        leaves: &[RowMajorMatrix<F>],
+    ) -> (Vec<Vec<[u64; D]>>, Vec<usize>)
+    where
+        H: CryptographicHasher<F, [u64; D]>,
+        C: PseudoCompressionFunction<[u64; D], N>,
+    {
+        let zero = [0u64; D];
+        let hash_row = |ms: &[&RowMajorMatrix<F>], r: usize| {
+            h.hash_iter(ms.iter().flat_map(|m| m.row_slice(r).unwrap().to_vec()))
+        };
+
+        // Tallest first, ties in insertion order.
+        let mut sorted: Vec<&RowMajorMatrix<F>> = leaves.iter().collect();
+        sorted.sort_by_key(|m| Reverse(m.height()));
+        let max_height = sorted[0].height();
+        let split = sorted
+            .iter()
+            .take_while(|m| m.height() == max_height)
+            .count();
+        let (tallest, mut rest) = sorted.split_at(split);
+
+        // Leaf layer: one digest per row, then default padding.
+        let mut layer: Vec<_> = (0..max_height).map(|r| hash_row(tallest, r)).collect();
+        layer.resize(padded_len(max_height, N), zero);
+        let mut layers = vec![layer];
+        let mut arities = Vec::new();
+
+        while layers.last().unwrap().len() > 1 {
+            let below = layers.last().unwrap();
+            let arity = select_arity_step::<N>(
+                below.len(),
+                max_height.next_power_of_two(),
+                rest.iter().map(|m| m.height()),
+            )
+            .expect("reference shape has reachable injections");
+            let computed = below.len() / arity;
+
+            // Matrices whose padded height matches this layer are injected into it.
+            let take = rest
+                .iter()
+                .take_while(|m| m.height().next_power_of_two() == computed.next_power_of_two())
+                .count();
+            let (inject, remaining) = rest.split_at(take);
+            rest = remaining;
+
+            let mut layer: Vec<_> = (0..computed)
+                .map(|i| {
+                    let folded = c.compress(array::from_fn(|n| {
+                        if n < arity {
+                            below[arity * i + n]
+                        } else {
+                            zero
+                        }
+                    }));
+                    if inject.is_empty() {
+                        return folded;
+                    }
+                    let row = if i < inject[0].height() {
+                        hash_row(inject, i)
+                    } else {
+                        zero
+                    };
+                    c.compress(array::from_fn(|n| match n {
+                        0 => folded,
+                        1 => row,
+                        _ => zero,
+                    }))
+                })
+                .collect();
+            layer.resize(padded_len(computed, N), zero);
+            layers.push(layer);
+            arities.push(arity);
+        }
+        (layers, arities)
+    }
+
+    /// Random matrices with the given heights, all of one width.
+    fn matrices(heights: &[usize], width: usize) -> Vec<RowMajorMatrix<F>> {
+        let mut rng =
+            SmallRng::seed_from_u64(heights.iter().sum::<usize>() as u64 * 31 + width as u64);
+        heights
+            .iter()
+            .map(|&height| RowMajorMatrix::rand(&mut rng, height, width))
+            .collect()
+    }
+
+    /// Build with the tree and with the reference model, and compare every layer.
+    ///
+    /// Comparing whole layers pins where a divergence starts.
+    fn assert_matches_reference<P, PW, H, C, const N: usize, const D: usize>(h: &H, c: &C)
+    where
+        P: PackedValue<Value = F>,
+        PW: PackedValue<Value = u64>,
+        H: CryptographicHasher<F, [u64; D]> + CryptographicHasher<P, [PW; D]> + Sync,
+        C: PseudoCompressionFunction<[u64; D], N> + PseudoCompressionFunction<[PW; D], N> + Sync,
+    {
+        for &(heights, width) in SHAPES {
+            let leaves = matrices(heights, width);
+            let (expected, arities) = reference_layers::<H, C, N, D>(h, c, &leaves);
+            let tree = MerkleTree::<F, u64, _, N, D>::new::<P, PW, H, C>(h, c, leaves);
+
+            assert_eq!(tree.arity_schedule, arities, "heights {heights:?}");
+            assert_eq!(
+                tree.digest_layers.len(),
+                expected.len(),
+                "heights {heights:?}"
+            );
+            for (level, (got, want)) in tree.digest_layers.iter().zip(&expected).enumerate() {
+                assert!(
+                    got == want,
+                    "layer {level} differs for heights {heights:?} width {width}"
+                );
+            }
+        }
+    }
+
+    /// The same comparison over byte digests, for the byte-oriented hashers.
+    fn assert_bytes_match_reference<H, C, const N: usize>(h: &H, c: &C)
+    where
+        H: CryptographicHasher<F, [u8; 32]> + Sync,
+        C: PseudoCompressionFunction<[u8; 32], N> + Sync,
+    {
+        // Reuse the word model by viewing each digest through a byte-to-word adapter.
+        let hw = Words(h);
+        let cw = Words(c);
+        for &(heights, width) in SHAPES {
+            let leaves = matrices(heights, width);
+            let (expected, arities) = reference_layers::<_, _, N, 4>(&hw, &cw, &leaves);
+            let tree = MerkleTree::<F, u8, _, N, 32>::new::<F, u8, H, C>(h, c, leaves);
+
+            assert_eq!(tree.arity_schedule, arities, "heights {heights:?}");
+            for (level, (got, want)) in tree.digest_layers.iter().zip(&expected).enumerate() {
+                let got: Vec<[u64; 4]> = got.iter().map(to_words).collect();
+                assert!(
+                    &got == want,
+                    "layer {level} differs for heights {heights:?} width {width}"
+                );
+            }
+        }
+    }
+
+    /// Adapter exposing a byte-digest primitive as a four-word digest primitive.
+    struct Words<'a, T>(&'a T);
+
+    impl<T> Clone for Words<'_, T> {
+        fn clone(&self) -> Self {
+            Self(self.0)
+        }
+    }
+
+    /// A 32-byte digest read as four little-endian words.
+    fn to_words(bytes: &[u8; 32]) -> [u64; 4] {
+        let (words, _) = bytes.as_chunks::<8>();
+        array::from_fn(|i| u64::from_le_bytes(words[i]))
+    }
+
+    /// Four little-endian words written back as a 32-byte digest.
+    fn to_bytes(words: [u64; 4]) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        for (chunk, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+            *chunk = word.to_le_bytes();
+        }
+        bytes
+    }
+
+    impl<T: CryptographicHasher<F, [u8; 32]>> CryptographicHasher<F, [u64; 4]> for Words<'_, T> {
+        fn hash_iter<I: IntoIterator<Item = F>>(&self, input: I) -> [u64; 4] {
+            to_words(&self.0.hash_iter(input))
+        }
+    }
+
+    impl<T: PseudoCompressionFunction<[u8; 32], N>, const N: usize>
+        PseudoCompressionFunction<[u64; 4], N> for Words<'_, T>
+    {
+        fn compress(&self, input: [[u64; 4]; N]) -> [u64; 4] {
+            to_words(&self.0.compress(input.map(to_bytes)))
+        }
+    }
+
+    /// Exercises both owned contiguous handles and owned per-row fallback handles.
+    struct OwnedRows {
+        matrix: RowMajorMatrix<F>,
+        contiguous: bool,
+    }
+
+    impl Matrix<F> for OwnedRows {
+        fn width(&self) -> usize {
+            self.matrix.width()
+        }
+
+        fn height(&self) -> usize {
+            self.matrix.height()
+        }
+
+        unsafe fn row_unchecked(&self, row: usize) -> impl Iterator<Item = F> + Send + Sync {
+            self.matrix.row_slice(row).unwrap().to_vec().into_iter()
+        }
+
+        fn contiguous_rows(
+            &self,
+            rows: Range<usize>,
+        ) -> Option<impl core::ops::Deref<Target = [F]>> {
+            (self.contiguous && rows.start <= rows.end && rows.end <= self.height()).then(|| {
+                self.matrix.values[rows.start * self.width()..rows.end * self.width()].to_vec()
+            })
+        }
+    }
+
+    #[test]
+    fn packed_rows_match_for_borrowed_owned_and_fallback_storage() {
+        let mut rng = SmallRng::seed_from_u64(10);
+        let perm = Poseidon2BabyBear::<16>::new_from_rng_128(&mut rng);
+        let h = PaddingFreeSponge::<_, 16, 8, 8>::new(perm.clone());
+        let c = TruncatedPermutation::<_, 2, 8, 16>::new(perm);
+        for (heights, width) in [(&[67, 67, 34, 17][..], 3), (&[129, 65][..], 135)] {
+            let leaves = matrices(heights, width);
+            let expected =
+                MerkleTree::<F, F, _, 2, 8>::new::<Packed, Packed, _, _>(&h, &c, leaves.clone())
+                    .digest_layers;
+            for contiguous in [false, true] {
+                let owned = leaves
+                    .iter()
+                    .cloned()
+                    .map(|matrix| OwnedRows { matrix, contiguous })
+                    .collect();
+                let got = MerkleTree::<F, F, _, 2, 8>::new::<Packed, Packed, _, _>(&h, &c, owned);
+                assert_eq!(
+                    got.digest_layers, expected,
+                    "width {width}, contiguous {contiguous}"
+                );
+            }
+            let strided = leaves
+                .iter()
+                .map(|m| m.as_view().vertically_strided(1, 0))
+                .collect();
+            let got = MerkleTree::<F, F, _, 2, 8>::new::<Packed, Packed, _, _>(&h, &c, strided);
+            assert_eq!(got.digest_layers, expected, "width {width}, strided");
+        }
+    }
+
+    #[test]
+    fn packed_poseidon2_matches_reference() {
+        // Packed arm: one tree node per vector lane, sixteen lanes under AVX-512.
+        //
+        // The reference hashes the same sponge one row at a time.
+        let mut rng = SmallRng::seed_from_u64(1);
+        let perm16 = Poseidon2BabyBear::<16>::new_from_rng_128(&mut rng);
+        let h = PaddingFreeSponge::<_, 16, 8, 8>::new(perm16.clone());
+
+        // Binary tree: every step folds two children.
+        let c2 = TruncatedPermutation::<_, 2, 8, 16>::new(perm16);
+        assert_field_matches_reference::<_, _, 2>(&h, &c2);
+
+        // Quaternary tree: full steps fold four, bridge steps fold two and pad the rest.
+        let perm32 = Poseidon2BabyBear::<32>::new_from_rng_128(&mut rng);
+        let c4 = TruncatedPermutation::<_, 4, 8, 32>::new(perm32);
+        assert_field_matches_reference::<_, _, 4>(&h, &c4);
+    }
+
+    /// The reference comparison over field digests, for the packed field sponges.
+    fn assert_field_matches_reference<H, C, const N: usize>(h: &H, c: &C)
+    where
+        H: CryptographicHasher<F, [F; 8]> + CryptographicHasher<Packed, [Packed; 8]> + Sync,
+        C: PseudoCompressionFunction<[F; 8], N> + PseudoCompressionFunction<[Packed; 8], N> + Sync,
+    {
+        for &(heights, width) in SHAPES {
+            let leaves = matrices(heights, width);
+            let tree =
+                MerkleTree::<F, F, _, N, 8>::new::<Packed, Packed, H, C>(h, c, leaves.clone());
+
+            // One row per call on the scalar sponge, with the digest words widened to u64.
+            let hw = FieldWords(h);
+            let cw = FieldWords(c);
+            let (expected, arities) = reference_layers::<_, _, N, 8>(&hw, &cw, &leaves);
+
+            assert_eq!(tree.arity_schedule, arities, "heights {heights:?}");
+            for (level, (got, want)) in tree.digest_layers.iter().zip(&expected).enumerate() {
+                let got: Vec<[u64; 8]> = got
+                    .iter()
+                    .map(|d| d.map(|x| x.as_canonical_u64()))
+                    .collect();
+                assert!(
+                    &got == want,
+                    "layer {level} differs for heights {heights:?} width {width}"
+                );
+            }
+        }
+    }
+
+    /// Adapter exposing a field-digest primitive as a word-digest primitive.
+    struct FieldWords<'a, T>(&'a T);
+
+    impl<T> Clone for FieldWords<'_, T> {
+        fn clone(&self) -> Self {
+            Self(self.0)
+        }
+    }
+
+    impl<T: CryptographicHasher<F, [F; 8]>> CryptographicHasher<F, [u64; 8]> for FieldWords<'_, T> {
+        fn hash_iter<I: IntoIterator<Item = F>>(&self, input: I) -> [u64; 8] {
+            self.0.hash_iter(input).map(|x| x.as_canonical_u64())
+        }
+    }
+
+    impl<T: PseudoCompressionFunction<[F; 8], N>, const N: usize>
+        PseudoCompressionFunction<[u64; 8], N> for FieldWords<'_, T>
+    {
+        fn compress(&self, input: [[u64; 8]; N]) -> [u64; 8] {
+            let input = input.map(|d| d.map(F::from_u64));
+            self.0.compress(input).map(|x| x.as_canonical_u64())
+        }
+    }
+
+    #[test]
+    fn batched_blake2s_matches_reference() {
+        let h = SerializingHasher::new(p3_blake2s::Blake2s256);
+        assert_bytes_match_reference::<_, _, 2>(
+            &h,
+            &CompressionFunctionFromHasher::<_, 2, 32>::new(p3_blake2s::Blake2s256),
+        );
+        assert_bytes_match_reference::<_, _, 4>(
+            &h,
+            &CompressionFunctionFromHasher::<_, 4, 32>::new(p3_blake2s::Blake2s256),
+        );
+    }
+
+    #[test]
+    fn batched_keccak_matches_reference() {
+        // Batched arm: several whole-row messages per hash call.
+        let h = SerializingHasher::new(Keccak256Hash);
+        assert_bytes_match_reference::<_, _, 2>(
+            &h,
+            &CompressionFunctionFromHasher::<_, 2, 32>::new(Keccak256Hash),
+        );
+        assert_bytes_match_reference::<_, _, 4>(
+            &h,
+            &CompressionFunctionFromHasher::<_, 4, 32>::new(Keccak256Hash),
+        );
+    }
+
+    #[test]
+    fn packed_keccak_words_match_reference() {
+        // Packed arm over u64 lanes: a Keccak state per lane, BabyBear rows serialized in pairs.
+        type Sponge = PaddingFreeSponge<KeccakF, 25, 17, 4>;
+        let sponge = Sponge::new(KeccakF);
+        let h = SerializingHasher::new(sponge);
+        let c = CompressionFunctionFromHasher::<_, 2, 4>::new(sponge);
+        assert_matches_reference::<[F; VECTOR_LEN], [u64; VECTOR_LEN], _, _, 2, 4>(&h, &c);
+    }
+
+    #[test]
+    fn pass_shape_keeps_every_block_busy() {
+        // Invariant: every pass but the last single-block one gives each block its minimum.
+        //
+        // Invariant: consecutive passes tile the layers bottom to top, with no gap.
+        let mut rng = SmallRng::seed_from_u64(5);
+        let perm = Poseidon2BabyBear::<16>::new_from_rng_128(&mut rng);
+        type Sponge = PaddingFreeSponge<Poseidon2BabyBear<16>, 16, 8, 8>;
+        type Compress = TruncatedPermutation<Poseidon2BabyBear<16>, 2, 8, 16>;
+        type Builder<'a> =
+            TreeBuilder<'a, Packed, Packed, Sponge, Compress, RowMajorMatrix<F>, 2, 8>;
+        let h = Sponge::new(perm.clone());
+        let c = Compress::new(perm);
+        let group = Builder::group();
+
+        for height in [1usize, 2, 63, 64, 65, 1000, 4096, 100_000] {
+            let leaves = [RowMajorMatrix::<F>::new(vec![F::ZERO; height], 1)];
+            let builder = Builder::new(&h, &c, &leaves);
+
+            let mut lo = 0;
+            while lo < builder.layers.len() {
+                let (blocks, hi) = builder.pass_shape(lo);
+                assert!((lo..builder.layers.len()).contains(&hi), "height {height}");
+                if blocks > 1 {
+                    assert!(blocks <= BLOCKS_PER_THREAD * current_num_threads());
+                    assert!(builder.layers[hi].computed >= blocks * group * MIN_BLOCK_GROUPS);
+
+                    // Fewer blocks than threads only when rows worth splitting lie ahead.
+                    if blocks < current_num_threads() {
+                        assert!(builder.rows_worth_splitting(lo), "height {height}");
+                    }
+                } else {
+                    // A single block always finishes the tree.
+                    assert_eq!(hi, builder.layers.len() - 1, "height {height}");
+                }
+                lo = hi + 1;
+            }
+            assert_eq!(lo, builder.layers.len());
+        }
+    }
+
+    #[test]
+    fn wide_rows_split_below_one_block_per_thread() {
+        // Invariant: rows worth spreading get one block per full vector group, whatever the pool.
+        //
+        // Invariant: rows not worth spreading, on a pool wider than the groups, stay on one block.
+        //
+        // Invariant: wider rows are never priced below narrower ones.
+        //
+        // The budget overrides move the gate, so the expected count reads the gate back.
+        //
+        // The gate itself is pinned to the pool's splitting rule on the leaf bytes.
+        //
+        // Fixture state: 2, 3 and 16 groups of rows, 2 MiB of them in total, or 4 bytes each.
+        //
+        //     2 groups x 16 rows, 2 MiB   ->  2 blocks under the default gate
+        //     2 groups x 16 rows x 4 B    ->  1 block on a pool of 3 or more
+        let mut rng = SmallRng::seed_from_u64(6);
+        let perm = Poseidon2BabyBear::<16>::new_from_rng_128(&mut rng);
+        type Sponge = PaddingFreeSponge<Poseidon2BabyBear<16>, 16, 8, 8>;
+        type Compress = TruncatedPermutation<Poseidon2BabyBear<16>, 2, 8, 16>;
+        type Builder<'a> =
+            TreeBuilder<'a, Packed, Packed, Sponge, Compress, RowMajorMatrix<F>, 2, 8>;
+        let h = Sponge::new(perm.clone());
+        let c = Compress::new(perm);
+        let group = Builder::group();
+        let threads = current_num_threads();
+
+        for groups in [2usize, 3, BLOCKS_PER_THREAD] {
+            let rows = groups * group;
+
+            // Wide rows fill 2 MiB, narrow rows hold one element each.
+            let wide_width = (2 << 20) / size_of::<F>() / rows;
+            let wide = [RowMajorMatrix::<F>::new(
+                vec![F::ZERO; rows * wide_width],
+                wide_width,
+            )];
+            let narrow = [RowMajorMatrix::<F>::new(vec![F::ZERO; rows], 1)];
+            let wide = Builder::new(&h, &c, &wide);
+            let narrow = Builder::new(&h, &c, &narrow);
+
+            // Pricing grows with the bytes, so narrow rows worth splitting imply wide ones are.
+            if narrow.rows_worth_splitting(0) {
+                assert!(wide.rows_worth_splitting(0), "{groups} groups");
+            }
+
+            // Every group is a block, unless a thread would idle over rows not worth splitting.
+            for (name, builder) in [("wide", &wide), ("narrow", &narrow)] {
+                // The gate is the pool's own, fed the bytes of every row from the leaves up.
+                assert_eq!(
+                    builder.rows_worth_splitting(0),
+                    should_split(builder.row_bytes(0), 1),
+                    "{groups} groups of {name} rows"
+                );
+
+                let expected = if groups < threads && !builder.rows_worth_splitting(0) {
+                    1
+                } else {
+                    groups
+                };
+                let (blocks, _) = builder.pass_shape(0);
+                assert_eq!(blocks, expected, "{groups} groups of {name} rows");
+            }
+        }
+    }
+
+    #[test]
+    fn row_bytes_count_every_later_injection() {
+        // Invariant: a layer prices its own rows and every injection above it, in bytes.
+        //
+        // Invariant: rows injected below the layer are left out.
+        //
+        // Fixture state: leaves of height 64, injections of height 32 and 16, widths 3, 5 and 7.
+        //
+        //     from layer 0  ->  (64 * 3 + 32 * 5 + 16 * 7) * 4 bytes
+        //     from layer 1  ->  (32 * 5 + 16 * 7) * 4 bytes
+        //     from layer 2  ->  16 * 7 * 4 bytes
+        //     from layer 3  ->  0
+        let mut rng = SmallRng::seed_from_u64(7);
+        let perm = Poseidon2BabyBear::<16>::new_from_rng_128(&mut rng);
+        type Sponge = PaddingFreeSponge<Poseidon2BabyBear<16>, 16, 8, 8>;
+        type Compress = TruncatedPermutation<Poseidon2BabyBear<16>, 2, 8, 16>;
+        type Builder<'a> =
+            TreeBuilder<'a, Packed, Packed, Sponge, Compress, RowMajorMatrix<F>, 2, 8>;
+        let h = Sponge::new(perm.clone());
+        let c = Compress::new(perm);
+        let matrices = [(64, 3), (32, 5), (16, 7)]
+            .map(|(height, width)| RowMajorMatrix::<F>::new(vec![F::ZERO; height * width], width));
+        let builder = Builder::new(&h, &c, &matrices);
+
+        // Each matrix lands on its own layer, so each layer up drops one matrix.
+        let elements = [64 * 3 + 32 * 5 + 16 * 7, 32 * 5 + 16 * 7, 16 * 7, 0];
+        for (lo, elements) in elements.into_iter().enumerate() {
+            assert_eq!(
+                builder.row_bytes(lo),
+                elements * size_of::<F>(),
+                "layer {lo}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_band_and_block_count_matches_one_block() {
+        // Invariant: the digests do not depend on how a pass splits its band into blocks.
+        //
+        // The thread count picks the split in a real build, so every split is pinned here.
+        //
+        // Scalar primitives make a vector group one node on every host.
+        //
+        // Fixture state: heights [17, 9, 5, 3] in a quaternary tree, band 1..=3, four blocks.
+        //
+        //     layer 3:   4 nodes, block 3 starts at node 3    real node
+        //     layer 2:   6 nodes, block 3 starts at node 6    padding, 6 -> 8
+        //     layer 1:  10 nodes, block 3 starts at node 12   padding, 10 -> 12
+        //     layer 0:  20 slots, block 3 children would start at slot 24
+        //
+        // The block owns a real node on top while its lowest piece has no children.
+        type Sponge = PaddingFreeSponge<Poseidon2BabyBear<16>, 16, 8, 8>;
+        type Compress = TruncatedPermutation<Poseidon2BabyBear<32>, 4, 8, 32>;
+        type Builder<'a> = TreeBuilder<'a, F, F, Sponge, Compress, RowMajorMatrix<F>, 4, 8>;
+        let mut rng = SmallRng::seed_from_u64(7);
+        let h = Sponge::new(Poseidon2BabyBear::<16>::new_from_rng_128(&mut rng));
+        let c = Compress::new(Poseidon2BabyBear::<32>::new_from_rng_128(&mut rng));
+        let empty = |builder: &Builder<'_>| -> Vec<_> {
+            builder
+                .layers
+                .iter()
+                .map(|layer| default_digest_layer(padded_len(layer.computed, 4)))
+                .collect()
+        };
+
+        // Small trees keep every band and block count cheap to enumerate.
+        for &(heights, width) in SHAPES.iter().filter(|(heights, _)| heights[0] < 100) {
+            let leaves = matrices(heights, width);
+            let builder = Builder::new(&h, &c, &leaves);
+            let top = builder.layers.len() - 1;
+
+            // Baseline: one block builds every layer.
+            let mut expected = empty(&builder);
+            builder.run_pass(&mut expected, 0..=top, 1);
+
+            // Mutation: rebuild one band on top of the finished layers below it.
+            for lo in 0..=top {
+                for hi in lo..=top {
+                    for blocks in 1..=8 {
+                        let mut got = empty(&builder);
+                        got[..lo].clone_from_slice(&expected[..lo]);
+                        got[hi + 1..].clone_from_slice(&expected[hi + 1..]);
+                        builder.run_pass(&mut got, lo..=hi, blocks);
+                        assert!(
+                            got == expected,
+                            "heights {heights:?}, band {lo}..={hi}, {blocks} blocks"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    proptest! {
+        // Each case hashes every leaf twice, once through the scalar reference.
+        //
+        // The fixed shapes above already cover the tall trees.
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn random_ladders_match_reference(
+            max_height in 1usize..=2049,
+            depths in collection::vec(0u32..12, 0..4),
+            width in 1usize..12,
+        ) {
+            // Any heights on the ceil(max / 2^k) ladder form a valid tree.
+            //
+            // Depth 0 repeats the tallest height, so a leaf can span several matrices.
+            let mut heights = vec![max_height];
+            heights.extend(depths.iter().map(|&k| max_height.div_ceil(1 << k)));
+            let leaves = matrices(&heights, width);
+
+            let h = SerializingHasher::new(Keccak256Hash);
+            let c = CompressionFunctionFromHasher::<_, 2, 32>::new(Keccak256Hash);
+            let (expected, _) = reference_layers::<_, _, 2, 4>(&Words(&h), &Words(&c), &leaves);
+            let tree = MerkleTree::<F, u8, _, 2, 32>::new::<F, u8, _, _>(&h, &c, leaves);
+
+            // Compare every layer, viewed as words like the reference.
+            let got: Vec<Vec<[u64; 4]>> = tree
+                .digest_layers
+                .iter()
+                .map(|layer| layer.iter().map(to_words).collect())
+                .collect();
+            prop_assert!(got == expected);
+        }
+    }
+
+    #[test]
+    fn default_digest_layer_is_all_default() {
+        // Byte digests: the word type is a primitive, so the allocation takes the zeroed path.
+        //
+        // The reinterpretation back to digests must still read as the default digest.
+        let bytes = default_digest_layer::<u8, 32>(5);
+        assert_eq!(bytes, vec![[0u8; 32]; 5]);
+
+        // A field word type whose default is not a primitive zero follows the plain fill path.
+        let words = default_digest_layer::<F, 8>(3);
+        assert_eq!(words, vec![[F::default(); 8]; 3]);
+
+        // An empty layer is legal: a height-zero tree allocates nothing.
+        assert!(default_digest_layer::<u8, 32>(0).is_empty());
+
+        // A digest width of one exercises the case where a digest is a single word.
+        assert_eq!(default_digest_layer::<u8, 1>(7), vec![[0u8; 1]; 7]);
+    }
+
+    #[test]
+    fn a_staged_group_is_lane_aligned_and_bounded() {
+        // Invariant: a group is a whole number of lane groups.
+        //
+        // Invariant: it stages at most `max(target, lanes * row_bytes)` bytes.
+        //
+        // The second bound is the price of the first.
+        // A row at or past the target still needs one full lane group staged.
+        //
+        // Both assertions have teeth, checked by mutating the sizing:
+        //
+        //     drop the lane rounding   ->  lanes 2, 16383 B: 1 row, and 1 % 2 != 0
+        //     round the target up      ->  one lane, 8191 B: 3 rows, 24573 bytes staged
+        //
+        // The second is why the sweep carries a width just under half the target.
+        for lanes in [0usize, 1, 2, 4, 8, 16] {
+            for row_bytes in [
+                0usize,
+                1,
+                64,
+                ROW_SCRATCH_BYTES / 8,
+                ROW_SCRATCH_BYTES / 2 - 1,
+                ROW_SCRATCH_BYTES - 1,
+                ROW_SCRATCH_BYTES,
+                ROW_SCRATCH_BYTES + 1,
+                4 * ROW_SCRATCH_BYTES,
+            ] {
+                let rows = rows_per_call(row_bytes, lanes);
+
+                // Zero on either argument is read as one, so both divisions stay defined.
+                let (effective_lanes, effective_bytes) = (lanes.max(1), row_bytes.max(1));
+
+                assert!(rows >= 1, "lanes={lanes} row_bytes={row_bytes}");
+                assert_eq!(
+                    rows % effective_lanes,
+                    0,
+                    "lanes={lanes} row_bytes={row_bytes} rows={rows}"
+                );
+                assert!(
+                    rows * effective_bytes
+                        <= ROW_SCRATCH_BYTES.max(effective_lanes * effective_bytes),
+                    "lanes={lanes} row_bytes={row_bytes} staged {} bytes",
+                    rows * effective_bytes
+                );
+            }
+        }
+
+        // Narrow rows: many whole lane groups fit and the target holds.
+        //
+        //     16 KiB / 64 B = 256 rows, over 8 lanes = 32 whole groups
+        assert_eq!(rows_per_call(64, 8), 256);
+        assert!(rows_per_call(64, 8) * 64 <= ROW_SCRATCH_BYTES);
+
+        // A row past the target still stages one whole lane group.
+        assert_eq!(rows_per_call(ROW_SCRATCH_BYTES + 1, 8), 8);
+    }
+
+    #[test]
+    fn the_staged_buffer_meets_the_bound_the_target_states() {
+        // Invariant: the bound is stated in bytes, and the buffer is sized in field elements.
+        //
+        // The batched driver composes both from the same width, so the two must line up:
+        //
+        //     row bytes    = total width * element bytes
+        //     buffer bytes = rows per group * total width * element bytes
+        //
+        // Checking the helper alone would miss a call site that sized its buffer some other way.
+        const ELEMENT: usize = size_of::<BabyBear>();
+
+        for lanes in [1usize, 2, 4, 8] {
+            // Widths straddling the target: 4096 four-byte columns are exactly 16 KiB.
+            for total_width in [0usize, 1, 16, 1024, 4095, 4096, 4097, 16384] {
+                let row_bytes = total_width * ELEMENT;
+                let rows = rows_per_call(row_bytes, lanes);
+
+                // Exactly what the batched driver reserves, converted to bytes.
+                let staged = rows * total_width * ELEMENT;
+
+                // Zero-width matrices stage nothing, whatever count the sizing hands back.
+                if total_width == 0 {
+                    assert_eq!(staged, 0, "lanes={lanes}");
+                    continue;
+                }
+
+                assert!(
+                    staged <= ROW_SCRATCH_BYTES.max(lanes * row_bytes),
+                    "lanes={lanes} total_width={total_width} staged {staged} bytes"
+                );
+            }
+        }
+    }
+
+    /// A byte hasher that records where every batched call reads its messages from.
+    ///
+    /// Digests come from Keccak-256, one message at a time.
+    ///
+    /// Four lanes make every tested height leave a short final group.
+    #[derive(Clone, Debug, Default)]
+    struct AddressRecorder {
+        /// Start and end address of each batched input, in call order.
+        calls: Arc<Mutex<Vec<Range<usize>>>>,
+    }
+
+    impl CryptographicHasher<u8, [u8; 32]> for AddressRecorder {
+        const LANES: usize = 4;
+
+        fn hash_iter<I: IntoIterator<Item = u8>>(&self, input: I) -> [u8; 32] {
+            Keccak256Hash.hash_iter(input)
+        }
+
+        fn hash_many(&self, input: &[u8], out: &mut [[u8; 32]]) {
+            self.calls
+                .lock()
+                .push(input.as_ptr_range().start as usize..input.as_ptr_range().end as usize);
+            Keccak256Hash.hash_many(input, out);
+        }
+    }
+
+    /// Build one byte tree and return its layers with the address ranges its leaf hashing read.
+    fn byte_tree<M: Matrix<u8>>(leaves: Vec<M>) -> (Vec<Vec<[u8; 32]>>, Vec<Range<usize>>) {
+        let h = AddressRecorder::default();
+        let c = CompressionFunctionFromHasher::<_, 2, 32>::new(Keccak256Hash);
+        let tree = MerkleTree::<u8, u8, M, 2, 32>::new::<u8, u8, _, _>(&h, &c, leaves);
+        let calls = h.calls.lock().clone();
+        (tree.digest_layers, calls)
+    }
+
+    #[test]
+    fn adjacent_rows_are_hashed_in_place() {
+        // Invariant: one matrix with adjacent rows is hashed straight from its storage.
+        //
+        // Invariant: any other input is staged, and both paths give the same digests.
+        //
+        // Fixture state: heights not a multiple of the four lanes, widths across the Keccak rate.
+        //
+        //     dense rows      -> every batched read lies inside the matrix storage
+        //     stride-one view -> same rows, adjacency hidden -> every read lies outside it
+        let mut rng = SmallRng::seed_from_u64(11);
+        for (height, width) in [(1, 1), (3, 5), (13, 136), (64, 137), (1025, 3), (257, 1024)] {
+            let matrix = RowMajorMatrix::<u8>::rand(&mut rng, height, width);
+            let storage = matrix.values.as_ptr_range();
+            let storage = storage.start as usize..storage.end as usize;
+            let inside =
+                |call: &Range<usize>| storage.start <= call.start && call.end <= storage.end;
+
+            // In place: the dense view exposes its rows as one run.
+            let (in_place, calls) = byte_tree(vec![matrix.as_view()]);
+            assert!(!calls.is_empty(), "height {height} width {width}");
+            assert!(calls.iter().all(inside), "height {height} width {width}");
+
+            // Staged: a stride-one view reads the same rows one at a time.
+            let (staged, calls) = byte_tree(vec![matrix.as_view().vertically_strided(1, 0)]);
+            assert!(
+                calls.iter().all(|call| !inside(call)),
+                "height {height} width {width}"
+            );
+
+            assert!(in_place == staged, "height {height} width {width}");
+        }
+    }
+
+    #[test]
+    fn a_view_starting_mid_storage_is_hashed_in_place() {
+        // Invariant: a view whose first row sits deep inside a buffer still hashes its own rows.
+        //
+        // Fixture state: 40 rows of 33 bytes, the view keeps rows 7..40.
+        //
+        //     storage: [ r0 .. r6 | r7 .. r39 ]
+        //                           ^ view starts here, 7 * 33 bytes in
+        let mut rng = SmallRng::seed_from_u64(12);
+        let matrix = RowMajorMatrix::<u8>::rand(&mut rng, 40, 33);
+        let (_, bottom) = matrix.split_rows(7);
+
+        // An owned copy of the same rows is the reference.
+        let owned = RowMajorMatrix::new(bottom.values.to_vec(), 33);
+        let (from_view, calls) = byte_tree(vec![bottom]);
+        let (from_owned, _) = byte_tree(vec![owned]);
+
+        // Every read lies inside the kept rows, never in the skipped prefix.
+        let kept = bottom.values.as_ptr_range();
+        let kept = kept.start as usize..kept.end as usize;
+        assert!(
+            calls
+                .iter()
+                .all(|call| kept.start <= call.start && call.end <= kept.end)
+        );
+        assert!(from_view == from_owned);
+    }
+
+    #[test]
+    fn several_leaf_matrices_are_staged() {
+        // Invariant: a leaf spanning two matrices is not one run, so it goes through staging.
+        //
+        //     leaf i = row i of the first matrix || row i of the second
+        let mut rng = SmallRng::seed_from_u64(13);
+        let first = RowMajorMatrix::<u8>::rand(&mut rng, 21, 10);
+        let second = RowMajorMatrix::<u8>::rand(&mut rng, 21, 6);
+        let storages = [first.values.as_ptr_range(), second.values.as_ptr_range()]
+            .map(|r| r.start as usize..r.end as usize);
+
+        let (layers, calls) = byte_tree(vec![first.as_view(), second.as_view()]);
+
+        // No batched read touches either matrix directly.
+        for call in &calls {
+            for storage in &storages {
+                assert!(call.end <= storage.start || storage.end <= call.start);
+            }
+        }
+
+        // The staged leaves equal the leaves of the rows concatenated up front.
+        let joined: Vec<u8> = (0..21)
+            .flat_map(|r| {
+                [
+                    first.row_slice(r).unwrap().to_vec(),
+                    second.row_slice(r).unwrap().to_vec(),
+                ]
+                .concat()
+            })
+            .collect();
+        let (joined_layers, _) = byte_tree(vec![RowMajorMatrix::new(joined, 16)]);
+        assert!(layers == joined_layers);
+    }
+}

@@ -1,15 +1,17 @@
+#![allow(clippy::use_self)]
+
 //! Discrete Fourier Transform, in-place, decimation-in-frequency
 //!
 //! Straightforward recursive algorithm, "unrolled" up to size 256.
 //!
-//! Inspired by Bernstein's djbfft: https://cr.yp.to/djbfft.html
+//! Inspired by Bernstein's djbfft: <https://cr.yp.to/djbfft.html>.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
 
 use itertools::izip;
-use p3_field::{Field, FieldAlgebra, PackedFieldPow2, PackedValue, TwoAdicField};
+use p3_field::{Field, PackedFieldPow2, PackedValue, PrimeCharacteristicRing, TwoAdicField};
 use p3_util::log2_strict_usize;
 
 use crate::utils::monty_reduce;
@@ -17,7 +19,7 @@ use crate::{FieldParameters, MontyField31, TwoAdicData};
 
 impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
     /// Given a field element `gen` of order n where `n = 2^lg_n`,
-    /// return a vector of vectors `table` where table[i] is the
+    /// return a vector of vectors `table` where `table[i]` is the
     /// vector of twiddle factors for an fft of length n/2^i. The
     /// values g_i^k for k >= i/2 are skipped as these are just the
     /// negatives of the other roots (using g_i^{i/2} = -1).  The
@@ -25,21 +27,74 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
     /// packed and non-packed variants.
     pub fn roots_of_unity_table(n: usize) -> Vec<Vec<Self>> {
         let lg_n = log2_strict_usize(n);
-        let gen = Self::two_adic_generator(lg_n);
+        let generator = Self::two_adic_generator(lg_n);
         let half_n = 1 << (lg_n - 1);
         // nth_roots = [1, g, g^2, g^3, ..., g^{n/2 - 1}]
-        let nth_roots: Vec<_> = gen.powers().take(half_n).collect();
+        let nth_roots = generator.powers().collect_n(half_n);
 
         (0..(lg_n - 1))
             .map(|i| nth_roots.iter().step_by(1 << i).copied().collect())
+            .rev()
+            .collect()
+    }
+
+    pub fn get_missing_twiddles(req_lg_n: usize, cur_lg_n: usize) -> Vec<Vec<Self>> {
+        // Get the main generator for the largest required FFT size.
+        let main_generator = Self::two_adic_generator(req_lg_n);
+
+        (cur_lg_n..req_lg_n)
+            .map(|level| {
+                // For a given 'level', we're generating twiddles for a DIF pass
+                // where the number of butterflies is m = 2^level.
+                let count = 1 << level;
+
+                // The generator for this smaller FFT size is a power of the main generator.
+                //
+                // The exponent is 2^(req_lg_n - (level + 1)).
+                let sub_generator_exp = 1 << (req_lg_n - level - 1);
+                let sub_generator = main_generator.exp_u64(sub_generator_exp as u64);
+
+                // Now, we can collect the 'count' powers of this specific sub-generator.
+                sub_generator.powers().collect_n(count)
+            })
             .collect()
     }
 }
 
 #[inline(always)]
-fn forward_butterfly<T: FieldAlgebra + Copy>(x: T, y: T, roots: T) -> (T, T) {
+fn forward_butterfly<T: PrimeCharacteristicRing + Copy>(x: T, y: T, roots: T) -> (T, T) {
     let t = x - y;
     (x + y, t * roots)
+}
+
+/// Architecture-dispatched DIF butterfly for packed `MontyField31` vectors.
+///
+/// The DIF butterfly computes `(x + y, (x - y) · ω)` where `ω` is a twiddle factor.
+///
+/// On aarch64, this delegates to `PackedMontyField31Neon::forward_butterfly`,
+/// which fuses the subtraction and multiplication to skip the modular reduction
+/// on `x - y`. See that method's documentation for the full rationale.
+///
+/// On other architectures, this falls back to the generic `forward_butterfly`.
+///
+/// TODO: apply the same fused sub+mul optimization for AVX2/AVX-512 backends.
+#[inline(always)]
+fn monty_forward_butterfly<MP: FieldParameters + TwoAdicData>(
+    x: <MontyField31<MP> as Field>::Packing,
+    y: <MontyField31<MP> as Field>::Packing,
+    roots: <MontyField31<MP> as Field>::Packing,
+) -> (
+    <MontyField31<MP> as Field>::Packing,
+    <MontyField31<MP> as Field>::Packing,
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        x.forward_butterfly(y, roots)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        forward_butterfly(x, y, roots)
+    }
 }
 
 #[inline(always)]
@@ -54,30 +109,6 @@ fn forward_butterfly_interleaved<const HALF_RADIX: usize, T: PackedFieldPow2>(
 }
 
 #[inline]
-fn forward_pass_packed<T: PackedFieldPow2>(input: &mut [T], roots: &[T::Scalar]) {
-    let packed_roots = T::pack_slice(roots);
-    let n = input.len();
-    let (xs, ys) = unsafe { input.split_at_mut_unchecked(n / 2) };
-
-    izip!(xs, ys, packed_roots)
-        .for_each(|(x, y, &roots)| (*x, *y) = forward_butterfly(*x, *y, roots));
-}
-
-#[inline]
-fn forward_iterative_layer_1<T: PackedFieldPow2>(input: &mut [T], roots: &[T::Scalar]) {
-    let packed_roots = T::pack_slice(roots);
-    let n = input.len();
-    let (top_half, bottom_half) = unsafe { input.split_at_mut_unchecked(n / 2) };
-    let (xs, ys) = unsafe { top_half.split_at_mut_unchecked(n / 4) };
-    let (zs, ws) = unsafe { bottom_half.split_at_mut_unchecked(n / 4) };
-
-    izip!(xs, ys, zs, ws, packed_roots).for_each(|(x, y, z, w, &root)| {
-        (*x, *y) = forward_butterfly(*x, *y, root);
-        (*z, *w) = forward_butterfly(*z, *w, root);
-    });
-}
-
-#[inline]
 fn forward_iterative_packed<const HALF_RADIX: usize, T: PackedFieldPow2>(
     input: &mut [T],
     roots: &[T::Scalar],
@@ -86,7 +117,7 @@ fn forward_iterative_packed<const HALF_RADIX: usize, T: PackedFieldPow2>(
     // roots <-- [1, roots[1], ..., roots[HALF_RADIX-1], 1, roots[1], ...]
     let roots = T::from_fn(|i| roots[i % HALF_RADIX]);
 
-    input.chunks_exact_mut(2).for_each(|pair| {
+    input.as_chunks_mut::<2>().0.iter_mut().for_each(|pair| {
         let (x, y) = forward_butterfly_interleaved::<HALF_RADIX, _>(pair[0], pair[1], roots);
         pair[0] = x;
         pair[1] = y;
@@ -95,7 +126,7 @@ fn forward_iterative_packed<const HALF_RADIX: usize, T: PackedFieldPow2>(
 
 #[inline]
 fn forward_iterative_packed_radix_2<T: PackedFieldPow2>(input: &mut [T]) {
-    input.chunks_exact_mut(2).for_each(|pair| {
+    input.as_chunks_mut::<2>().0.iter_mut().for_each(|pair| {
         let x = pair[0];
         let y = pair[1];
         let (mut x, y) = x.interleave(y, 1);
@@ -108,6 +139,19 @@ fn forward_iterative_packed_radix_2<T: PackedFieldPow2>(input: &mut [T]) {
 }
 
 impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
+    /// Apply one DIF layer of butterflies across the packed input.
+    ///
+    /// At FFT layer `lg_m`, the input is viewed as groups of `2m` elements.
+    /// Each group is split into a top half (`xs`) and bottom half (`ys`),
+    /// and we apply the DIF butterfly pairwise:
+    ///
+    /// ```text
+    ///     xs[i]  ──┬──(+)──->  xs[i]         (= x + y)
+    ///              │
+    ///     ys[i]  ──┴──(−)──->  ys[i] · ω[i]  (= (x − y) · ω)
+    /// ```
+    ///
+    /// Uses `monty_forward_butterfly` for the fused sub+mul optimization.
     #[inline]
     fn forward_iterative_layer(
         packed_input: &mut [<Self as Field>::Packing],
@@ -125,8 +169,60 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
                 let (xs, ys) = unsafe { layer_chunk.split_at_mut_unchecked(packed_m) };
 
                 izip!(xs, ys, packed_roots)
-                    .for_each(|(x, y, &root)| (*x, *y) = forward_butterfly(*x, *y, root));
+                    .for_each(|(x, y, &root)| (*x, *y) = monty_forward_butterfly(*x, *y, root));
             });
+    }
+
+    /// First DIF pass: split the entire array in half and butterfly.
+    ///
+    /// This is a specialization of `forward_iterative_layer` for the very
+    /// first layer (`lg_m = lg_n - 1`), where `m = n/2`. The array is split
+    /// into exactly two halves and each pair of elements is butterflied with
+    /// the corresponding twiddle factor.
+    ///
+    /// Specializing this avoids the `chunks_exact_mut` overhead for the
+    /// common case of a single split.
+    #[inline]
+    fn monty_forward_pass_packed(input: &mut [<Self as Field>::Packing], roots: &[Self]) {
+        let packed_roots = <Self as Field>::Packing::pack_slice(roots);
+        let n = input.len();
+        let (xs, ys) = unsafe { input.split_at_mut_unchecked(n / 2) };
+
+        izip!(xs, ys, packed_roots)
+            .for_each(|(x, y, &roots)| (*x, *y) = monty_forward_butterfly(*x, *y, roots));
+    }
+
+    /// Second DIF pass: split into quarters and butterfly with shared roots.
+    ///
+    /// This is a specialization of `forward_iterative_layer` for the second
+    /// layer (`lg_m = lg_n - 2`), where `m = n/4`. The array has four
+    /// quarters, and the top-left/top-right pair shares the same twiddle
+    /// factors as the bottom-left/bottom-right pair:
+    ///
+    /// ```text
+    ///     ┌────────────────────────────┐
+    ///     │  xs  │  ys  │  zs  │  ws   │
+    ///     └────────────────────────────┘
+    ///       ↕ ω     ↕ ω    ↕ ω    ↕ ω
+    ///
+    ///     butterfly(xs[i], ys[i], ω[i])
+    ///     butterfly(zs[i], ws[i], ω[i])   ← same ω
+    /// ```
+    ///
+    /// Processing two butterfly pairs per loop iteration improves
+    /// instruction-level parallelism.
+    #[inline]
+    fn monty_forward_iterative_layer_1(input: &mut [<Self as Field>::Packing], roots: &[Self]) {
+        let packed_roots = <Self as Field>::Packing::pack_slice(roots);
+        let n = input.len();
+        let (top_half, bottom_half) = unsafe { input.split_at_mut_unchecked(n / 2) };
+        let (xs, ys) = unsafe { top_half.split_at_mut_unchecked(n / 4) };
+        let (zs, ws) = unsafe { bottom_half.split_at_mut_unchecked(n / 4) };
+
+        izip!(xs, ys, zs, ws, packed_roots).for_each(|(x, y, z, w, &root)| {
+            (*x, *y) = monty_forward_butterfly(*x, *y, root);
+            (*z, *w) = monty_forward_butterfly(*z, *w, root);
+        });
     }
 
     #[inline]
@@ -169,6 +265,7 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
         let packing_width = <Self as Field>::Packing::WIDTH;
         let n = packed_input.len() * packing_width;
         let lg_n = log2_strict_usize(n);
+        debug_assert_eq!(root_table.len(), lg_n - 1);
 
         // Stop loop early to do radix 16 separately. This value is determined by the largest
         // packing width we will encounter, which is 16 at the moment for AVX512. Specifically
@@ -183,15 +280,14 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
         assert!(lg_n >= LAST_LOOP_LAYER + NUM_SPECIALISATIONS);
 
         // Specialise the first NUM_SPECIALISATIONS iterations; improves performance a little.
-        forward_pass_packed(packed_input, &root_table[0]); // lg_m == lg_n - 1, s == 0
-        forward_iterative_layer_1(packed_input, &root_table[1]); // lg_m == lg_n - 2, s == 1
+        Self::monty_forward_pass_packed(packed_input, &root_table[lg_n - 2]); // lg_m == lg_n - 1, s == 0
+        Self::monty_forward_iterative_layer_1(packed_input, &root_table[lg_n - 3]); // lg_m == lg_n - 2, s == 1
 
         // loop from lg_n-2 down to 4.
         for lg_m in (LAST_LOOP_LAYER..(lg_n - NUM_SPECIALISATIONS)).rev() {
-            let s = lg_n - lg_m - 1;
             let m = 1 << lg_m;
 
-            let roots = &root_table[s];
+            let roots = &root_table[lg_m - 1];
             debug_assert_eq!(roots.len(), m);
 
             Self::forward_iterative_layer(packed_input, roots, m);
@@ -244,7 +340,7 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
 
         // Expanding the calculation of t3 saves one instruction
         let t1 = MP::PRIME + a[1].value - a[3].value;
-        let t3 = MontyField31::new_monty(monty_reduce::<MP>(
+        let t3 = Self::new_monty(monty_reduce::<MP>(
             t1 as u64 * MP::ROOTS_8.as_ref()[2].value as u64,
         ));
         let t5 = a[1] + a[3];
@@ -286,7 +382,7 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
     fn forward_32(a: &mut [Self], root_table: &[Vec<Self>]) {
         assert_eq!(a.len(), 32);
 
-        Self::forward_pass(a, &root_table[0]);
+        Self::forward_pass(a, &root_table[root_table.len() - 1]);
 
         // Safe because a.len() == 32
         let (a0, a1) = unsafe { a.split_at_mut_unchecked(a.len() / 2) };
@@ -304,13 +400,13 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
             Self::forward_iterative(input, root_table);
         } else {
             assert_eq!(n, 1 << (root_table.len() + 1));
-            forward_pass_packed(input, &root_table[0]);
+            Self::monty_forward_pass_packed(input, &root_table[root_table.len() - 1]);
 
             // Safe because input.len() > ITERATIVE_FFT_THRESHOLD
             let (a0, a1) = unsafe { input.split_at_mut_unchecked(input.len() / 2) };
 
-            Self::forward_fft_recur(a0, &root_table[1..]);
-            Self::forward_fft_recur(a1, &root_table[1..]);
+            Self::forward_fft_recur(a0, &root_table[..root_table.len() - 1]);
+            Self::forward_fft_recur(a1, &root_table[..root_table.len() - 1]);
         }
     }
 
@@ -329,7 +425,7 @@ impl<MP: FieldParameters + TwoAdicData> MontyField31<MP> {
             2 => Self::forward_2(input),
             _ => {
                 let packed_input = <Self as Field>::Packing::pack_slice_mut(input);
-                Self::forward_fft_recur(packed_input, root_table)
+                Self::forward_fft_recur(packed_input, root_table);
             }
         }
     }

@@ -1,0 +1,431 @@
+//! Traits for univariate polynomial commitment schemes.
+
+use alloc::vec::Vec;
+use core::fmt::Debug;
+
+use p3_field::ExtensionField;
+use p3_matrix::Matrix;
+use p3_matrix::dense::RowMajorMatrix;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::{PeriodicColumns, PeriodicLdeTable, PolynomialSpace};
+
+pub type Val<D> = <D as PolynomialSpace>::Val;
+
+/// A polynomial commitment scheme, for committing to batches of polynomials defined by their evaluations
+/// over some domain.
+///
+/// In general this does not have to be a hiding commitment scheme but it might be for some implementations.
+// TODO: Should we have a super-trait for weakly-binding PCSs, like FRI outside unique decoding radius?
+pub trait Pcs<Challenge, Challenger>
+where
+    Challenge: ExtensionField<Val<Self::Domain>>,
+{
+    /// The class of evaluation domains that this commitment scheme works over.
+    type Domain: PolynomialSpace;
+
+    /// The commitment that's sent to the verifier.
+    type Commitment: Clone + Serialize + DeserializeOwned;
+
+    /// Data that the prover stores for committed polynomials, to help the prover with opening.
+    type ProverData;
+
+    /// The opening argument.
+    type Proof: Clone + Serialize + DeserializeOwned;
+
+    /// The type of a proof verification error.
+    type Error: Debug;
+
+    /// Configuration or budget failure during commitment or opening.
+    type ProverError: Debug;
+
+    /// This should return a domain such that `Domain::next_point` returns `Some`.
+    fn natural_domain_for_degree(&self, degree: usize) -> Self::Domain;
+
+    /// Given a collection of evaluation matrices, produce a binding commitment to
+    /// the polynomials defined by those evaluations. Hiding implementations may randomize
+    /// their encoding before committing.
+    ///
+    /// Returns both the commitment which should be sent to the verifier
+    /// and the prover data which can be used to produce opening proofs.
+    /// Configuration and budget failures are returned before consuming private randomness.
+    #[allow(clippy::type_complexity)]
+    fn commit(
+        &self,
+        evaluations: impl IntoIterator<Item = (Self::Domain, RowMajorMatrix<Val<Self::Domain>>)>,
+    ) -> Result<(Self::Commitment, Self::ProverData), Self::ProverError>;
+
+    /// Open each requested commitment, matrix and point in caller order.
+    ///
+    /// Each request must supply one point vector per committed matrix. Columns are
+    /// interpreted as polynomials evaluated over the domain supplied to [`Self::commit`].
+    /// The returned values retain request, matrix, point and column order.
+    ///
+    /// Configuration and budget rejection leaves the challenger, private randomness,
+    /// and any single-use opening state unchanged. This does not undo earlier successful calls.
+    fn open(
+        &self,
+        // For each multi-matrix commitment,
+        commitment_data_with_opening_points: Vec<OpeningRequest<'_, Self::ProverData, Challenge>>,
+        fiat_shamir_challenger: &mut Challenger,
+    ) -> Result<(OpenedValues<Challenge>, Self::Proof), Self::ProverError>;
+
+    /// Verify the claimed column evaluations for each commitment, matrix and point.
+    ///
+    /// Claims supply the original evaluation domains and must retain the ordering used
+    /// to construct the opening proof. The proof and transcript formats are backend-specific.
+    fn verify(
+        &self,
+        // For each commitment:
+        commitments_with_opening_points: Vec<
+            CommitmentOpening<Challenge, Self::Commitment, Self::Domain>,
+        >,
+        // The opening proof for all claimed evaluations.
+        proof: &Self::Proof,
+        fiat_shamir_challenger: &mut Challenger,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Capabilities used by univariate STARK provers and verifiers.
+///
+/// Generic commitment clients only need [`Pcs`]. Evaluation views remain backend-specific
+/// through the GAT, so implementations can borrow committed LDEs without copying.
+pub trait UnivariateStarkPcs<Challenge, Challenger>: Pcs<Challenge, Challenger>
+where
+    Challenge: ExtensionField<Val<Self::Domain>>,
+{
+    /// Type of the output of `get_evaluations_on_domain`.
+    type EvaluationsOnDomain<'a>: Matrix<Val<Self::Domain>> + 'a;
+
+    /// Whether to activate the STARK's randomized layout and masking protocol.
+    ///
+    /// Hiding implementations must enforce their trace-size and opening budgets.
+    /// The flag alone does not certify caller-supplied commitments, randomness,
+    /// or an arbitrary use of the underlying opening protocol.
+    const ZK: bool;
+
+    /// The base-2 logarithm of the largest trace domain a proof may claim.
+    ///
+    /// - A verifier rejects a proof-supplied height above this bound.
+    /// - The rejection happens before any domain is derived from that height.
+    /// - A backend whose evaluation domain must fit a two-adic subgroup subtracts its blowup.
+    ///
+    /// This is the upper end of the pair.
+    ///
+    /// The smallest claimable height is the lower end.
+    fn log_max_trace_height(&self) -> usize;
+
+    /// The base-2 logarithm of the smallest base trace domain a proof may claim.
+    ///
+    /// The base trace domain carries the selectors and the periodic columns.
+    /// Under zero knowledge it is one bit shorter than the committed domain.
+    ///
+    /// - A verifier builds it from a proof-supplied height before the opening argument runs.
+    /// - The height is therefore rejected here or not at all.
+    /// - A positive bound keeps a malformed proof out of domain arithmetic it would break.
+    /// - Backends defined down to a single row return zero.
+    ///
+    /// There is no default, so a backend with a minimum has to state it.
+    fn log_min_trace_height(&self) -> usize;
+
+    /// Same as `commit` but without randomization. This is used for preprocessed columns
+    /// which do not have to be randomized even when ZK is enabled. Note that the preprocessed columns still
+    /// need to be padded to the extended domain height.
+    ///
+    /// Returns both the commitment which should be sent to the verifier
+    /// and the prover data which can be used to produce opening proofs.
+    fn commit_preprocessing(
+        &self,
+        evaluations: impl IntoIterator<Item = (Self::Domain, RowMajorMatrix<Val<Self::Domain>>)>,
+    ) -> Result<(Self::Commitment, Self::ProverData), Self::ProverError> {
+        self.commit(evaluations)
+    }
+
+    /// Commit to the quotient polynomial. We first decompose the quotient polynomial into
+    /// `num_chunks` many smaller polynomials each of degree `degree / num_chunks`.
+    /// This can have minor performance benefits, but is not strictly necessary in the non `zk` case.
+    /// When `zk` is enabled, this commitment will additionally include some randomization process
+    /// to hide the inputs.
+    ///
+    /// ### Arguments
+    /// - `quotient_domain` the domain of the quotient polynomial.
+    /// - `quotient_evaluations` the evaluations of the quotient polynomial over the domain. This should be in
+    ///   standard (not bit-reversed) order.
+    /// - `num_chunks` the number of smaller polynomials to decompose the quotient polynomial into.
+    #[allow(clippy::type_complexity)]
+    fn commit_quotient(
+        &self,
+        quotient_domain: Self::Domain,
+        quotient_evaluations: RowMajorMatrix<Val<Self::Domain>>,
+        num_chunks: usize,
+    ) -> Result<(Self::Commitment, Self::ProverData), Self::ProverError> {
+        // Given the evaluation vector of `Q_i(x)` over a domain, split it into evaluation vectors
+        // of `q_{i0}(x), ...` over subdomains and commit to these `q`'s.
+        // TODO: Currently, split_evals involves copying the data to a new matrix.
+        //       We may be able to avoid this copy making use of bit-reversals.
+        let quotient_sub_evaluations =
+            quotient_domain.split_evals(num_chunks, quotient_evaluations);
+        let quotient_sub_domains = quotient_domain.split_domains(num_chunks);
+
+        let ldes = self.get_quotient_ldes(
+            quotient_sub_domains
+                .into_iter()
+                .zip(quotient_sub_evaluations),
+            num_chunks,
+        )?;
+        self.commit_ldes(ldes)
+    }
+
+    /// When committing to quotient polynomials in batch-STARK,
+    /// it is simpler to first compute the LDE evaluations before batch-committing to them.
+    ///
+    /// This corresponds to the first step of `commit_quotient`. When `zk` is enabled,
+    /// this will additionally add randomization.
+    #[allow(clippy::type_complexity)]
+    fn get_quotient_ldes(
+        &self,
+        evaluations: impl IntoIterator<Item = (Self::Domain, RowMajorMatrix<Val<Self::Domain>>)>,
+        num_chunks: usize,
+    ) -> Result<Vec<RowMajorMatrix<Val<Self::Domain>>>, Self::ProverError>;
+
+    /// Commits to a collection of LDE evaluation matrices.
+    fn commit_ldes(
+        &self,
+        ldes: Vec<RowMajorMatrix<Val<Self::Domain>>>,
+    ) -> Result<(Self::Commitment, Self::ProverData), Self::ProverError>;
+
+    /// Given prover data corresponding to a commitment to a collection of evaluation matrices,
+    /// return the evaluations of those matrices on the given domain.
+    ///
+    /// This is essentially a no-op when called with a `domain` which is a subset of the evaluation domain
+    /// on which the evaluation matrices are defined.
+    fn get_evaluations_on_domain<'a>(
+        &self,
+        prover_data: &'a Self::ProverData,
+        idx: usize,
+        domain: Self::Domain,
+    ) -> Self::EvaluationsOnDomain<'a>;
+
+    /// This is the same as `get_evaluations_on_domain` but without randomization.
+    /// This is used for preprocessed columns which do not have to be randomized even when ZK is enabled.
+    fn get_evaluations_on_domain_no_random<'a>(
+        &self,
+        prover_data: &'a Self::ProverData,
+        idx: usize,
+        domain: Self::Domain,
+    ) -> Self::EvaluationsOnDomain<'a> {
+        self.get_evaluations_on_domain(prover_data, idx, domain)
+    }
+
+    /// Open commitments with an optional commitment to unrandomized preprocessing.
+    ///
+    /// `preprocessed_commitment` identifies a request in the batch, not a matrix within
+    /// a commitment. Hiding implementations omit random codewords for that request.
+    /// The caller owns the commitment ordering; PCS implementations impose no STARK layout.
+    /// Non-hiding implementations behave exactly like [`Pcs::open`].
+    fn open_with_preprocessing(
+        &self,
+        // For each multi-matrix commitment,
+        commitment_data_with_opening_points: Vec<OpeningRequest<'_, Self::ProverData, Challenge>>,
+        fiat_shamir_challenger: &mut Challenger,
+        _preprocessed_commitment: Option<usize>,
+    ) -> Result<(OpenedValues<Challenge>, Self::Proof), Self::ProverError> {
+        assert!(
+            !Self::ZK,
+            "open_with_preprocessing should have a different implementation when ZK is enabled"
+        );
+        self.open(commitment_data_with_opening_points, fiat_shamir_challenger)
+    }
+
+    /// Verify with trusted metadata identifying the unrandomized preprocessing commitment.
+    ///
+    /// The index identifies a commitment request, not a matrix. It must come from the
+    /// verifier's statement or key, never from the proof or its random-opening lengths.
+    /// `None` requires every commitment to use the ordinary PCS opening format.
+    /// Non-hiding implementations behave exactly like [`Pcs::verify`].
+    fn verify_with_preprocessing(
+        &self,
+        rounds: Vec<CommitmentOpening<Challenge, Self::Commitment, Self::Domain>>,
+        proof: &Self::Proof,
+        challenger: &mut Challenger,
+        _preprocessed_commitment: Option<usize>,
+    ) -> Result<(), Self::Error> {
+        self.verify(rounds, proof, challenger)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn get_opt_randomization_poly_commitment(
+        &self,
+        _domain: impl IntoIterator<Item = Self::Domain>,
+    ) -> Result<Option<(Self::Commitment, Self::ProverData)>, Self::ProverError> {
+        Ok(None)
+    }
+
+    /// Build the compact periodic LDE table (height = max_period × blowup, width = num periodic columns).
+    ///
+    /// Default: evaluate each column at the first `extended_height` quotient points. Backends that
+    /// can compute this faster (e.g. via coset LDE) should override this method.
+    fn build_periodic_lde_table(
+        &self,
+        periodic_cols: &[Vec<Val<Self::Domain>>],
+        trace_domain: Self::Domain,
+        quotient_domain: Self::Domain,
+    ) -> PeriodicLdeTable<Val<Self::Domain>>
+    where
+        Self::Domain: Clone,
+        Val<Self::Domain>: Clone,
+    {
+        let trace_size = trace_domain.size();
+        let quotient_size = quotient_domain.size();
+        assert!(
+            quotient_size >= trace_size,
+            "quotient domain size ({quotient_size}) must be >= trace domain size ({trace_size})",
+        );
+        assert!(
+            quotient_size.is_multiple_of(trace_size),
+            "quotient domain size ({quotient_size}) must be divisible by trace domain size ({trace_size})",
+        );
+        let blowup = quotient_size / trace_size;
+
+        // A malformed declaration is a bug in the AIR the prover was handed, not proof data.
+        let periodic_cols =
+            PeriodicColumns::new(periodic_cols, trace_size).unwrap_or_else(|err| panic!("{err}"));
+
+        // No declared column means no table, and no longest period to pad up to.
+        let Some(max_period) = periodic_cols.max_period() else {
+            return PeriodicLdeTable::empty();
+        };
+
+        let extended_height = max_period
+            .checked_mul(blowup)
+            .expect("extended height overflow when computing max_period * blowup");
+        // Every period divides the trace size, so the longest one is at most the trace size.
+        // Hence max_period * blowup <= trace_size * blowup = quotient_size.
+        debug_assert!(extended_height <= quotient_size);
+        let num_cols = periodic_cols.len();
+        let row_major_capacity = extended_height
+            .checked_mul(num_cols)
+            .expect("row-major periodic table capacity overflow");
+
+        let mut quotient_pts = Vec::with_capacity(extended_height);
+        let mut pt = quotient_domain.first_point();
+        for _ in 0..extended_height {
+            quotient_pts.push(pt);
+            pt = quotient_domain
+                .next_point(pt)
+                .expect("quotient domain must support next_point");
+        }
+
+        let padded_cols: Vec<Vec<Val<Self::Domain>>> = periodic_cols
+            .as_slice()
+            .iter()
+            .map(|col| (0..max_period).map(|i| col[i % col.len()]).collect())
+            .collect();
+
+        let mut row_major = Vec::with_capacity(row_major_capacity);
+        for point in quotient_pts.iter().take(extended_height) {
+            for padded in &padded_cols {
+                row_major.push(trace_domain.evaluate_periodic_column_at(padded, *point));
+            }
+        }
+        PeriodicLdeTable::new(RowMajorMatrix::new(row_major, num_cols))
+    }
+}
+
+/// A joint commitment to a collection of matrices and their opening at
+/// a collection of points.
+///
+/// This is the shape [`Pcs::verify`] checks an opening argument against, so it is also what
+/// any code building that argument produces.
+#[derive(Clone, Debug)]
+pub struct CommitmentOpening<Challenge, Commitment, Domain> {
+    /// Commitment whose matrices are opened, in commitment order.
+    pub commitment: Commitment,
+    /// Claims for each matrix, in the order supplied to `commit`.
+    pub matrices: Vec<MatrixOpening<Challenge, Domain>>,
+}
+
+/// Opening points and claimed column evaluations for one matrix.
+#[derive(Clone, Debug)]
+pub struct MatrixOpening<Challenge, Domain> {
+    pub domain: Domain,
+    pub points: Vec<PointOpening<Challenge>>,
+}
+
+/// Claimed evaluations of every column at one point, in column order.
+#[derive(Clone, Debug)]
+pub struct PointOpening<Challenge> {
+    pub point: Challenge,
+    pub values: Vec<Challenge>,
+}
+
+/// Points to open for each matrix in one commitment.
+///
+/// Requests, matrices and points retain caller order in [`OpenedValues`].
+/// The prover data is borrowed; point vectors are moved without copying.
+#[derive(Debug)]
+pub struct OpeningRequest<'a, ProverData, Challenge> {
+    pub prover_data: &'a ProverData,
+    pub points: Vec<Vec<Challenge>>,
+}
+
+impl<ProverData, Challenge: Clone> Clone for OpeningRequest<'_, ProverData, Challenge> {
+    fn clone(&self) -> Self {
+        Self {
+            prover_data: self.prover_data,
+            points: self.points.clone(),
+        }
+    }
+}
+
+impl<'a, ProverData, Challenge> From<(&'a ProverData, Vec<Vec<Challenge>>)>
+    for OpeningRequest<'a, ProverData, Challenge>
+{
+    fn from((prover_data, points): (&'a ProverData, Vec<Vec<Challenge>>)) -> Self {
+        Self {
+            prover_data,
+            points,
+        }
+    }
+}
+
+impl<Challenge> From<(Challenge, Vec<Challenge>)> for PointOpening<Challenge> {
+    fn from((point, values): (Challenge, Vec<Challenge>)) -> Self {
+        Self { point, values }
+    }
+}
+
+impl<Challenge, Domain> From<(Domain, Vec<(Challenge, Vec<Challenge>)>)>
+    for MatrixOpening<Challenge, Domain>
+{
+    fn from((domain, points): (Domain, Vec<(Challenge, Vec<Challenge>)>)) -> Self {
+        Self {
+            domain,
+            points: points.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl<Challenge, Commitment, Domain>
+    From<(Commitment, Vec<(Domain, Vec<(Challenge, Vec<Challenge>)>)>)>
+    for CommitmentOpening<Challenge, Commitment, Domain>
+{
+    fn from(
+        (commitment, matrices): (Commitment, Vec<(Domain, Vec<(Challenge, Vec<Challenge>)>)>),
+    ) -> Self {
+        Self {
+            commitment,
+            matrices: matrices.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Compatibility name for the named verification claim.
+pub type CommitmentWithOpeningPoints<Challenge, Commitment, Domain> =
+    CommitmentOpening<Challenge, Commitment, Domain>;
+
+pub type OpenedValues<F> = Vec<OpenedValuesForRound<F>>;
+pub type OpenedValuesForRound<F> = Vec<OpenedValuesForMatrix<F>>;
+pub type OpenedValuesForMatrix<F> = Vec<OpenedValuesForPoint<F>>;
+pub type OpenedValuesForPoint<F> = Vec<F>;

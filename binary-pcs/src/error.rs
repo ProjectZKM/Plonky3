@@ -1,0 +1,179 @@
+//! Typed reasons an opening proof was rejected.
+
+use core::fmt::Debug;
+
+use thiserror::Error;
+
+use crate::transcript::TranscriptFailure;
+
+/// Why an opening proof was rejected.
+///
+/// Derives [`thiserror::Error`] and [`Debug`] only — not `PartialEq`/`Eq`. [`p3_commit::Mmcs`]
+/// carries no such bound on `Error` for a general MMCS (`commit/src/mmcs.rs`), so the derive
+/// cannot apply here.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum BinaryPcsError<F, MmcsError> {
+    /// The proof carries a different number of intermediate folding rounds than the config
+    /// derives.
+    ///
+    /// Checked before any indexing into `rounds`, so a malformed proof is rejected rather
+    /// than desyncing the round loop that walks it.
+    #[error("expected {expected} folding rounds, proof carries {actual}")]
+    RoundCountMismatch { expected: usize, actual: usize },
+
+    /// A round opened a different number of rows than the sampled query count demands.
+    ///
+    /// Checked before any indexing into the opened rows, so a short or padded opening list
+    /// is rejected instead of being read out of bounds or silently truncated.
+    #[error("round {round} opened {actual} rows, expected {expected}")]
+    OpeningCountMismatch {
+        round: usize,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// An opened row had the wrong width.
+    ///
+    /// Every committed round holds a width-1 codeword; a row of any other width would desync
+    /// the fold if it were read as-is rather than rejected up front.
+    #[error("round {round} row {query} has width {actual}, expected {expected}")]
+    RowWidthMismatch {
+        round: usize,
+        query: usize,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// The final codeword's length disagrees with the fold schedule.
+    ///
+    /// Checked before any query reads from it, so an under- or over-sized final codeword is
+    /// rejected instead of being indexed out of bounds.
+    #[error("final codeword has {actual} symbols, expected {expected}")]
+    FinalCodewordLengthMismatch { expected: usize, actual: usize },
+
+    /// A Merkle multiproof did not verify.
+    #[error("Merkle opening failed in round {round}: {source:?}")]
+    MerkleFailed {
+        round: usize,
+        #[source]
+        source: MmcsError,
+    },
+
+    /// Folding the queried pair at one round does not reproduce the value read at the next
+    /// round (or, at the last round, in the final codeword).
+    ///
+    /// This is what ties every committed round to its neighbours; without it, a prover could
+    /// commit to codewords with no relation to one another at all.
+    #[error("round {round} query {query} is not the fold of the previous round")]
+    FoldMismatch { round: usize, query: usize },
+
+    /// The final codeword does not encode the value the sumcheck ended at.
+    #[error("the final codeword does not encode the sumcheck's final value")]
+    FinalCheck,
+
+    /// The grinding witness did not meet the demanded difficulty.
+    #[error("proof-of-work witness rejected")]
+    InvalidPowWitness,
+
+    /// The proof carries a different number of opening-protocol evaluation batches than the
+    /// public protocol schedules.
+    ///
+    /// Checked before any claim is registered, so a malformed proof is rejected before it can
+    /// desync the transcript one claim at a time.
+    #[error("expected {expected} opening batches, proof carries {actual}")]
+    OpeningBatchCountMismatch { expected: usize, actual: usize },
+
+    /// The scalar claim count exceeds the remaining alpha-batching budget.
+    #[error(
+        "opening protocol has {actual} claims, but at most {max} retain the configured {security_level}-bit opening budget"
+    )]
+    OpeningClaimCountExceedsSecurityBudget {
+        actual: usize,
+        max: usize,
+        security_level: usize,
+    },
+
+    /// The table dimensions do not fit the configured stacked polynomial.
+    #[error("opening protocol dimensions do not match the configured stacked polynomial")]
+    InvalidOpeningProtocol,
+
+    /// Prescribed points must match the batches and their table arities.
+    #[error("prescribed opening points do not match the opening protocol")]
+    OpeningPointShapeMismatch,
+
+    /// Supplied evaluations must cover every batch the protocol schedules.
+    ///
+    /// Reported apart from the points, which the same protocol also prescribes, so a caller
+    /// that got one of the two lists wrong learns which.
+    #[error("expected {expected} evaluation batches, {actual} supplied")]
+    OpeningEvalCountMismatch { expected: usize, actual: usize },
+
+    /// One opening batch has the wrong number of evaluations for its column list.
+    ///
+    /// A batch's shape is the pair of side lengths, not their total, so the two sides are
+    /// reported apart: a request and a list that agree on the total can still disagree here.
+    #[error(
+        "table {table_idx} opening expected {expected_current} direct and {expected_next} successor evaluations, got {actual_current} and {actual_next}"
+    )]
+    OpeningBatchSizeMismatch {
+        table_idx: usize,
+        expected_current: usize,
+        expected_next: usize,
+        actual_current: usize,
+        actual_next: usize,
+    },
+
+    /// The committed layout runs preprocessing rounds the opening pipeline does not lay out.
+    ///
+    /// The commit phase lays out a single committed column, so no round has a per-round
+    /// residual to read. Checked before any transcript operation, like every other shape
+    /// check here, so a layout the pipeline cannot open leaves the challenger alone.
+    #[error("the committed layout runs {folding} preprocessing rounds, expected none")]
+    OpeningPreprocessingDepth { folding: usize },
+
+    /// The sumcheck transcript did not verify.
+    #[error(transparent)]
+    Sumcheck(#[from] p3_sumcheck::SumcheckError),
+
+    /// The proof's sumcheck data carries PoW witnesses.
+    ///
+    /// Every fold round runs at `pow_bits = 0` (see `prover::fold_rounds_with`), and the verifier
+    /// replays each round with a freshly built, always-empty `pow_witnesses` vector, so
+    /// whatever the proof carries here is read by nothing and bound to nothing: a third party
+    /// could mutate it and keep a valid proof. `p3_sumcheck::ring_switch` rejects a non-empty
+    /// `pow_witnesses` for the same reason.
+    #[error("the sumcheck data carries {actual} PoW witnesses, expected none")]
+    NonEmptyPowWitnesses { actual: usize },
+
+    /// The grinding witness is not the value a zero difficulty budget admits.
+    ///
+    /// Checked before any transcript operation, like every other proof-shape check here.
+    //
+    // Why: at `pow_bits = 0` neither side touches the sponge.
+    //
+    //     prover  : grind(0)            -> returns zero, absorbs nothing
+    //     verifier: check_witness(0, w) -> returns true, absorbs nothing
+    //
+    // `pow_witness` is then bound to nothing: any value rides along and still verifies.
+    // Zero is the only value an honest prover emits, so zero is the only value accepted.
+    #[error("the grinding witness is {actual} at zero difficulty, expected zero")]
+    NonCanonicalPowWitness { actual: F },
+}
+
+impl<F: Debug, E: Debug> From<TranscriptFailure<F>> for BinaryPcsError<F, E> {
+    fn from(failure: TranscriptFailure<F>) -> Self {
+        match failure {
+            TranscriptFailure::FinalCodewordLength { expected, got } => {
+                Self::FinalCodewordLengthMismatch {
+                    expected,
+                    actual: got,
+                }
+            }
+            TranscriptFailure::PowWitness { .. } => Self::InvalidPowWitness,
+            TranscriptFailure::NonCanonicalPowWitness { actual } => {
+                Self::NonCanonicalPowWitness { actual }
+            }
+        }
+    }
+}

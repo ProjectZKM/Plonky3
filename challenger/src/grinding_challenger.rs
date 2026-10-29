@@ -1,21 +1,207 @@
-use p3_field::{Field, PrimeField, PrimeField32, PrimeField64};
-use p3_maybe_rayon::prelude::*;
+use p3_field::{
+    Field, PackedValue, PrimeCharacteristicRing, PrimeField, PrimeField32, PrimeField64,
+};
+use p3_maybe_rayon::search::find_map_first;
 use p3_symmetric::CryptographicPermutation;
 use tracing::instrument;
 
-use crate::{CanObserve, CanSampleBits, DuplexChallenger, MultiField32Challenger};
+use crate::{
+    CanObserve, CanSample, CanSampleBits, CanSampleUniformBits, DuplexChallenger,
+    MultiField32Challenger, UniformSamplingField,
+};
 
-pub trait GrindingChallenger:
-    CanObserve<Self::Witness> + CanSampleBits<usize> + Sync + Clone
-{
+/// Trait for challengers that support proof-of-work (PoW) grinding.
+///
+/// A `GrindingChallenger` can:
+/// - Absorb a candidate witness into the transcript
+/// - Sample random bitstrings to check the PoW condition
+/// - Brute-force search for a valid witness that satisfies the PoW
+///
+/// This trait is typically used in protocols requiring computational effort
+/// from the prover.
+///
+/// # Why cloning is not required here
+///
+/// A parallel witness search needs a cloneable, shareable transcript.
+/// Checking a witness needs neither.
+///
+/// Those bounds therefore sit on the implementations that search.
+/// A mutable reference to a challenger can then grind too.
+pub trait GrindingChallenger: CanObserve<Self::Witness> + CanSampleBits<usize> {
+    /// The underlying field element type used as the witness.
     type Witness: Field;
 
+    /// Perform a brute-force search to find a valid PoW witness.
+    ///
+    /// Given a `bits` parameter, this function searches for a field element
+    /// `witness` such that after observing it, the next `bits` bits that challenger outputs
+    /// are all `0`.
     fn grind(&mut self, bits: usize) -> Self::Witness;
 
+    /// Whether a grind of b bits can be sampled from the witness field.
+    ///
+    /// A grind of b bits reads the low b bits of one sampled field element.
+    ///
+    /// A positive difficulty therefore needs b below the word size and 2^b below the field order.
+    ///
+    /// A zero difficulty never samples, so every field supports it.
+    ///
+    /// ```text
+    ///     BabyBear, p = 15 * 2^27 + 1
+    ///
+    ///     b =  0:  never samples   -> supported
+    ///     b = 30:  2^30 < p        -> supported
+    ///     b = 31:  2^31 > p        -> the bit sampler would panic
+    /// ```
+    #[must_use]
+    fn supports_pow_bits(bits: usize) -> bool
+    where
+        Self: Sized,
+    {
+        // Both bounds are the ones the bit sampler asserts.
+        bits == 0
+            || (bits < usize::BITS as usize
+                && 1u64
+                    .checked_shl(bits as u32)
+                    .is_some_and(|bound| Self::Witness::order() > bound.into()))
+    }
+
+    /// Check whether a given `witness` satisfies the PoW condition.
+    ///
+    /// After absorbing the witness, the challenger samples `bits` random bits
+    /// and verifies that all bits sampled are zero.
+    ///
+    /// Returns `true` if the witness passes the PoW check, `false` otherwise.
     #[must_use]
     fn check_witness(&mut self, bits: usize, witness: Self::Witness) -> bool {
+        if bits == 0 {
+            return true;
+        }
         self.observe(witness);
         self.sample_bits(bits) == 0
+    }
+}
+
+impl<C: GrindingChallenger> GrindingChallenger for &mut C {
+    type Witness = C::Witness;
+
+    fn grind(&mut self, bits: usize) -> Self::Witness {
+        // Reborrow through both layers so the search advances the original transcript.
+        (**self).grind(bits)
+    }
+
+    fn check_witness(&mut self, bits: usize, witness: Self::Witness) -> bool {
+        // Absorbing the witness must advance the original transcript, not a copy of it.
+        (**self).check_witness(bits, witness)
+    }
+}
+
+/// A byte challenger that can test many proof-of-work candidates against one transcript.
+///
+/// [`SerializingChallenger32`](crate::SerializingChallenger32) and
+/// [`SerializingChallenger64`](crate::SerializingChallenger64) grind through this trait.
+///
+/// The default method clones the challenger once per candidate and runs the check on the clone,
+/// so an empty `impl` serves any byte challenger. An override may share the candidate-independent
+/// work between candidates, but it must accept exactly the candidates the default accepts.
+pub trait ByteGrindingChallenger: CanObserve<u8> + CanSample<u8> + Clone + Send + Sync {
+    /// Search `0..num_candidates` for a candidate that passes.
+    ///
+    /// Candidate `c` passes when a copy of `self` that observes `encode(c)` as one slice and then
+    /// samples `S` bytes produces bytes on which `accepts` returns `true`.
+    ///
+    /// # Returns
+    ///
+    /// The smallest passing candidate, or `None` when none passes.
+    /// It does not depend on the thread count, so proofs are reproducible.
+    fn find_witness<const W: usize, const S: usize>(
+        &self,
+        num_candidates: u64,
+        encode: impl Fn(u64) -> [u8; W] + Sync,
+        accepts: impl Fn([u8; S]) -> bool + Sync,
+    ) -> Option<u64> {
+        find_witness_by_cloning(self, num_candidates, encode, accepts)
+    }
+}
+
+/// Run the [`ByteGrindingChallenger::find_witness`] check on a fresh clone for every candidate.
+pub(crate) fn find_witness_by_cloning<C, const W: usize, const S: usize>(
+    challenger: &C,
+    num_candidates: u64,
+    encode: impl Fn(u64) -> [u8; W] + Sync,
+    accepts: impl Fn([u8; S]) -> bool + Sync,
+) -> Option<u64>
+where
+    C: CanObserve<u8> + CanSample<u8> + Clone + Sync,
+{
+    find_map_first(
+        0..num_candidates,
+        || (),
+        |(), candidate| {
+            let mut challenger = challenger.clone();
+            challenger.observe_slice(&encode(candidate));
+            accepts(challenger.sample_array()).then_some(candidate)
+        },
+    )
+}
+
+/// Trait for challengers that support proof-of-work (PoW) grinding with
+/// guaranteed uniformly sampled bits.
+pub trait UniformGrindingChallenger:
+    GrindingChallenger + CanSampleUniformBits<Self::Witness>
+{
+    /// Grinds based on *uniformly sampled bits*. This variant is allowed to do rejection
+    /// sampling if a value is sampled that would violate our uniformity requirement
+    /// (chance of about 1/P).
+    ///
+    /// Use this together with `check_witness_uniform`.
+    /// At zero difficulty, returns the canonical zero witness without changing the transcript.
+    fn grind_uniform(&mut self, bits: usize) -> Self::Witness;
+
+    /// Grinds based on *uniformly sampled bits*. This variant errors if a value is
+    /// sampled, which would violate our uniformity requirement (chance of about 1/P).
+    /// See the `UniformSamplingField` trait implemented for each field for details.
+    ///
+    /// Use this together with `check_witness_uniform_may_error`.
+    /// At zero difficulty, returns the canonical zero witness without changing the transcript.
+    fn grind_uniform_may_error(&mut self, bits: usize) -> Self::Witness;
+
+    /// Check whether a given `witness` satisfies the PoW condition.
+    ///
+    /// After absorbing the witness, the challenger samples `bits` random bits
+    /// *uniformly* and verifies that all bits sampled are zero. The uniform
+    /// sampling implies we do rejection sampling in about ~1/P cases.
+    /// At zero difficulty, accepts any witness without changing the transcript;
+    /// protocols requiring canonical proof encodings must separately require zero.
+    ///
+    /// Returns `true` if the witness passes the PoW check, `false` otherwise.
+    fn check_witness_uniform(&mut self, bits: usize, witness: Self::Witness) -> bool {
+        if bits == 0 {
+            return true;
+        }
+        self.observe(witness);
+        self.sample_uniform_bits::<true>(bits)
+            .expect("Error impossible here due to resampling strategy")
+            == 0
+    }
+
+    /// Check whether a given `witness` satisfies the PoW condition.
+    ///
+    /// After absorbing the witness, the challenger samples `bits` random bits
+    /// *uniformly* and verifies that all bits sampled are zero. In about ~1/P
+    /// cases this function may error if a sampled value lies outside a range
+    /// in which we can guarantee uniform bits.
+    /// At zero difficulty, accepts any witness without changing the transcript;
+    /// protocols requiring canonical proof encodings must separately require zero.
+    ///
+    /// Returns `true` if the witness passes the PoW check, `false` otherwise.
+    fn check_witness_uniform_may_error(&mut self, bits: usize, witness: Self::Witness) -> bool {
+        if bits == 0 {
+            return true;
+        }
+        self.observe(witness);
+        self.sample_uniform_bits::<false>(bits)
+            .is_ok_and(|v| v == 0)
     }
 }
 
@@ -23,18 +209,243 @@ impl<F, P, const WIDTH: usize, const RATE: usize> GrindingChallenger
     for DuplexChallenger<F, P, WIDTH, RATE>
 where
     F: PrimeField64,
-    P: CryptographicPermutation<[F; WIDTH]>,
+    P: CryptographicPermutation<[F; WIDTH]>
+        + CryptographicPermutation<[<F as Field>::Packing; WIDTH]>,
 {
     type Witness = F;
 
-    #[instrument(name = "grind for proof-of-work witness", skip_all)]
+    #[instrument(name = "grind for proof-of-work witness", skip_all, level = "debug")]
     fn grind(&mut self, bits: usize) -> Self::Witness {
-        let witness = (0..F::ORDER_U64)
-            .into_par_iter()
-            .map(|i| F::from_canonical_u64(i))
-            .find_any(|witness| self.clone().check_witness(bits, *witness))
-            .expect("failed to find witness");
+        // Ensure `bits` is small enough to be used in a shift.
+        assert!(bits < 64, "bit count must be valid");
+
+        // Ensure the PoW target 2^bits is smaller than the field order.
+        // Otherwise, the probability analysis for grinding would break.
+        assert!((1u64 << bits) < F::ORDER_U64);
+
+        // Trivial case: 0 bits mean no PoW is required and any witness is valid.
+        if bits == 0 {
+            return F::ZERO;
+        }
+
+        // Device accelerator, when one is installed (see `grind_hook`): hand it the duplex
+        // buffers and take the smallest passing witness back. `check_witness` re-verifies and
+        // applies the transcript mutation exactly as the host path would, so a wrong hook
+        // asserts loudly rather than corrupting a transcript, and a declining hook falls through
+        // to the host scan.
+        if let Some(hook) = crate::grind_hook::get() {
+            let sponge: alloc::vec::Vec<u64> = self
+                .sponge_state
+                .iter()
+                .map(|x| x.as_canonical_u64())
+                .collect();
+            let input: alloc::vec::Vec<u64> = self
+                .input_buffer
+                .iter()
+                .map(|x| x.as_canonical_u64())
+                .collect();
+            let output: alloc::vec::Vec<u64> = self
+                .output_buffer
+                .iter()
+                .map(|x| x.as_canonical_u64())
+                .collect();
+            if let Some(w) = hook(&sponge, &input, &output, bits) {
+                assert!(
+                    w < F::ORDER_U64,
+                    "grind hook returned a non-canonical witness"
+                );
+                // SAFETY: bounds-checked against the field order above.
+                let witness = unsafe { F::from_canonical_unchecked(w) };
+                assert!(self.check_witness(bits, witness));
+                return witness;
+            }
+        }
+
+        // SIMD width: number of field elements processed in parallel.
+        // Each SIMD lane corresponds to one candidate witness.
+        let lanes = F::Packing::WIDTH;
+
+        // Total number of batches needed to cover all field elements.
+        // Each batch tests `lanes` witnesses in parallel.
+        let num_batches = F::ORDER_U64.div_ceil(lanes as u64);
+
+        // Cache the field order.
+        let order = F::ORDER_U64;
+
+        // Bitmask used to check the PoW condition. eg. bits = 3 => mask = 0b111
+        // We accept a witness if (sample & mask) == 0. This verifies 'bits' trailing zeros.
+        let mask = (1u64 << bits) - 1;
+
+        // New inputs are absorbed sequentially starting at the next free rate slot.
+        // The grinding witness is absorbed at that position.
+        let witness_idx = self.input_buffer.len();
+
+        // The witness counts as one absorbed element on top of the buffered inputs.
+        let num_absorbed = witness_idx + 1;
+
+        // The absorb binds its length into the first capacity element.
+        let tagged_capacity = self.sponge_state[RATE] + F::from_u8(num_absorbed as u8);
+
+        // Build the pre-permutation sponge state shared by every candidate, broadcast to all
+        // SIMD lanes. This mirrors a scalar absorb and is invariant across batches.
+        let base_packed_state: [_; WIDTH] = core::array::from_fn(|i| {
+            if i < witness_idx {
+                // Buffered transcript elements fill the leading rate slots.
+                F::Packing::from(self.input_buffer[i])
+            } else if i < RATE {
+                // The witness slot (overwritten below) and the unused rate slots are zeroed.
+                F::Packing::ZERO
+            } else if i == RATE {
+                // The first capacity element carries the length tag.
+                F::Packing::from(tagged_capacity)
+            } else {
+                // The rest of the capacity carries forward unchanged.
+                F::Packing::from(self.sponge_state[i])
+            }
+        });
+
+        // Grinding is implemented via parallel brute-force search over candidate witnesses.
+        //
+        // For efficiency, the search is vectorized using SIMD.
+        // It returns the smallest passing witness, as trying witnesses serially would.
+        //
+        // - Each SIMD lane corresponds to a distinct candidate witness
+        // - All lanes share the same transcript prefix
+        // - A single permutation evaluates multiple candidates in parallel
+        //
+        // The search runs on a dedicated pool: it sits on the transcript's critical path and its
+        // compute is small, so queueing it in the global pool behind long parallel sections
+        // would cost far more than the search itself.
+        let witness = p3_maybe_rayon::pool::dedicated_install(8, || {
+            find_map_first(
+                0..num_batches,
+                || (),
+                |(), batch| {
+                    // Compute the starting candidate for this batch.
+                    //
+                    // Each batch processes `F::Packing::WIDTH` candidates:
+                    //   - Batch 0 -> candidates [0, 1, ..., F::Packing::WIDTH - 1]
+                    //   - Batch 1 -> candidates [F::Packing::WIDTH, ..., 2 * F::Packing::WIDTH - 1]
+                    //   - Batch k -> candidates [k * F::Packing::WIDTH, ..., (k+1) * F::Packing::WIDTH - 1]
+                    let base = batch * lanes as u64;
+
+                    // Start with a copy of the precomputed base state.
+                    let mut packed_state = base_packed_state;
+
+                    // Generate SIMD-packed candidate witnesses.
+                    // Each lane receives a distinct field element.
+                    //   [base + 0, base + 1, ..., base + F::Packing::WIDTH - 1]
+                    let packed_witnesses = F::Packing::from_fn(|lane| {
+                        let candidate = base + lane as u64;
+                        if candidate < order {
+                            // SAFETY: candidate < field order, so this is a valid canonical field element.
+                            unsafe { F::from_canonical_unchecked(candidate) }
+                        } else {
+                            // Values outside the field order can never satisfy PoW, so we repeat the last potential witness
+                            F::NEG_ONE
+                        }
+                    });
+
+                    // Insert the candidate witnesses at the next absorption position.
+                    //
+                    // This simulates absorbing `transcript || witness` before the Fiat–Shamir challenge is derived.
+                    packed_state[witness_idx] = packed_witnesses;
+
+                    // Apply the cryptographic permutation (SIMD version)
+                    //
+                    // This permutes all `lanes` candidates simultaneously.
+                    self.permutation.permute_mut(&mut packed_state);
+
+                    // Check each lane for the PoW condition
+                    //
+                    // - In a duplex sponge, output is read from position [RATE-1] (last rate element).
+                    // - We check if the low `bits` of each sample are all zeros.
+                    //
+                    // We scan SIMD lanes to find the first candidate whose output satisfies the PoW condition.
+                    packed_state[RATE - 1]
+                        .as_slice()
+                        .iter()
+                        .zip(packed_witnesses.as_slice())
+                        .find(|(sample, _)| {
+                            // Accept if the low `bits` bits are all zero.
+                            (sample.as_canonical_u64() & mask) == 0
+                        })
+                        .map(|(_, &witness)| witness)
+                },
+            )
+            .expect("failed to find proof-of-work witness")
+        });
+
+        // Double-check the witness using the standard verifier logic and update the challenger state.
         assert!(self.check_witness(bits, witness));
+
+        witness
+    }
+}
+
+impl<F, P, const WIDTH: usize, const RATE: usize> UniformGrindingChallenger
+    for DuplexChallenger<F, P, WIDTH, RATE>
+where
+    F: UniformSamplingField + PrimeField64,
+    P: CryptographicPermutation<[F; WIDTH]>
+        + CryptographicPermutation<[<F as Field>::Packing; WIDTH]>,
+{
+    #[instrument(
+        name = "grind uniform for proof-of-work witness",
+        skip_all,
+        level = "debug"
+    )]
+    fn grind_uniform(&mut self, bits: usize) -> Self::Witness {
+        // Call the generic grinder with the "resample" checking logic.
+        self.grind_generic(bits, |challenger, witness| {
+            challenger.check_witness_uniform(bits, witness)
+        })
+    }
+    #[instrument(
+        name = "grind uniform may error for proof-of-work witness",
+        skip_all,
+        level = "debug"
+    )]
+    fn grind_uniform_may_error(&mut self, bits: usize) -> Self::Witness {
+        // Call the generic grinder with the "error" checking logic.
+        self.grind_generic(bits, |challenger, witness| {
+            challenger.check_witness_uniform_may_error(bits, witness)
+        })
+    }
+}
+impl<F, P, const WIDTH: usize, const RATE: usize> DuplexChallenger<F, P, WIDTH, RATE>
+where
+    F: PrimeField64,
+    P: CryptographicPermutation<[F; WIDTH]>,
+{
+    /// A generic, private helper for PoW grinding, parameterized by the checking function.
+    fn grind_generic<CHECK>(&mut self, bits: usize, check_fn: CHECK) -> F
+    where
+        CHECK: Fn(&mut Self, F) -> bool + Sync + Send,
+    {
+        assert!(bits < (usize::BITS as usize), "bit count must be valid");
+        assert!(
+            (1u64 << bits) < F::ORDER_U64,
+            "bit count exceeds field order"
+        );
+        // Canonical witness for disabled PoW; leave the transcript untouched.
+        if bits == 0 {
+            return F::ZERO;
+        }
+        // The core parallel brute-force search logic.
+        let witness = find_map_first(
+            0..F::ORDER_U64,
+            || (),
+            |(), i| {
+                // SAFETY: i is below the field order, so it is canonical.
+                let witness = unsafe { F::from_canonical_unchecked(i) };
+                check_fn(&mut self.clone(), witness).then_some(witness)
+            },
+        )
+        .expect("failed to find proof-of-work witness");
+        // Run the check one last time on the *original* challenger to update its state
+        // and confirm the witness is valid.
+        assert!(check_fn(self, witness));
         witness
     }
 }
@@ -48,14 +459,152 @@ where
 {
     type Witness = F;
 
-    #[instrument(name = "grind for proof-of-work witness", skip_all)]
+    #[instrument(name = "grind for proof-of-work witness", skip_all, level = "debug")]
     fn grind(&mut self, bits: usize) -> Self::Witness {
-        let witness = (0..F::ORDER_U64)
-            .into_par_iter()
-            .map(F::from_canonical_u64)
-            .find_any(|witness| self.clone().check_witness(bits, *witness))
-            .expect("failed to find witness");
+        assert!(bits < (usize::BITS as usize), "bit count must be valid");
+        // Evaluate the bound in `u64` to keep the shift within its type width.
+        // A `u32` shift by `bits >= 32` would wrap and accept a trivial proof-of-work.
+        assert!(
+            (1u64 << bits) < F::ORDER_U64,
+            "requested bit count must fit within the field order"
+        );
+
+        // Trivial case: 0 bits mean no PoW is required and any witness is valid.
+        if bits == 0 {
+            return F::ZERO;
+        }
+
+        // The candidate-independent transcript work happens once inside `pow_check_fn`.
+        // The parallel search then runs one stack-state permutation per candidate.
+        let witness = {
+            let accepts = self.pow_check_fn(bits);
+            find_map_first(
+                0..u64::from(F::ORDER_U32),
+                || (),
+                |(), candidate| {
+                    let candidate = candidate as u32;
+                    accepts(candidate).then_some(candidate)
+                },
+            )
+            .expect("failed to find proof-of-work witness")
+        };
+        // candidate < F::ORDER_U32 by construction so this is safe.
+        let witness = unsafe { F::from_canonical_unchecked(witness) };
+
+        // Re-run the standard verifier logic to validate the witness and
+        // advance the real transcript state.
         assert!(self.check_witness(bits, witness));
         witness
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use p3_baby_bear::{BabyBear, Poseidon2BabyBear, default_babybear_poseidon2_16};
+    use p3_goldilocks::{Goldilocks, Poseidon2Goldilocks, default_goldilocks_poseidon2_8};
+
+    use super::*;
+
+    /// The difficulties checked: free, the smallest, and two that span many parallel chunks.
+    const BITS: [usize; 4] = [0, 1, 8, 14];
+
+    /// Assert that `grind` returns the smallest witness `check` accepts on `challenger`.
+    fn assert_grinds_smallest<C: GrindingChallenger + Clone>(
+        challenger: &C,
+        grind: impl Fn(&mut C, usize) -> C::Witness,
+        check: impl Fn(&mut C, usize, C::Witness) -> bool,
+    ) {
+        for bits in BITS {
+            let witness = grind(&mut challenger.clone(), bits);
+            // The serial search: try 0, 1, 2, ... on a fresh transcript each.
+            let smallest = (0..)
+                .map(C::Witness::from_u64)
+                .find(|&candidate| check(&mut challenger.clone(), bits, candidate));
+            assert_eq!(Some(witness), smallest, "bits {bits}");
+        }
+    }
+
+    #[test]
+    fn duplex_grinders_return_the_smallest_witness() {
+        let permutation = default_babybear_poseidon2_16();
+        // Transcripts leaving 0, 1 and 7 elements buffered before the witness.
+        for pending in [0, 1, 7] {
+            let mut challenger = DuplexChallenger::<BabyBear, _, 16, 8>::new(permutation.clone());
+            challenger.observe_slice(&BabyBear::new_array([3; 7])[..pending]);
+
+            assert_grinds_smallest(
+                &challenger,
+                |c, bits| c.grind(bits),
+                |c, bits, w| c.check_witness(bits, w),
+            );
+            assert_grinds_smallest(
+                &challenger,
+                |c, bits| c.grind_uniform(bits),
+                |c, bits, w| c.check_witness_uniform(bits, w),
+            );
+            assert_grinds_smallest(
+                &challenger,
+                |c, bits| c.grind_uniform_may_error(bits),
+                |c, bits, w| c.check_witness_uniform_may_error(bits, w),
+            );
+        }
+    }
+
+    #[test]
+    fn multi_field_grinder_returns_the_smallest_witness() {
+        let permutation = default_goldilocks_poseidon2_8();
+        for pending in [0, 1, 7] {
+            let mut challenger =
+                MultiField32Challenger::<BabyBear, Goldilocks, _, 8, 4>::new(permutation.clone())
+                    .unwrap();
+            challenger.observe_slice(&BabyBear::new_array([5; 7])[..pending]);
+
+            assert_grinds_smallest(
+                &challenger,
+                |c, bits| c.grind(bits),
+                |c, bits, w| c.check_witness(bits, w),
+            );
+        }
+    }
+
+    #[test]
+    fn supported_pow_bits_stop_below_the_field_order() {
+        // Fixture state: the two bounds the bit sampler asserts.
+        //
+        //     BabyBear,   p = 15 * 2^27 + 1  ~ 2^30.9
+        //     Goldilocks, p = 2^64 - 2^32 + 1
+        //
+        //     b      BabyBear   Goldilocks
+        //     0      yes        yes          never samples
+        //     30     yes        yes          2^30 < p
+        //     31     no         yes          2^31 > BabyBear p
+        //     63     no         64-bit only  2^63 < Goldilocks p, but past a 32-bit word
+        //     64     no         no           not below a 64-bit word
+        //     max    no         no           the shift itself would overflow
+        //
+        // Invariant: a difficulty is supported exactly when b = 0, or b is below the word size and 2^b < p.
+        let wide_word = usize::BITS > 63;
+        type BabyBearChallenger = DuplexChallenger<BabyBear, Poseidon2BabyBear<16>, 16, 8>;
+        type GoldilocksChallenger = DuplexChallenger<Goldilocks, Poseidon2Goldilocks<8>, 8, 4>;
+        let cases = [
+            (0, true, true),
+            (30, true, true),
+            (31, false, true),
+            (63, false, wide_word),
+            (64, false, false),
+            (usize::MAX, false, false),
+        ];
+        for (bits, baby_bear, goldilocks) in cases {
+            assert_eq!(
+                BabyBearChallenger::supports_pow_bits(bits),
+                baby_bear,
+                "bits {bits}"
+            );
+            assert_eq!(
+                GoldilocksChallenger::supports_pow_bits(bits),
+                goldilocks,
+                "bits {bits}"
+            );
+        }
     }
 }

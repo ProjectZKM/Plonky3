@@ -1,9 +1,26 @@
 ![Plonky3-powered-by-polygon](https://github.com/Plonky3/Plonky3/assets/86010/7ec356ad-b0f3-4c4c-aa1d-3a151c1065e7)
 
-Plonky3 is a toolkit for implementing polynomial IOPs (PIOPs), such as PLONK and STARKs. It aims to support several polynomial commitment schemes, such as Brakedown.
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/Plonky3/Plonky3/blob/main/LICENSE-MIT)
+[![License](https://img.shields.io/github/license/Plonky3/Plonky3)](https://github.com/Plonky3/Plonky3/blob/main/LICENSE-APACHE)
 
-This is the "core" repo, but the plan is to move each crate into its own repo once APIs stabilize.
+Plonky3 is a toolkit which provides a set of primitives, such as polynomial commitment schemes, for implementing polynomial IOPs (PIOPs). It is mainly used to power STARK-based zkVMs, though in principle it may be used for PLONK-based circuits or other PIOPs.
 
+For questions or discussions, please use the Telegram group, [t.me/plonky3](https://t.me/plonky3).
+
+
+## Deprecated crates
+
+Starting with v0.9.0, the following crates are deprecated and planned for removal
+in a future release:
+
+- `p3-bn254`
+- `p3-monolith`
+- `p3-monolith-air`
+- `p3-poseidon1-air`
+- `p3-poseidon2-air`
+- `p3-rescue`
+
+Avoid using these crates in new projects. A removal version has not yet been scheduled.
 
 ## Status
 
@@ -14,27 +31,41 @@ Fields:
   - [x] AVX2
   - [x] AVX-512
   - [x] NEON
-- [x] BabyBear
+- [x] General 31 bit fields (BabyBear and KoalaBear)
   - [x] ~128 bit extension field
   - [x] AVX2
   - [x] AVX-512
   - [x] NEON
 - [x] Goldilocks
   - [x] ~128 bit extension field
+- [x] Binary tower fields GF(2) ⊂ GF(4) ⊂ … ⊂ GF(2^128)
+  - [x] GHASH polynomial-basis representation of GF(2^128), with SIMD packings
 
 Generalized vector commitment schemes
 - [x] generalized Merkle tree
 
 Polynomial commitment schemes
 - [x] FRI-based PCS
+- [x] STIR-based PCS
+- [x] WHIR-based PCS
+- [x] Multilinear PCS over binary tower fields (Binius-style, additive-domain proximity)
 - [ ] tensor PCS
 - [ ] univariate-to-multivariate adapter
 - [ ] multivariate-to-univariate adapter
 
 PIOPs
 - [x] univariate STARK
-- [ ] multivariate STARK
+- [x] multivariate STARK (SuperSpartan-style, over AIRs)
+- [x] batched STARK (shared PCS openings across multiple instances)
 - [ ] PLONK
+
+Interactive proof primitives
+- [x] Sumcheck (generic-degree, small-value optimization, HVZK masking, ring switching)
+- [x] LogUp lookup arguments (local and cross-AIR)
+- [x] Typed Fiat-Shamir transcript layer (DSFS / IETF draft)
+
+Security
+- [x] Composable soundness analysis for FRI/STIR/WHIR-based STARKs
 
 Codes
 - [x] Brakedown
@@ -46,6 +77,7 @@ Interpolation
 - [x] radix-2 Bowers FFT
 - [ ] four-step FFT
 - [x] Mersenne circle group FFT
+- [x] Additive NTT (Lin–Chung–Han transform) over binary tower fields
 
 Hashes
 - [x] Rescue
@@ -54,23 +86,73 @@ Hashes
 - [x] BLAKE3
   - [ ] modifications to tune BLAKE3 for hashing small leaves
 - [x] Keccak-256
+- [x] SHA-256
 - [x] Monolith
 
 
+## Binary-field example
+
+The [binary AIR example](multi-stark/examples/prove_binary_field.rs) proves a nonlinear
+recurrence over `BinaryField128` using the multilinear STARK prover and `BinaryPcs`,
+with Keccak Merkle commitments and a binary challenger. It serializes the proof and
+verifies it with a fresh transcript:
+
+```bash
+cargo run --release -p p3-multi-stark --example prove_binary_field
+```
+
+This example is not zero knowledge. Characteristic-two LogUp lookups are unsupported
+and rejected; the example uses ordinary AIR constraints.
+
 ## Benchmarks
 
-Many variations are possible, with different fields, hashes and so forth, but here are a couple examples of Plonky3 benchmarks.
+Many variations are possible, with different fields, hashes, and so forth, which can be controlled through the command line.
 
-Prove 2^19 Poseidon2 permutations of width 16, using the `KoalaBear` field and Keccak in the Merkle tree:
-Poseidon2
-```
-RUSTFLAGS="-Ctarget-cpu=native" cargo run --example prove_poseidon2_koala_bear_keccak --release --features parallel
+For example, to prove 2^20 Poseidon2 permutations of width 16, using the `KoalaBear` field, `Radix2DitParallel` DFT, and `KeccakF` as the Merkle tree hash:
+```bash
+RUSTFLAGS="-Ctarget-cpu=native" cargo run --example prove_prime_field_31 --release --features parallel -- --field koala-bear --objective poseidon-2-permutations --log-trace-length 17 --discrete-fourier-transform radix-2-dit-parallel --merkle-hash keccak-f
 ```
 
-Prove 1365 Keccak-f permutations, using the `BabyBear` field and Keccak in the Merkle tree.
+Currently the options for the command line arguments are:
+- `--field` (`-f`): `mersenne-31` or `koala-bear` or `baby-bear`.
+- `--objective` (`-o`): `blake-3-permutations, poseidon-2-permutations, keccak-f-permutations`.
+- `--log-trace-length` (`-l`): Accepts any integer between `0` and `255`. The number of permutations proven is `trace_length, 8*trace_length` and `trace_length/24` for `blake3, poseidon2` and `keccakf` respectively. 
+- `--discrete-fourier-transform` (`-d`): `radix-2-dit-parallel, recursive-dft` or `small-batch-dft`. This option should be omitted if the field choice is `mersenne-31` as the circle stark currently only supports a single discrete fourier transform.
+- `--merkle-hash` (`-m`): `poseidon-2, keccak-f`.
+
+`prove_hash_binary` proves Keccak-f permutations, BLAKE3 compressions or SHA-256 compressions
+over `BinaryField128` with the multilinear STARK prover. They commit their bit-valued traces
+through the `BooleanTracePcs`, which opens the current and the next row of every column. Every
+objective generates its trace already packed into bits:
+```bash
+RUSTFLAGS="-Ctarget-cpu=native" cargo run --example prove_hash_binary --release --features parallel -- --objective keccak-f-permutations --log-trace-length 14 --security-bits 96
+RUSTFLAGS="-Ctarget-cpu=native" cargo run --example prove_hash_binary --release --features parallel -- --objective blake-3-compressions --log-trace-length 10 --security-bits 96
+RUSTFLAGS="-Ctarget-cpu=native" cargo run --example prove_hash_binary --release --features parallel -- --objective sha-256-compressions --log-trace-length 10 --security-bits 96
+RUSTFLAGS="-Ctarget-cpu=native" cargo run --example prove_hash_binary --release --features parallel -- --objective blake-2s-compressions --log-trace-length 10 --security-bits 96
 ```
-RUSTFLAGS="-Ctarget-cpu=native" cargo run --example prove_baby_bear_keccak --release --features parallel
-```
+- `--objective` (`-o`): `keccak-f-permutations`, `blake-3-compressions`, `sha-256-compressions` or
+  `blake-2s-compressions`.
+- `--log-trace-length` (`-l`): required. The binary Keccak-f AIR uses 25 rows per permutation
+  (one per round, plus the output row), so `keccak-f-permutations` proves
+  `2^log-trace-length / 25` permutations; the three compression objectives each prove
+  `2^log-trace-length` compressions, one row per compression.
+- `--format`: `human` (default) or `json`. With `json`, standard output is one JSON object per
+  run carrying the same measurements, and progress lines and tracing spans go to standard error.
+- `--representation` (`-r`): the field representation the zerocheck prover runs its later
+  rounds in: `auto` (default; `poly-basis-late` with a hardware carryless multiply,
+  subfield-tower basis otherwise), `subfield`, `poly-basis`, or `poly-basis-late` (polynomial
+  basis, with an eligible stage's first dense residual built one round later at half the size).
+  Every choice proves and verifies the same statement and emits a byte-identical proof; this is
+  a performance tradeoff only.
+- `--log-inv-rate`, `--pcs-pow-bits`, `--security-bits` (default 100), `--folding`, and
+  `--merkle-arity` (`2` or `4`, default `4`) tune the PCS. The defaults are inverse rate 1,
+  folding 4, and Merkle arity 4.
+
+The Boolean commitment packs each trace's bits into `BinaryField128` elements and reduces column
+claims through a bit-ring switch, which caps the proven security at roughly
+`125 - (log-trace-length + ceil(log2(width)) - 7 + log-inv-rate)` bits, with width 1625 for Keccak-f
+and 11536 for BLAKE3; PCS grinding does not raise that cap. Lower `--security-bits` for larger
+traces.
 
 Extra speedups may be possible with some configuration changes:
 - `JEMALLOC_SYS_WITH_MALLOC_CONF=retain:true,dirty_decay_ms:-1,muzzy_decay_ms:-1` will cause jemalloc to hang on to virtual memory. This may not affect the very first proof much, but can help significantly with subsequent proofs as fewer pages (if any) will need to be newly assigned by the OS. These settings might not be suitable for all production environments, e.g. if the process' virtual memory is limited by `ulimit` or `max_map_count`.
@@ -78,26 +160,45 @@ Extra speedups may be possible with some configuration changes:
 
 ## CPU features
 
-Plonky3 contains optimizations that rely on newer CPU instructions that are not available in older processors. These instruction sets include x86's [BMI1 and 2](https://en.wikipedia.org/wiki/X86_Bit_manipulation_instruction_set), [AVX2](https://en.wikipedia.org/wiki/Advanced_Vector_Extensions#Advanced_Vector_Extensions_2), and [AVX-512](https://en.wikipedia.org/wiki/AVX-512). Rustc does not emit those instructions by default; they must be explicitly enabled through the `target-feature` compiler option (or implicitly by setting `target-cpu`). To enable all features that are supported on your machine, you can set `target-cpu` to `native`. For example, to run the tests:
-```
+Plonky3 contains optimizations that rely on newer CPU instructions unavailable in older processors. These instruction sets include x86's [BMI1 and 2](https://en.wikipedia.org/wiki/X86_Bit_manipulation_instruction_set), [AVX2](https://en.wikipedia.org/wiki/Advanced_Vector_Extensions#Advanced_Vector_Extensions_2), and [AVX-512](https://en.wikipedia.org/wiki/AVX-512). Rustc does not emit those instructions by default; they must be explicitly enabled through the `target-feature` compiler option (or implicitly by setting `target-cpu`). To enable all features that are supported on your machine, you can set `target-cpu` to `native`. For example, to run the tests:
+```bash
 RUSTFLAGS="-Ctarget-cpu=native" cargo test
 ```
 
-Support for some instructions, such as AVX-512, is still experimental. They are only available in the nightly build of Rustc and are enabled by the [`nightly-features` feature flag](#nightly-only-optimizations). To use them, you must enable the flag in Rustc (e.g. by setting `target-feature`) and you must also enable the `nightly-features` feature.
+## Development
 
+Repository checks have one local and CI interface:
 
-## Nightly-only optimizations
-
-Some optimizations (in particular, AVX-512-optimized math) rely on features that are currently available only in the nightly build of Rustc. To use them, you need to enable the `nightly-features` feature. For example, to run the tests:
+```bash
+python3 scripts/check.py fast
+python3 scripts/check.py test --package p3-field
+python3 scripts/check.py full
 ```
-cargo test --features nightly-features
-```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, focused commands, cross-target checks, and CI metadata. The [architecture guide](docs/architecture.md) maps the crates and records backend capabilities and hiding guarantees.
+
+## Configuration
+
+### Cargo features
+
+| Feature | Where | What it does |
+| --- | --- | --- |
+| `parallel` | Most crates | Routes hot loops through `rayon` instead of the sequential fallback. Off by default. Activate at the workspace root with `cargo … --features parallel`. |
+| `neon` | `p3-blake3` | Forwards to the upstream `blake3/neon` feature for aarch64. Off by default. |
+| `test-utils` | `p3-commit` (off by default) | Compiles in-crate test helpers used by integration tests. |
+| `test-util` | `p3-sumcheck` (off by default) | Compiles the sumcheck test helper module used by downstream tests. |
+
+There is no `nightly`, `asm`, or `simd` Cargo feature — SIMD code paths are gated by `cfg(target_feature = …)` and enabled through `RUSTFLAGS`, not features. See [CPU features](#cpu-features) above.
+
+### Recommended `RUSTFLAGS`
+
+- `-Ctarget-cpu=native` — enables every SIMD instruction set the host supports (AVX2 / AVX-512 / NEON / SIMD128 fallbacks for Mersenne31, BabyBear, KoalaBear, Goldilocks). Required to get parity with the published benchmark numbers.
+- `lto = "fat"` in `[profile.release]` of the workspace `Cargo.toml` (or your downstream) for a some release-mode speedup, at the cost of longer compile times.
+- `JEMALLOC_SYS_WITH_MALLOC_CONF=retain:true,dirty_decay_ms:-1,muzzy_decay_ms:-1` for repeated-proof workloads (see [Benchmarks](#benchmarks)).
 
 ## Known issues
 
-The verifier might panic upon receiving certain invalid proofs.
-
+- **The verifier may panic on certain malformed proofs.** Downstream integrators that accept untrusted proofs should wrap `verify` in `catch_unwind` out of caution.
 
 ## License
 
@@ -114,18 +215,18 @@ at your option.
 Do you feel keen and able to help with Plonky3? That's great! We
 encourage external contributions!
 
-We want to make it easy for you to contribute, but at the same time we
+We want to make it easy for you to contribute, but at the same time, we
 must manage the burden of reviewing external contributions. We are a
 small team, and the time we spend reviewing external contributions is
 time we are not developing ourselves.
 
-We also want to help you to avoid inadvertently duplicating work that
+We also want to help you avoid inadvertently duplicating work that
 is already underway, or building something that we will not
 want to incorporate.
 
 First and foremost, please keep in mind that this is a highly
 technical piece of software and contributing is only suitable for
-experienced mathematicians, cryptographers and software engineers.
+experienced mathematicians, cryptographers, and software engineers.
 
 The Polygon Zero Team reserves the right to accept or reject any
 external contribution for any reason, including a simple lack of time
@@ -136,21 +237,21 @@ To avoid disappointment, please communicate your intention to
 contribute openly, while respecting the limited time and availability
 we have to review and provide guidance for external contributions. It
 is a good idea to drop a note in our public Discord #development
-channel of your intention to work on something, whether an issue, a
+channel about your intention to work on something, whether an issue, a
 new feature, or a performance improvement. This is probably all that's
 really required to avoid duplication of work with other contributors.
 
 What follows are some more specific requests for how to write PRs in a
 way that will make them easy for us to review. Deviating from these
-guidelines may result in your PR being rejected, ignored or forgotten.
+guidelines may result in your PR being rejected, ignored, or forgotten.
 
 
 ### General guidance for your PR
 
-Obviously PRs will not be considered unless they pass our Github
-CI. The Github CI is not executed for PRs from forks, but you can
-simulate the Github CI by running the commands in
-`.github/workflows/ci.yml`.
+Obviously, PRs will not be considered unless they pass our GitHub CI.
+The GitHub CI is not executed for PRs from forks, but you can run its
+routine host checks locally with `python3 scripts/check.py full`; see
+[CONTRIBUTING.md](CONTRIBUTING.md) for targeted and cross-platform commands.
 
 Under no circumstances should a single PR mix different purposes: Your
 PR is either a bug fix, a new feature, or a performance improvement,
@@ -158,12 +259,16 @@ never a combination. Nor should you include, for example, two
 unrelated performance improvements in one PR. Please just submit
 separate PRs. The goal is to make reviewing your PR as simple as
 possible, and you should be thinking about how to compose the PR to
-minimise the burden on the reviewer.
+minimize the burden on the reviewer.
 
 Plonky3 uses stable Rust, so any PR that depends on unstable features
 is likely to be rejected. It's possible that we may relax this policy
 in the future, but we aim to minimize the use of unstable features;
 please discuss with us before enabling any.
+
+Please do not submit any PRs consisting of merely minor fixes to documentation.
+They will not be accepted. If you find something that bothers you particularly,
+make an issue and we will fix it when we find the time.
 
 Here are a few specific guidelines for the three main categories of
 PRs that we expect:
@@ -176,7 +281,7 @@ In the PR description, please clearly but briefly describe
 1. the bug (could be a reference to a GH issue; if it is from a
    discussion (on Discord/email/etc. for example), please copy in the
    relevant parts of the discussion);
-2. what turned out to the cause the bug; and
+2. what turned out to cause the bug; and
 3. how the PR fixes the bug.
 
 Wherever possible, PRs that fix bugs should include additional tests
@@ -185,7 +290,7 @@ that (i) trigger the original bug and (ii) pass after applying the PR.
 
 #### The PR implements a new feature
 
-If you plan to contribute an implementation of a new feature, please
+If you plan to contribute the implementation of a new feature, please
 double-check with the Polygon Zero team that it is a sufficient
 priority for us that it will be reviewed and integrated.
 

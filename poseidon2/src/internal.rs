@@ -29,107 +29,56 @@
 
 use alloc::vec::Vec;
 
-use p3_field::{Field, FieldAlgebra};
+use p3_field::{Algebra, Field, InjectiveMonomial, PrimeCharacteristicRing};
 
 use crate::add_rc_and_sbox_generic;
 
 /// Initialize an internal layer from a set of constants.
-pub trait InternalLayerConstructor<FA>
+pub trait InternalLayerConstructor<F>
 where
-    FA: FieldAlgebra,
+    F: Field,
 {
     /// A constructor which internally will convert the supplied
     /// constants into the appropriate form for the implementation.
-    fn new_from_constants(internal_constants: Vec<FA::F>) -> Self;
+    fn new_from_constants(internal_constants: Vec<F>) -> Self;
 }
 
 /// Given a vector v compute the matrix vector product (1 + diag(v))state with 1 denoting the constant matrix of ones.
-pub fn matmul_internal<F: Field, FA: FieldAlgebra<F = F>, const WIDTH: usize>(
-    state: &mut [FA; WIDTH],
+pub fn matmul_internal<F: Field, A: Algebra<F>, const WIDTH: usize>(
+    state: &mut [A; WIDTH],
     mat_internal_diag_m_1: [F; WIDTH],
 ) {
-    let sum: FA = state.iter().cloned().sum();
+    let sum = A::sum_array::<WIDTH>(state);
     for i in 0..WIDTH {
-        state[i] = state[i].clone() * FA::from_f(mat_internal_diag_m_1[i]);
-        state[i] = state[i].clone() + sum.clone();
+        state[i] *= mat_internal_diag_m_1[i];
+        state[i] += sum.dup();
     }
 }
 
 /// A trait containing all data needed to implement the internal layers of Poseidon2.
-pub trait InternalLayer<FA, const WIDTH: usize, const D: u64>: Sync + Clone
+pub trait InternalLayer<R, const WIDTH: usize, const D: u64>: Sync + Clone
 where
-    FA: FieldAlgebra,
+    R: PrimeCharacteristicRing,
 {
     /// Perform the internal layers of the Poseidon2 permutation on the given state.
-    fn permute_state(&self, state: &mut [FA; WIDTH]);
+    fn permute_state(&self, state: &mut [R; WIDTH]);
 }
 
 /// A helper method which allows any field to easily implement Internal Layer.
 /// This should only be used in places where performance is not critical.
 #[inline]
-pub fn internal_permute_state<FA: FieldAlgebra, const WIDTH: usize, const D: u64>(
-    state: &mut [FA; WIDTH],
-    diffusion_mat: fn(&mut [FA; WIDTH]),
-    internal_constants: &[FA::F],
+pub fn internal_permute_state<
+    F: Field,
+    A: Algebra<F> + InjectiveMonomial<D>,
+    const WIDTH: usize,
+    const D: u64,
+>(
+    state: &mut [A; WIDTH],
+    diffusion_mat: fn(&mut [A; WIDTH]),
+    internal_constants: &[F],
 ) {
-    for elem in internal_constants.iter() {
-        add_rc_and_sbox_generic::<FA, D>(&mut state[0], *elem);
+    for elem in internal_constants {
+        add_rc_and_sbox_generic(&mut state[0], *elem);
         diffusion_mat(state);
     }
-}
-
-/// The compiler doesn't realize that add is associative
-/// so we help it out and minimize the dependency chains by hand.
-#[inline(always)]
-fn sum_7<FA: FieldAlgebra + Copy>(state: &[FA]) -> FA {
-    assert_eq!(state.len(), 7);
-
-    let s01 = state[0] + state[1];
-    let s23 = state[2] + state[3];
-    let s45 = state[4] + state[5];
-
-    let s0123 = s01 + s23;
-    let s456 = s45 + state[6];
-    s0123 + s456
-}
-
-/// The compiler doesn't realize that add is associative
-/// so we help it out and minimize the dependency chains by hand.
-#[inline(always)]
-fn sum_8<FA: FieldAlgebra + Copy>(state: &[FA]) -> FA {
-    assert_eq!(state.len(), 8);
-
-    let s01 = state[0] + state[1];
-    let s23 = state[2] + state[3];
-    let s45 = state[4] + state[5];
-    let s67 = state[6] + state[7];
-
-    let s0123 = s01 + s23;
-    let s4567 = s45 + s67;
-    s0123 + s4567
-}
-
-/// The compiler doesn't realize that add is associative
-/// so we help it out and minimize the dependency chains by hand.
-#[inline(always)]
-pub fn sum_15<FA: FieldAlgebra + Copy>(state: &[FA]) -> FA {
-    assert_eq!(state.len(), 15);
-
-    let bot_sum = sum_8(&state[..8]);
-    let top_sum = sum_7(&state[8..]);
-
-    bot_sum + top_sum
-}
-
-/// The compiler doesn't realize that add is associative
-/// so we help it out and minimize the dependency chains by hand.
-#[inline(always)]
-pub fn sum_23<FA: FieldAlgebra + Copy>(state: &[FA]) -> FA {
-    assert_eq!(state.len(), 23);
-
-    let bot_sum = sum_8(&state[..8]);
-    let mid_sum = sum_8(&state[8..16]);
-    let top_sum = sum_7(&state[16..]);
-
-    bot_sum + mid_sum + top_sum
 }

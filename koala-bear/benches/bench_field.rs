@@ -1,23 +1,45 @@
-use std::any::type_name;
+use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use p3_field::{Field, FieldAlgebra};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use p3_field::{Field, PrimeCharacteristicRing};
 use p3_field_testing::bench_func::{
-    benchmark_add_latency, benchmark_add_throughput, benchmark_inv, benchmark_iter_sum,
-    benchmark_mul_latency, benchmark_mul_throughput, benchmark_sub_latency,
-    benchmark_sub_throughput,
+    benchmark_add_latency, benchmark_add_throughput, benchmark_div_2exp, benchmark_inv,
+    benchmark_iter_sum, benchmark_mul_2exp, benchmark_mul_latency, benchmark_mul_throughput,
+    benchmark_sub_latency, benchmark_sub_throughput,
 };
+use p3_field_testing::{benchmark_dot_array, benchmark_sum_array};
 use p3_koala_bear::KoalaBear;
+use p3_util::pretty_name;
+use rand::rngs::SmallRng;
+use rand::{RngExt, SeedableRng};
 
 type F = KoalaBear;
+type PF = <KoalaBear as Field>::Packing;
 
 fn bench_field(c: &mut Criterion) {
     let name = "KoalaBear";
-    const REPS: usize = 1000;
+    const REPS: usize = 500;
     benchmark_inv::<F>(c, name);
+    // `KoalaBear::try_sqrt` is an inherent method (the two-adic specialization), so
+    // it must be benchmarked through the concrete type rather than the generic
+    // `benchmark_sqrt` helper, which would resolve to the slower trait default.
+    {
+        let mut rng = SmallRng::seed_from_u64(1);
+        let x = rng.random::<F>().square();
+        c.bench_function("KoalaBear sqrt", |b| {
+            b.iter(|| black_box(black_box(x).try_sqrt()));
+        });
+    }
+    benchmark_mul_2exp::<F, 100>(c, name, 16);
+    benchmark_mul_2exp::<F, 100>(c, name, 64);
+    benchmark_mul_2exp::<F, 100>(c, name, (1 << 63) - 1);
+    benchmark_div_2exp::<F, 100>(c, name, 16);
+    benchmark_div_2exp::<F, 100>(c, name, 33);
+    benchmark_div_2exp::<F, 100>(c, name, (1 << 63) - 1);
     benchmark_iter_sum::<F, 4, REPS>(c, name);
+    benchmark_sum_array::<F, 4, REPS>(c, name);
     benchmark_iter_sum::<F, 8, REPS>(c, name);
-    benchmark_iter_sum::<F, 12, REPS>(c, name);
+    benchmark_sum_array::<F, 8, REPS>(c, name);
 
     // Note that each round of throughput has 10 operations
     // So we should have 10 * more repetitions for latency tests.
@@ -27,28 +49,44 @@ fn bench_field(c: &mut Criterion) {
     benchmark_sub_latency::<F, L_REPS>(c, name);
     benchmark_sub_throughput::<F, REPS>(c, name);
 
+    let mut rng = SmallRng::seed_from_u64(1);
     c.bench_function("3rd_root", |b| {
         b.iter_batched(
-            rand::random::<F>,
+            || rng.random::<F>(),
             |x| x.exp_u64(1420470955),
             BatchSize::SmallInput,
-        )
+        );
     });
 }
 
 fn bench_packedfield(c: &mut Criterion) {
-    let name = type_name::<<F as Field>::Packing>().to_string();
+    let name = &pretty_name::<PF>();
     // Note that each round of throughput has 10 operations
     // So we should have 10 * more repetitions for latency tests.
     const REPS: usize = 100;
     const L_REPS: usize = 10 * REPS;
 
-    benchmark_add_latency::<<F as Field>::Packing, L_REPS>(c, &name);
-    benchmark_add_throughput::<<F as Field>::Packing, REPS>(c, &name);
-    benchmark_sub_latency::<<F as Field>::Packing, L_REPS>(c, &name);
-    benchmark_sub_throughput::<<F as Field>::Packing, REPS>(c, &name);
-    benchmark_mul_latency::<<F as Field>::Packing, L_REPS>(c, &name);
-    benchmark_mul_throughput::<<F as Field>::Packing, REPS>(c, &name);
+    // Choosing constants so that the number of summations is the same.
+    benchmark_iter_sum::<PF, 64, 46>(c, name);
+    benchmark_sum_array::<PF, 64, 46>(c, name);
+    benchmark_iter_sum::<PF, 2944, 1>(c, name);
+    benchmark_sum_array::<PF, 2944, 1>(c, name);
+
+    benchmark_add_latency::<<F as Field>::Packing, L_REPS>(c, name);
+    benchmark_add_throughput::<<F as Field>::Packing, REPS>(c, name);
+    benchmark_sub_latency::<<F as Field>::Packing, L_REPS>(c, name);
+    benchmark_sub_throughput::<<F as Field>::Packing, REPS>(c, name);
+    benchmark_mul_latency::<<F as Field>::Packing, L_REPS>(c, name);
+    benchmark_mul_throughput::<<F as Field>::Packing, REPS>(c, name);
+
+    // Delayed-reduction dot products, with `4` as the control.
+    // Lengths `5` to `8` each pay one Montgomery reduction.
+    benchmark_dot_array::<PF, 4>(c, name);
+    benchmark_dot_array::<PF, 5>(c, name);
+    benchmark_dot_array::<PF, 6>(c, name);
+    benchmark_dot_array::<PF, 7>(c, name);
+    benchmark_dot_array::<PF, 8>(c, name);
+    benchmark_dot_array::<PF, 64>(c, name);
 }
 
 criterion_group!(koala_bear_arithmetic, bench_field, bench_packedfield);

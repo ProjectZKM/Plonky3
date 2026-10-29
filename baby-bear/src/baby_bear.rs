@@ -1,15 +1,14 @@
-use p3_field::{exp_1725656503, exp_u64_by_squaring, Field, FieldAlgebra};
+use p3_field::exponentiation::exp_1725656503;
+use p3_field::{Algebra, PrimeCharacteristicRing, UniformSamplingField};
 use p3_monty_31::{
     BarrettParameters, BinomialExtensionData, FieldParameters, MontyField31, MontyParameters,
-    PackedMontyParameters, TwoAdicData,
+    PackedMontyParameters, RelativelyPrimePower, TwoAdicData,
 };
-
-use serde::{Serialize, Deserialize};
 
 /// The prime field `2^31 - 2^27 + 1`, a.k.a. the Baby Bear field.
 pub type BabyBear = MontyField31<BabyBearParameters>;
 
-#[derive(Copy, Clone, Default, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Default, Debug, Eq, Hash, PartialEq)]
 pub struct BabyBearParameters;
 
 impl MontyParameters for BabyBearParameters {
@@ -28,40 +27,16 @@ impl BarrettParameters for BabyBearParameters {}
 impl FieldParameters for BabyBearParameters {
     const MONTY_GEN: BabyBear = BabyBear::new(31);
 
-    fn exp_u64_generic<FA: FieldAlgebra>(val: FA, power: u64) -> FA {
-        match power {
-            1725656503 => exp_1725656503(val), // used to compute x^{1/7}
-            _ => exp_u64_by_squaring(val, power),
-        }
-    }
+    // Measured -3.5% on quotient evaluation (twoadic PCS, Poseidon2 AIR, aarch64+neon).
+    const BENEFITS_FROM_LOCKSTEP_EVALUATION: bool = true;
+}
 
-    fn try_inverse<F: Field>(p1: F) -> Option<F> {
-        if p1.is_zero() {
-            return None;
-        }
-
-        // From Fermat's little theorem, in a prime field `F_p`, the inverse of `a` is `a^(p-2)`.
-        // Here p-2 = 2013265919 = 1110111111111111111111111111111_2.
-        // Uses 30 Squares + 7 Multiplications => 37 Operations total.
-
-        let p100000000 = p1.exp_power_of_2(8);
-        let p100000001 = p100000000 * p1;
-        let p10000000000000000 = p100000000.exp_power_of_2(8);
-        let p10000000100000001 = p10000000000000000 * p100000001;
-        let p10000000100000001000 = p10000000100000001.exp_power_of_2(3);
-        let p1000000010000000100000000 = p10000000100000001000.exp_power_of_2(5);
-        let p1000000010000000100000001 = p1000000010000000100000000 * p1;
-        let p1000010010000100100001001 = p1000000010000000100000001 * p10000000100000001000;
-        let p10000000100000001000000010 = p1000000010000000100000001.square();
-        let p11000010110000101100001011 = p10000000100000001000000010 * p1000010010000100100001001;
-        let p100000001000000010000000100 = p10000000100000001000000010.square();
-        let p111000011110000111100001111 =
-            p100000001000000010000000100 * p11000010110000101100001011;
-        let p1110000111100001111000011110000 = p111000011110000111100001111.exp_power_of_2(4);
-        let p1110111111111111111111111111111 =
-            p1110000111100001111000011110000 * p111000011110000111100001111;
-
-        Some(p1110111111111111111111111111111)
+impl RelativelyPrimePower<7> for BabyBearParameters {
+    /// In the field `BabyBear`, `a^{1/7}` is equal to a^{1725656503}.
+    ///
+    /// This follows from the calculation `7 * 1725656503 = 6*(2^31 - 2^27) + 1 = 1 mod (p - 1)`.
+    fn exp_root_d<R: PrimeCharacteristicRing>(val: R) -> R {
+        exp_1725656503(val)
     }
 }
 
@@ -102,6 +77,12 @@ impl BinomialExtensionData<4> for BabyBearParameters {
 
 impl BinomialExtensionData<5> for BabyBearParameters {
     const W: BabyBear = BabyBear::new(2);
+
+    #[inline(always)]
+    fn mul_w<A: Algebra<MontyField31<Self>>>(a: A) -> A {
+        a.double()
+    }
+
     const DTH_ROOT: BabyBear = BabyBear::new(815036133);
     const EXT_GENERATOR: [BabyBear; 5] = BabyBear::new_array([8, 1, 0, 0, 0]);
     const EXT_TWO_ADICITY: usize = 27;
@@ -110,20 +91,64 @@ impl BinomialExtensionData<5> for BabyBearParameters {
     const TWO_ADIC_EXTENSION_GENERATORS: Self::ArrayLike = [];
 }
 
+impl BinomialExtensionData<8> for BabyBearParameters {
+    const W: BabyBear = BabyBear::new(11);
+    const DTH_ROOT: BabyBear = BabyBear::new(420899707);
+    const EXT_GENERATOR: [BabyBear; 8] = BabyBear::new_array([5, 1, 0, 0, 0, 0, 0, 0]);
+    const EXT_TWO_ADICITY: usize = 30;
+
+    type ArrayLike = [[BabyBear; 8]; 3];
+    const TWO_ADIC_EXTENSION_GENERATORS: Self::ArrayLike = BabyBear::new_2d_array([
+        [0, 0, 0, 0, 1996171314, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 124907976, 0],
+        [0, 0, 0, 518392818, 0, 0, 0, 0],
+    ]);
+}
+
+impl UniformSamplingField for BabyBearParameters {
+    const MAX_SINGLE_SAMPLE_BITS: usize = 27;
+    // NOTE: We only include `0` to not have to deal with one-off indexing. `k` must be > 0.
+    // Also, we don't care about k > 30 for BabyBear.
+    const SAMPLING_BITS_M: [u64; 64] = {
+        let prime: u64 = Self::PRIME as u64;
+        let mut a = [0u64; 64];
+        let mut k = 0;
+        while k < 64 {
+            if k == 0 {
+                a[k] = prime; // This value is irrelevant in practice. `bits = 0` returns 0 always
+            } else {
+                // Create a mask to zero out the last k bits
+                let mask = !((1u64 << k) - 1);
+                a[k] = prime & mask;
+            }
+            k += 1;
+        }
+        a
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use core::array;
 
-    use p3_field::{PrimeField32, PrimeField64, TwoAdicField};
-    use p3_field_testing::{test_field, test_field_dft, test_two_adic_field};
+    use num_bigint::BigUint;
+    use p3_field::extension::BinomialExtensionField;
+    use p3_field::{Field, InjectiveMonomial, PermutationMonomial, PrimeField64, TwoAdicField};
+    use p3_field_testing::{
+        test_field, test_field_dft, test_field_dft_consistency, test_field_dft_large,
+        test_field_json_serialization, test_prime_field, test_prime_field_32, test_prime_field_64,
+        test_two_adic_field,
+    };
+    use proptest::prelude::*;
 
     use super::*;
 
     type F = BabyBear;
+    type EF = BinomialExtensionField<F, 4>;
 
     #[test]
     fn test_baby_bear_two_adicity_generators() {
-        let base = BabyBear::from_canonical_u32(0x1a427a41);
+        let base = BabyBear::from_u32(0x1a427a41);
         for bits in 0..=BabyBear::TWO_ADICITY {
             assert_eq!(
                 BabyBear::two_adic_generator(bits),
@@ -133,108 +158,138 @@ mod tests {
     }
 
     #[test]
+    fn test_baby_bear_inverse_at_gcd_extremes() {
+        // Inversion runs a binary GCD on the stored Montgomery value m = x * 2^32 mod p.
+        //
+        // It returns v = 2^60 * m^{-1} mod p, with |v| <= 2^60.
+        //
+        // The shifted value 2^30 * p + v must then lie in [0, 2^32 * p).
+        //
+        //     x = 943718400  = 2^{-32}:  m = 1    ->  v = 2^60, the top of the range
+        //     x = 1950351248:            m = 241  ->  v ~ -0.99 * 2^60, near the bottom
+        for x in [943_718_400, 1_950_351_248] {
+            let a = F::from_u32(x);
+            assert_eq!(a * a.inverse(), F::ONE);
+        }
+    }
+
+    #[test]
     fn test_to_babybear_array() {
         let range_array: [u32; 32] = array::from_fn(|i| i as u32);
         assert_eq!(
             BabyBear::new_array(range_array),
-            range_array.map(F::from_canonical_u32)
-        )
+            range_array.map(F::from_u32)
+        );
     }
 
     #[test]
     fn test_baby_bear() {
-        let f = F::from_canonical_u32(100);
+        let f = F::from_u32(100);
         assert_eq!(f.as_canonical_u64(), 100);
 
-        let f = F::from_canonical_u32(0);
-        assert!(f.is_zero());
-
-        let f = F::from_wrapped_u32(F::ORDER_U32);
-        assert!(f.is_zero());
-
         let f_1 = F::ONE;
-        let f_1_copy = F::from_canonical_u32(1);
-
-        let expected_result = F::ZERO;
-        assert_eq!(f_1 - f_1_copy, expected_result);
-
-        let expected_result = F::TWO;
-        assert_eq!(f_1 + f_1_copy, expected_result);
-
-        let f_2 = F::from_canonical_u32(2);
-        let expected_result = F::from_canonical_u32(3);
-        assert_eq!(f_1 + f_1_copy * f_2, expected_result);
-
-        let expected_result = F::from_canonical_u32(5);
-        assert_eq!(f_1 + f_2 * f_2, expected_result);
-
-        let f_p_minus_1 = F::from_canonical_u32(F::ORDER_U32 - 1);
-        let expected_result = F::ZERO;
-        assert_eq!(f_1 + f_p_minus_1, expected_result);
-
-        let f_p_minus_2 = F::from_canonical_u32(F::ORDER_U32 - 2);
-        let expected_result = F::from_canonical_u32(F::ORDER_U32 - 3);
-        assert_eq!(f_p_minus_1 + f_p_minus_2, expected_result);
-
-        let expected_result = F::from_canonical_u32(1);
-        assert_eq!(f_p_minus_1 - f_p_minus_2, expected_result);
-
-        let expected_result = f_p_minus_1;
-        assert_eq!(f_p_minus_2 - f_p_minus_1, expected_result);
-
-        let expected_result = f_p_minus_2;
-        assert_eq!(f_p_minus_1 - f_1, expected_result);
-
-        let m1 = F::from_canonical_u32(0x34167c58);
-        let m2 = F::from_canonical_u32(0x61f3207b);
-        let expected_prod = F::from_canonical_u32(0x1b5c8046);
+        let f_2 = F::TWO;
+        let f_p_minus_1 = F::NEG_ONE;
+        let f_p_minus_2 = F::NEG_ONE + F::NEG_ONE;
+        let m1 = F::from_u32(0x34167c58);
+        let m2 = F::from_u32(0x61f3207b);
+        let expected_prod = F::from_u32(0x1b5c8046);
         assert_eq!(m1 * m2, expected_prod);
 
-        assert_eq!(m1.exp_u64(1725656503).exp_const_u64::<7>(), m1);
-        assert_eq!(m2.exp_u64(1725656503).exp_const_u64::<7>(), m2);
-        assert_eq!(f_2.exp_u64(1725656503).exp_const_u64::<7>(), f_2);
+        assert_eq!(m1.injective_exp_n().injective_exp_root_n(), m1);
+        assert_eq!(m2.injective_exp_n().injective_exp_root_n(), m2);
+        assert_eq!(F::TWO.injective_exp_n().injective_exp_root_n(), F::TWO);
 
-        let f_serialized = serde_json::to_string(&f).unwrap();
-        let f_deserialized: F = serde_json::from_str(&f_serialized).unwrap();
-        assert_eq!(f, f_deserialized);
-
-        let f_1_serialized = serde_json::to_string(&f_1).unwrap();
-        let f_1_deserialized: F = serde_json::from_str(&f_1_serialized).unwrap();
-        let f_1_serialized_again = serde_json::to_string(&f_1_deserialized).unwrap();
-        let f_1_deserialized_again: F = serde_json::from_str(&f_1_serialized_again).unwrap();
-        assert_eq!(f_1, f_1_deserialized);
-        assert_eq!(f_1, f_1_deserialized_again);
-
-        let f_2_serialized = serde_json::to_string(&f_2).unwrap();
-        let f_2_deserialized: F = serde_json::from_str(&f_2_serialized).unwrap();
-        assert_eq!(f_2, f_2_deserialized);
-
-        let f_p_minus_1_serialized = serde_json::to_string(&f_p_minus_1).unwrap();
-        let f_p_minus_1_deserialized: F = serde_json::from_str(&f_p_minus_1_serialized).unwrap();
-        assert_eq!(f_p_minus_1, f_p_minus_1_deserialized);
-
-        let f_p_minus_2_serialized = serde_json::to_string(&f_p_minus_2).unwrap();
-        let f_p_minus_2_deserialized: F = serde_json::from_str(&f_p_minus_2_serialized).unwrap();
-        assert_eq!(f_p_minus_2, f_p_minus_2_deserialized);
-
-        let m1_serialized = serde_json::to_string(&m1).unwrap();
-        let m1_deserialized: F = serde_json::from_str(&m1_serialized).unwrap();
-        assert_eq!(m1, m1_deserialized);
-
-        let m2_serialized = serde_json::to_string(&m2).unwrap();
-        let m2_deserialized: F = serde_json::from_str(&m2_serialized).unwrap();
-        assert_eq!(m2, m2_deserialized);
+        test_field_json_serialization(&[f, f_1, f_2, f_p_minus_1, f_p_minus_2, m1, m2]);
     }
 
-    test_field!(crate::BabyBear);
+    proptest! {
+        /// Exercises the inherent (two-adic) `try_sqrt` which shadows
+        /// `Field::try_sqrt` for the concrete `BabyBear` type.
+        #[test]
+        fn test_baby_bear_inherent_sqrt(x in prop::num::u32::ANY.prop_map(F::from_u32)) {
+            // The square of any element is a quadratic residue, so its root
+            // always exists and squares back to the original square.
+            let square = x.square();
+            prop_assert_eq!(square.try_sqrt().map(|r| r.square()), Some(square));
+
+            // Whenever a root is reported, it must square back to `x`.
+            if let Some(r) = x.try_sqrt() {
+                prop_assert_eq!(r.square(), x);
+            }
+        }
+    }
+
+    // MontyField31's have no redundant representations.
+    const ZEROS: [BabyBear; 1] = [BabyBear::ZERO];
+    const ONES: [BabyBear; 1] = [BabyBear::ONE];
+
+    // Get the prime factorization of the order of the multiplicative group.
+    // i.e. the prime factorization of P - 1.
+    fn multiplicative_group_prime_factorization() -> [(BigUint, u32); 3] {
+        [
+            (BigUint::from(2u8), 27),
+            (BigUint::from(3u8), 1),
+            (BigUint::from(5u8), 1),
+        ]
+    }
+
+    test_field!(
+        crate::BabyBear,
+        &super::ZEROS,
+        &super::ONES,
+        &super::multiplicative_group_prime_factorization()
+    );
     test_two_adic_field!(crate::BabyBear);
 
-    test_field_dft!(radix2dit, crate::BabyBear, p3_dft::Radix2Dit<_>);
-    test_field_dft!(bowers, crate::BabyBear, p3_dft::Radix2Bowers);
-    test_field_dft!(parallel, crate::BabyBear, p3_dft::Radix2DitParallel::<_>);
+    test_field_dft!(radix2dit, crate::BabyBear, super::EF, p3_dft::Radix2Dit<_>);
+    test_field_dft!(
+        radix2smallbatch,
+        crate::BabyBear,
+        super::EF,
+        p3_dft::Radix2DFTSmallBatch<_>
+    );
+    test_field_dft!(bowers, crate::BabyBear, super::EF, p3_dft::Radix2Bowers);
+    test_field_dft!(
+        parallel,
+        crate::BabyBear,
+        super::EF,
+        p3_dft::Radix2DitParallel::<_>
+    );
     test_field_dft!(
         recur_dft,
         crate::BabyBear,
+        super::EF,
         p3_monty_31::dft::RecursiveDft<_>
     );
+    test_field_dft_consistency!(
+        radix2_smallbatch_and_ditparallel,
+        crate::BabyBear,
+        super::EF,
+        p3_dft::Radix2DFTSmallBatch<_>,
+        p3_dft::Radix2DitParallel<_>
+    );
+    test_field_dft_large!(
+        radix2smallbatch_large,
+        crate::BabyBear,
+        super::EF,
+        p3_dft::Radix2DFTSmallBatch<_>
+    );
+
+    test_field_dft_large!(
+        parallel_large,
+        crate::BabyBear,
+        super::EF,
+        p3_dft::Radix2DitParallel<_>
+    );
+
+    test_field_dft_large!(
+        recur_dft_large,
+        crate::BabyBear,
+        super::EF,
+        p3_monty_31::dft::RecursiveDft<_>
+    );
+    test_prime_field!(crate::BabyBear);
+    test_prime_field_64!(crate::BabyBear, &super::ZEROS, &super::ONES);
+    test_prime_field_32!(crate::BabyBear, &super::ZEROS, &super::ONES);
 }

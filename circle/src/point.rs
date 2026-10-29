@@ -2,7 +2,10 @@ use alloc::vec::Vec;
 use core::ops::{Add, AddAssign, Mul, Neg, Sub};
 
 use p3_field::extension::ComplexExtendable;
-use p3_field::{batch_multiplicative_inverse, ExtensionField, Field};
+use p3_field::{ExtensionField, Field, batch_multiplicative_inverse};
+use p3_maybe_rayon::prelude::*;
+
+use crate::domain::CircleDomain;
 
 /// Affine representation of a point on the circle.
 /// x^2 + y^2 == 1
@@ -17,9 +20,9 @@ pub struct Point<F> {
 
 impl<F: Field> Point<F> {
     #[inline]
-    pub fn new(x: F, y: F) -> Point<F> {
+    pub fn new(x: F, y: F) -> Self {
         debug_assert_eq!(x.square() + y.square(), F::ONE);
-        Point { x, y, _private: () }
+        Self { x, y, _private: () }
     }
 
     const ZERO: Self = Self {
@@ -59,11 +62,20 @@ impl<F: Field> Point<F> {
         Self::new(self.x.square().double() - F::ONE, self.x.double() * self.y)
     }
 
+    /// Apply the doubling map `n` times: π^n(x,y)
+    pub fn repeated_double(mut self, n: usize) -> Self {
+        for _ in 0..n {
+            self = self.double();
+        }
+        self
+    }
+
     /// Evaluate the vanishing polynomial for the standard position coset of size 2^log_n
     /// at this point
     /// Circle STARKs, Section 3.3, Equation 8 (page 10 of the first revision PDF)
     pub fn v_n(mut self, log_n: usize) -> F {
-        for _ in 0..(log_n - 1) {
+        debug_assert!(log_n >= 1, "v_n requires log_n >= 1");
+        for _ in 0..log_n.saturating_sub(1) {
             self.x = self.x.square().double() - F::ONE; // TODO: replace this by a custom field impl.
         }
         self.x
@@ -71,9 +83,12 @@ impl<F: Field> Point<F> {
 
     /// Compute a product of successive `v_n`'s.
     ///
-    /// More explicitely this computes `(1..log_n).map(|i| self.v_n(i)).product()`
+    /// More explicitly this computes `(1..log_n).map(|i| self.v_n(i)).product()`
     /// but uses far fewer `self.x.square().double() - F::ONE` steps compared to the naive implementation.
     pub fn v_n_prod(mut self, log_n: usize) -> F {
+        if log_n <= 1 {
+            return F::ONE;
+        }
         let mut output = self.x;
         for _ in 0..(log_n - 2) {
             self.x = self.x.square().double() - F::ONE; // TODO: replace this by a custom field impl.
@@ -90,9 +105,20 @@ impl<F: Field> Point<F> {
         (at - self).to_projective_line().unwrap()
     }
 
+    /// Return the numerator and denominator of the reciprocal selector `1 / v_tilde_p(self, at)`.
+    ///
+    /// More precisely, if `v_tilde_p(self, at) = denom / numer`, then its reciprocal is
+    /// `numer / denom`. This form lets callers batch-invert only `denom` values.
+    #[inline]
+    pub(crate) fn recip_v_tilde_p_num_den<EF: ExtensionField<F>>(self, at: Point<EF>) -> (EF, EF) {
+        let diff = at - self;
+        (diff.x + EF::ONE, diff.y)
+    }
+
     /// The concrete value of the selector s_P = v_n / (v_0 . T_p⁻¹) at P=self, used for normalization.
     /// Circle STARKs, Section 5.1, Remark 16 (page 22 of the first revision PDF)
     pub fn s_p_at_p(self, log_n: usize) -> F {
+        debug_assert!(log_n >= 1, "s_p_at_p requires log_n >= 1");
         -self.v_n_prod(log_n).mul_2exp_u64((2 * log_n - 1) as u64) * self.y
     }
 
@@ -106,31 +132,53 @@ impl<F: Field> Point<F> {
     }
 }
 
-/// Compute (ṽ_P(x,y) * s_p)^{-1} for each element in the list.
-/// This takes advantage of batched inversion.
-pub fn compute_lagrange_den_batched<F: Field, EF: ExtensionField<F>>(
+/// Compute Lagrange denominators for CFFT-ordered points of `domain`.
+///
+/// Let `k = domain.log_n` and let `g` generate the subgroup of order `2^(k-1)`. Then
+/// `s_p_at_p(P, k) = -2^k * (2^(k-1) P).y`, and doubling `k - 1` times sends the half-coset
+/// `shift + <g>` to `2^(k-1) shift` and the half-coset `-shift + <g>` to its negation, for any
+/// `shift`. So `s_p_at_p` equals `s_p_at_p(shift, k)` on the first half and its negation on the
+/// second, which avoids recomputing the `s_p` chain for every point.
+///
+/// `points[i]` must lie in `shift + <g>` exactly when `i` is even. CFFT ordering satisfies this;
+/// any ordering that does not yields wrong denominators.
+pub(crate) fn compute_lagrange_den_on_domain<F: ComplexExtendable, EF: ExtensionField<F>>(
     points: &[Point<F>],
     at: Point<EF>,
-    log_n: usize,
+    domain: CircleDomain<F>,
 ) -> Vec<EF> {
-    // This following line costs about 2% of the runtime for example prove_poseidon2_m31_keccak.
-    // Would be nice to find further speedups.
-    // Maybe modify to use packed fields here?
+    let n = points.len();
+    debug_assert_eq!(n, 1 << domain.log_n);
+
+    let s_p_at_shift = domain.shift.s_p_at_p(domain.log_n);
+    let s_p_at_index = |i: usize| {
+        if i & 1 == 0 {
+            s_p_at_shift
+        } else {
+            -s_p_at_shift
+        }
+    };
+    // Spot-check the parity precondition on both ends of the slice.
+    debug_assert!(
+        [0, 1, n - 2, n - 1]
+            .into_iter()
+            .all(|i| points[i].s_p_at_p(domain.log_n) == s_p_at_index(i)),
+        "points do not alternate between the half-cosets of the domain"
+    );
+
     let (numer, denom): (Vec<_>, Vec<_>) = points
-        .iter()
-        .map(|&pt| {
+        .par_iter()
+        .enumerate()
+        .map(|(i, &pt)| {
             let diff = at - pt;
-            let numer = diff.x + F::ONE;
-            let denom = diff.y * pt.s_p_at_p(log_n);
-            (numer, denom)
+            (diff.x + F::ONE, diff.y * s_p_at_index(i))
         })
         .unzip();
 
     let inv_d = batch_multiplicative_inverse(&denom);
-
     numer
-        .iter()
-        .zip(inv_d.iter())
+        .par_iter()
+        .zip(inv_d.par_iter())
         .map(|(&num, &inv_d)| num * inv_d)
         .collect()
 }
@@ -195,11 +243,17 @@ impl<F: Field> Mul<usize> for Point<F> {
 
 #[cfg(test)]
 mod tests {
+    use p3_field::PrimeCharacteristicRing;
+    use p3_field::extension::BinomialExtensionField;
     use p3_mersenne_31::Mersenne31;
+    use proptest::prelude::*;
+    use rand::rngs::SmallRng;
+    use rand::{RngExt, SeedableRng};
 
     use super::*;
 
     type F = Mersenne31;
+    type EF = BinomialExtensionField<F, 3>;
     type Pt = Point<F>;
 
     #[test]
@@ -211,9 +265,104 @@ mod tests {
         assert_eq!(one * 7, -one);
         assert_eq!(one * 8, Pt::ZERO);
 
-        let gen = Pt::generator(10);
+        let generator = Pt::generator(10);
         let log_n = 10;
-        let vn_prod_gen = (1..log_n).map(|i| gen.v_n(i)).product();
-        assert_eq!(gen.v_n_prod(log_n), vn_prod_gen);
+        let vn_prod_gen = (1..log_n).map(|i| generator.v_n(i)).product();
+        assert_eq!(generator.v_n_prod(log_n), vn_prod_gen);
+    }
+
+    #[test]
+    fn recip_v_tilde_p_num_den_matches_selector_value() {
+        let p = Pt::generator(8);
+        let at = Point::<EF>::from_projective_line(EF::from(F::new(7)));
+
+        let (numer, denom) = p.recip_v_tilde_p_num_den(at);
+        let diff = at - p;
+
+        assert_eq!(numer, diff.x + EF::ONE);
+        assert_eq!(denom, diff.y);
+        assert_eq!(p.v_tilde_p(at), diff.to_projective_line().unwrap());
+        assert_eq!(diff.to_projective_line().unwrap() * numer, denom);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "v_n requires log_n >= 1")]
+    fn test_v_n_underflow_log_n_0() {
+        let p = Pt::generator(3);
+        let _ = p.v_n(0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "s_p_at_p requires log_n >= 1")]
+    fn test_s_p_at_p_underflow_log_n_0() {
+        let p = Pt::generator(3);
+        let _ = p.s_p_at_p(0);
+    }
+
+    /// Independent reference: the pre-batched formulation, one inversion per point.
+    fn lagrange_den_scalar(points: &[Pt], at: Point<EF>, log_n: usize) -> Vec<EF> {
+        points
+            .iter()
+            .map(|&pt| {
+                let diff = at - pt;
+                let numer = diff.x + F::ONE;
+                let denom = diff.y * pt.s_p_at_p(log_n);
+                numer * denom.inverse()
+            })
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn compute_lagrange_den_on_domain_matches_scalar(
+            log_n in 1usize..11,
+            at_seed in any::<u64>(),
+        ) {
+            let domain = crate::CircleDomain::standard(log_n);
+            let points = crate::cfft_permute_slice(&domain.points().collect::<Vec<_>>());
+
+            // A pseudo-random extension point stands in for the out-of-domain query.
+            let mut rng = SmallRng::seed_from_u64(at_seed);
+            let at = Point::<EF>::from_projective_line(rng.random());
+
+            // Discard the measure-zero draws that would invert a zero denominator.
+            let all_invertible = points
+                .iter()
+                .all(|&pt| (at - pt).y * pt.s_p_at_p(log_n) != EF::ZERO);
+            prop_assume!(all_invertible);
+
+            prop_assert_eq!(
+                compute_lagrange_den_on_domain(&points, at, domain),
+                lagrange_den_scalar(&points, at, log_n)
+            );
+        }
+    }
+
+    #[test]
+    fn compute_lagrange_den_on_nonstandard_domain_matches_scalar() {
+        for log_n in 1..10 {
+            let domain = crate::CircleDomain::new(log_n, Pt::generator(log_n + 2));
+            let points = crate::cfft_permute_slice(&domain.points().collect::<Vec<_>>());
+            let at = Point::<EF>::from_projective_line(EF::from_u8(9));
+
+            assert_eq!(
+                compute_lagrange_den_on_domain(&points, at, domain),
+                lagrange_den_scalar(&points, at, log_n),
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "points do not alternate between the half-cosets of the domain")]
+    fn compute_lagrange_den_on_domain_rejects_reversed_points() {
+        let domain = crate::CircleDomain::<F>::standard(4);
+        let mut points = crate::cfft_permute_slice(&domain.points().collect::<Vec<_>>());
+        points.reverse();
+        let at = Point::<EF>::from_projective_line(EF::from_u8(9));
+
+        let _ = compute_lagrange_den_on_domain(&points, at, domain);
     }
 }

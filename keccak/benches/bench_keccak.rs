@@ -1,13 +1,16 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use p3_field::FieldAlgebra;
-use p3_keccak::{KeccakF, VECTOR_LEN};
+use core::hint::black_box;
+
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use p3_field::PrimeCharacteristicRing;
+use p3_keccak::{Keccak256Hash, KeccakF, Sha3_256Hash, VECTOR_LEN};
 use p3_mersenne_31::Mersenne31;
-use p3_symmetric::{CryptographicHasher, PaddingFreeSponge, Permutation, SerializingHasher32To64};
+use p3_symmetric::{CryptographicHasher, PaddingFreeSponge, Permutation, SerializingHasher};
 
 pub fn criterion_benchmark(c: &mut Criterion) {
     keccak_permutation(c);
     keccak_u64_hash(c);
     keccak_field_32_hash(c);
+    keccak_hash_many(c);
 }
 
 pub fn keccak_permutation(c: &mut Criterion) {
@@ -18,7 +21,7 @@ pub fn keccak_permutation(c: &mut Criterion) {
     let mut bytes: [[u64; VECTOR_LEN]; 25] = unsafe { core::mem::zeroed() };
     group.throughput(Throughput::Bytes(BYTES_PER_PERM as u64));
     group.bench_function("keccak permutation [[u64; VECTOR_LEN]; 25]", |b| {
-        b.iter(|| KeccakF.permute_mut(black_box(&mut bytes)))
+        b.iter(|| KeccakF.permute_mut(black_box(&mut bytes)));
     });
     group.finish();
 }
@@ -34,10 +37,10 @@ pub fn keccak_u64_hash(c: &mut Criterion) {
     let mut group = c.benchmark_group("keccak u64 hash");
     group.throughput(Throughput::Bytes(BYTES_PER_HASH as u64));
     group.bench_function("keccak u64 hash_slice", |b| {
-        b.iter(|| u64_hash.hash_slice(black_box(&input)))
+        b.iter(|| u64_hash.hash_slice(black_box(&input)));
     });
     group.bench_function("keccak u64 hash_iter", |b| {
-        b.iter(|| u64_hash.hash_iter(black_box(input.iter().copied())))
+        b.iter(|| u64_hash.hash_iter(black_box(input.iter().copied())));
     });
     group.finish();
 }
@@ -51,7 +54,7 @@ pub fn keccak_field_32_hash(c: &mut Criterion) {
 
     type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
     let u64_hash = U64Hash::new(KeccakF {});
-    type FieldHash = SerializingHasher32To64<U64Hash>;
+    type FieldHash = SerializingHasher<U64Hash>;
     let field_hash = FieldHash::new(u64_hash);
 
     let mut group = c.benchmark_group("keccak field 32 hash");
@@ -62,7 +65,7 @@ pub fn keccak_field_32_hash(c: &mut Criterion) {
                 &field_hash,
                 black_box(&input),
             )
-        })
+        });
     });
     group.bench_function("keccak field 32 hash_iter", |b| {
         b.iter(|| {
@@ -70,8 +73,29 @@ pub fn keccak_field_32_hash(c: &mut Criterion) {
                 &field_hash,
                 black_box(input.iter().copied()),
             )
-        })
+        });
     });
+    group.finish();
+}
+
+pub fn keccak_hash_many(c: &mut Criterion) {
+    /// Bytes per batch, so every length does the same amount of absorbing.
+    const BATCH_BYTES: usize = 1 << 22;
+
+    let mut group = c.benchmark_group("keccak hash_many");
+    for len in [64, 540, 1024, 64 * 1024] {
+        let messages = BATCH_BYTES / len;
+        let input: Vec<u8> = (0..messages * len).map(|i| i as u8).collect();
+        let mut out = vec![[0u8; 32]; messages];
+
+        group.throughput(Throughput::Bytes((messages * len) as u64));
+        group.bench_function(format!("keccak-256 {len}-byte messages"), |b| {
+            b.iter(|| Keccak256Hash.hash_many(black_box(&input), black_box(&mut out)));
+        });
+        group.bench_function(format!("sha3-256 {len}-byte messages"), |b| {
+            b.iter(|| Sha3_256Hash.hash_many(black_box(&input), black_box(&mut out)));
+        });
+    }
     group.finish();
 }
 

@@ -1,34 +1,40 @@
-use std::fmt::Debug;
+#![allow(
+    deprecated,
+    reason = "Keep the p3-poseidon2-air example working until the crate is removed."
+)]
 
-use p3_baby_bear::{BabyBear, GenericPoseidon2LinearLayersBabyBear};
+use p3_baby_bear::{
+    BABYBEAR_POSEIDON2_HALF_FULL_ROUNDS, BABYBEAR_POSEIDON2_PARTIAL_ROUNDS_16,
+    BABYBEAR_S_BOX_DEGREE, BabyBear, GenericPoseidon2LinearLayersBabyBear,
+};
 use p3_challenger::{HashChallenger, SerializingChallenger32};
 use p3_commit::ExtensionMmcs;
 use p3_field::extension::BinomialExtensionField;
-use p3_fri::{FriConfig, HidingFriPcs};
+use p3_fri::{FriParameters, HidingFriPcs};
 use p3_keccak::{Keccak256Hash, KeccakF};
 use p3_merkle_tree::MerkleTreeHidingMmcs;
-use p3_poseidon2_air::{generate_vectorized_trace_rows, RoundConstants, VectorizedPoseidon2Air};
-use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher32To64};
-use p3_uni_stark::{prove, verify, StarkConfig};
-use rand::rngs::{StdRng, ThreadRng};
-use rand::{random, thread_rng, SeedableRng};
-#[cfg(not(target_env = "msvc"))]
+use p3_poseidon2_air::{RoundConstants, VectorizedPoseidon2Air};
+use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher};
+use p3_uni_stark::{StarkConfig, prove, verify};
+use rand::SeedableRng;
+use rand::rngs::{SmallRng, StdRng};
+#[cfg(target_family = "unix")]
 use tikv_jemallocator::Jemalloc;
-use tracing_forest::util::LevelFilter;
 use tracing_forest::ForestLayer;
+use tracing_forest::util::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(target_family = "unix")]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
 const WIDTH: usize = 16;
-const SBOX_DEGREE: u64 = 7;
+const SBOX_DEGREE: u64 = BABYBEAR_S_BOX_DEGREE;
 const SBOX_REGISTERS: usize = 1;
-const HALF_FULL_ROUNDS: usize = 4;
-const PARTIAL_ROUNDS: usize = 20;
+const HALF_FULL_ROUNDS: usize = BABYBEAR_POSEIDON2_HALF_FULL_ROUNDS;
+const PARTIAL_ROUNDS: usize = BABYBEAR_POSEIDON2_PARTIAL_ROUNDS_16;
 
 const NUM_ROWS: usize = 1 << 16;
 const VECTOR_LEN: usize = 1 << 3;
@@ -36,7 +42,7 @@ const NUM_PERMUTATIONS: usize = NUM_ROWS * VECTOR_LEN;
 
 type Dft = p3_dft::Radix2DitParallel<BabyBear>;
 
-fn main() -> Result<(), impl Debug> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
@@ -55,7 +61,7 @@ fn main() -> Result<(), impl Debug> {
     type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
     let u64_hash = U64Hash::new(KeccakF {});
 
-    type FieldHash = SerializingHasher32To64<U64Hash>;
+    type FieldHash = SerializingHasher<U64Hash>;
     let field_hash = FieldHash::new(u64_hash);
 
     type MyCompress = CompressionFunctionFromHasher<U64Hash, 2, 4>;
@@ -66,29 +72,20 @@ fn main() -> Result<(), impl Debug> {
         [u64; p3_keccak::VECTOR_LEN],
         FieldHash,
         MyCompress,
-        ThreadRng,
+        StdRng,
+        2,
         4,
         4,
     >;
-    let val_mmcs = ValMmcs::new(field_hash, compress, thread_rng());
+    let mut rng = SmallRng::seed_from_u64(1);
+    let constants = RoundConstants::from_rng(&mut rng);
+    let val_mmcs = ValMmcs::new(field_hash, compress, 0, StdRng::seed_from_u64(1));
 
     type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
 
     type Challenger = SerializingChallenger32<Val, HashChallenger<u8, ByteHash, 32>>;
-
-    let constants = RoundConstants::from_rng(&mut thread_rng());
-    let inputs = (0..NUM_PERMUTATIONS).map(|_| random()).collect::<Vec<_>>();
-    let trace = generate_vectorized_trace_rows::<
-        Val,
-        GenericPoseidon2LinearLayersBabyBear,
-        WIDTH,
-        SBOX_DEGREE,
-        SBOX_REGISTERS,
-        HALF_FULL_ROUNDS,
-        PARTIAL_ROUNDS,
-        VECTOR_LEN,
-    >(inputs, &constants);
+    let challenger = Challenger::from_hasher(vec![], byte_hash);
 
     let air: VectorizedPoseidon2Air<
         Val,
@@ -101,23 +98,19 @@ fn main() -> Result<(), impl Debug> {
         VECTOR_LEN,
     > = VectorizedPoseidon2Air::new(constants);
 
+    let fri_params = FriParameters::new_benchmark_zk(challenge_mmcs);
+
+    let trace = air.generate_vectorized_trace_rows(NUM_PERMUTATIONS, fri_params.log_blowup);
+
     let dft = Dft::default();
 
-    let fri_config = FriConfig {
-        log_blowup: 1,
-        num_queries: 100,
-        proof_of_work_bits: 16,
-        mmcs: challenge_mmcs,
-    };
     type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, StdRng>;
-    let pcs = Pcs::new(dft, val_mmcs, fri_config, 4, StdRng::from_entropy());
+    let pcs = Pcs::new(dft, val_mmcs, fri_params, 4, StdRng::seed_from_u64(2));
 
     type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
-    let config = MyConfig::new(pcs);
+    let config = MyConfig::new(pcs, challenger);
 
-    let mut challenger = Challenger::from_hasher(vec![], byte_hash);
-    let proof = prove(&config, &air, &mut challenger, trace, &vec![]);
+    let proof = prove(&config, &air, trace, &[])?;
 
-    let mut challenger = Challenger::from_hasher(vec![], byte_hash);
-    verify(&config, &air, &mut challenger, &proof, &vec![])
+    verify(&config, &air, &proof, &[]).map_err(Into::into)
 }

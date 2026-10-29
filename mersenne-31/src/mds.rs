@@ -6,10 +6,10 @@
 //! work by Angus Gruen and Hamish Ivey-Law. Other sizes are from Ulrich Haböck's
 //! database.
 
-use p3_field::FieldAlgebra;
+use p3_field::PrimeCharacteristicRing;
+use p3_mds::MdsPermutation;
 use p3_mds::karatsuba_convolution::Convolve;
 use p3_mds::util::{dot_product, first_row_to_first_col};
-use p3_mds::MdsPermutation;
 use p3_symmetric::Permutation;
 
 use crate::Mersenne31;
@@ -22,7 +22,15 @@ pub struct MdsMatrixMersenne31;
 /// Here "small" means N = len(rhs) <= 16 and sum(r for r in rhs) <
 /// 2^24 (roughly), though in practice the sum will be less than 2^9.
 struct SmallConvolveMersenne31;
-impl Convolve<Mersenne31, i64, i64, i64> for SmallConvolveMersenne31 {
+impl Convolve<Mersenne31, i64, i64> for SmallConvolveMersenne31 {
+    const T_ZERO: i64 = 0;
+    const U_ZERO: i64 = 0;
+
+    #[inline(always)]
+    fn halve(val: i64) -> i64 {
+        val >> 1
+    }
+
     /// Return the lift of an (almost) reduced Mersenne31 element.
     /// The Mersenne31 implementation guarantees that
     /// 0 <= input.value <= P < 2^31.
@@ -31,7 +39,6 @@ impl Convolve<Mersenne31, i64, i64, i64> for SmallConvolveMersenne31 {
         input.value as i64
     }
 
-    /// FIXME: Refactor the dot product
     /// For a convolution of size N, |x| < N * 2^31 and (as per the
     /// assumption above), |y| < 2^24. So the product is at most N * 2^55
     /// which will not overflow for N <= 16.
@@ -49,7 +56,7 @@ impl Convolve<Mersenne31, i64, i64, i64> for SmallConvolveMersenne31 {
     #[inline(always)]
     fn reduce(z: i64) -> Mersenne31 {
         debug_assert!(z >= 0);
-        Mersenne31::from_wrapped_u64(z as u64)
+        Mersenne31::from_u64(z as u64)
     }
 }
 
@@ -58,7 +65,15 @@ impl Convolve<Mersenne31, i64, i64, i64> for SmallConvolveMersenne31 {
 /// Here "large" means the elements can be as big as the field
 /// characteristic, and the size N of the RHS is <= 64.
 struct LargeConvolveMersenne31;
-impl Convolve<Mersenne31, i64, i64, i64> for LargeConvolveMersenne31 {
+impl Convolve<Mersenne31, i64, i64> for LargeConvolveMersenne31 {
+    const T_ZERO: i64 = 0;
+    const U_ZERO: i64 = 0;
+
+    #[inline(always)]
+    fn halve(val: i64) -> i64 {
+        val >> 1
+    }
+
     /// Return the lift of an (almost) reduced Mersenne31 element.
     /// The Mersenne31 implementation guarantees that
     /// 0 <= input.value <= P < 2^31.
@@ -125,12 +140,21 @@ impl Convolve<Mersenne31, i64, i64, i64> for LargeConvolveMersenne31 {
         const MASK: i64 = (1 << 31) - 1;
         // Morally, our value is a i62 not a i64 as the top 3 bits are
         // guaranteed to be equal.
-        let low_bits = Mersenne31::from_canonical_u32((z & MASK) as u32);
+        //
+        // The masked value can equal 2^31 - 1 (the non-canonical representation of zero).
+        //
+        // So the constructor must accept it.
+        let low_bits = Mersenne31::new_reduced((z & MASK) as u32);
+
         let high_bits = ((z >> 31) & MASK) as i32;
         let sign_bits = (z >> 62) as i32;
 
-        // Note that high_bits + sign_bits > 0 as by assumption b[63] = b[61].
-        let high = Mersenne31::from_canonical_u32((high_bits + sign_bits) as u32);
+        // The sum lies in [0, 2^31 - 1].
+        //
+        // A negative `z` forces the upper-bit chunk to be at least 1.
+        //
+        // So the sign correction of -1 cannot drag the sum below zero.
+        let high = Mersenne31::new_reduced((high_bits + sign_bits) as u32);
         low_bits + high
     }
 }
@@ -147,10 +171,6 @@ impl Permutation<[Mersenne31; 8]> for MdsMatrixMersenne31 {
             SmallConvolveMersenne31::conv8,
         )
     }
-
-    fn permute_mut(&self, input: &mut [Mersenne31; 8]) {
-        *input = self.permute(*input);
-    }
 }
 impl MdsPermutation<Mersenne31, 8> for MdsMatrixMersenne31 {}
 
@@ -166,14 +186,10 @@ impl Permutation<[Mersenne31; 12]> for MdsMatrixMersenne31 {
             SmallConvolveMersenne31::conv12,
         )
     }
-
-    fn permute_mut(&self, input: &mut [Mersenne31; 12]) {
-        *input = self.permute(*input);
-    }
 }
 impl MdsPermutation<Mersenne31, 12> for MdsMatrixMersenne31 {}
 
-const MATRIX_CIRC_MDS_16_SML_ROW: [i64; 16] =
+pub(crate) const MATRIX_CIRC_MDS_16_SML_ROW: [i64; 16] =
     [1, 1, 51, 1, 11, 17, 2, 1, 101, 63, 15, 2, 67, 22, 13, 3];
 
 impl Permutation<[Mersenne31; 16]> for MdsMatrixMersenne31 {
@@ -186,15 +202,11 @@ impl Permutation<[Mersenne31; 16]> for MdsMatrixMersenne31 {
             SmallConvolveMersenne31::conv16,
         )
     }
-
-    fn permute_mut(&self, input: &mut [Mersenne31; 16]) {
-        *input = self.permute(*input);
-    }
 }
 impl MdsPermutation<Mersenne31, 16> for MdsMatrixMersenne31 {}
 
 #[rustfmt::skip]
-const MATRIX_CIRC_MDS_32_MERSENNE31_ROW: [i64; 32] = [
+pub(crate) const MATRIX_CIRC_MDS_32_MERSENNE31_ROW: [i64; 32] = [
     0x1896DC78, 0x559D1E29, 0x04EBD732, 0x3FF449D7,
     0x2DB0E2CE, 0x26776B85, 0x76018E57, 0x1025FA13,
     0x06486BAB, 0x37706EBA, 0x25EB966B, 0x113C24E5,
@@ -214,10 +226,6 @@ impl Permutation<[Mersenne31; 32]> for MdsMatrixMersenne31 {
             MATRIX_CIRC_MDS_32_MERSENNE31_COL,
             LargeConvolveMersenne31::conv32,
         )
-    }
-
-    fn permute_mut(&self, input: &mut [Mersenne31; 32]) {
-        *input = self.permute(*input);
     }
 }
 impl MdsPermutation<Mersenne31, 32> for MdsMatrixMersenne31 {}
@@ -252,107 +260,120 @@ impl Permutation<[Mersenne31; 64]> for MdsMatrixMersenne31 {
             LargeConvolveMersenne31::conv64,
         )
     }
-
-    fn permute_mut(&self, input: &mut [Mersenne31; 64]) {
-        *input = self.permute(*input);
-    }
 }
 impl MdsPermutation<Mersenne31, 64> for MdsMatrixMersenne31 {}
 
 #[cfg(test)]
 mod tests {
-    use p3_field::FieldAlgebra;
+    use p3_field::PrimeCharacteristicRing;
+    use p3_mds::karatsuba_convolution::Convolve;
     use p3_symmetric::Permutation;
 
-    use super::{MdsMatrixMersenne31, Mersenne31};
+    use super::{LargeConvolveMersenne31, MdsMatrixMersenne31, Mersenne31};
+
+    #[test]
+    fn large_convolve_reduce_accepts_p_representation() {
+        // Invariant: the reducer accepts inputs whose low 31 bits are all ones.
+        //
+        // Reason: 2^31 - 1 is the non-canonical representation of zero.
+
+        // Fixture state:
+        //
+        //     P     = 2^31 - 1
+        //     z_neg = -1     (bit pattern: all 64 bits set)
+        //     z_pos =  P     (bit pattern: low 31 bits set, rest zero)
+        //
+        // Masking either value by `(1 << 31) - 1` produces P, the edge case under test.
+
+        // Case 1: z = -1  →  -1 ≡ P - 1   (mod P).
+        let got = LargeConvolveMersenne31::reduce(-1);
+        let expected = Mersenne31::ZERO - Mersenne31::ONE;
+        assert_eq!(got, expected);
+
+        // Case 2: z = P   →   P ≡ 0   (mod P).
+        let got = LargeConvolveMersenne31::reduce((1i64 << 31) - 1);
+        assert_eq!(got, Mersenne31::ZERO);
+    }
 
     #[test]
     fn mersenne8() {
-        let input: [Mersenne31; 8] = [
+        let input: [Mersenne31; 8] = Mersenne31::new_array([
             1741044457, 327154658, 318297696, 1528828225, 468360260, 1271368222, 1906288587,
             1521884224,
-        ]
-        .map(Mersenne31::from_canonical_u64);
+        ]);
 
         let output = MdsMatrixMersenne31.permute(input);
 
-        let expected: [Mersenne31; 8] = [
+        let expected: [Mersenne31; 8] = Mersenne31::new_array([
             895992680, 1343855369, 2107796831, 266468728, 846686506, 252887121, 205223309,
             260248790,
-        ]
-        .map(Mersenne31::from_canonical_u64);
+        ]);
 
         assert_eq!(output, expected);
     }
 
     #[test]
     fn mersenne12() {
-        let input: [Mersenne31; 12] = [
+        let input: [Mersenne31; 12] = Mersenne31::new_array([
             1232740094, 661555540, 11024822, 1620264994, 471137070, 276755041, 1316882747,
             1023679816, 1675266989, 743211887, 44774582, 1990989306,
-        ]
-        .map(Mersenne31::from_canonical_u64);
+        ]);
 
         let output = MdsMatrixMersenne31.permute(input);
 
-        let expected: [Mersenne31; 12] = [
+        let expected: [Mersenne31; 12] = Mersenne31::new_array([
             860812289, 399778981, 1228500858, 798196553, 673507779, 1116345060, 829764188,
             138346433, 578243475, 553581995, 578183208, 1527769050,
-        ]
-        .map(Mersenne31::from_canonical_u64);
+        ]);
 
         assert_eq!(output, expected);
     }
 
     #[test]
     fn mersenne16() {
-        let input: [Mersenne31; 16] = [
+        let input: [Mersenne31; 16] = Mersenne31::new_array([
             1431168444, 963811518, 88067321, 381314132, 908628282, 1260098295, 980207659,
             150070493, 357706876, 2014609375, 387876458, 1621671571, 183146044, 107201572,
             166536524, 2078440788,
-        ]
-        .map(Mersenne31::from_canonical_u64);
+        ]);
 
         let output = MdsMatrixMersenne31.permute(input);
 
-        let expected: [Mersenne31; 16] = [
+        let expected: [Mersenne31; 16] = Mersenne31::new_array([
             1858869691, 1607793806, 1200396641, 1400502985, 1511630695, 187938132, 1332411488,
             2041577083, 2014246632, 802022141, 796807132, 1647212930, 813167618, 1867105010,
             508596277, 1457551581,
-        ]
-        .map(Mersenne31::from_canonical_u64);
+        ]);
 
         assert_eq!(output, expected);
     }
 
     #[test]
     fn mersenne32() {
-        let input: [Mersenne31; 32] = [
+        let input: [Mersenne31; 32] = Mersenne31::new_array([
             873912014, 1112497426, 300405095, 4255553, 1234979949, 156402357, 1952135954,
             718195399, 1041748465, 683604342, 184275751, 1184118518, 214257054, 1293941921,
             64085758, 710448062, 1133100009, 350114887, 1091675272, 671421879, 1226105999,
             546430131, 1298443967, 1787169653, 2129310791, 1560307302, 471771931, 1191484402,
             1550203198, 1541319048, 229197040, 839673789,
-        ]
-        .map(Mersenne31::from_canonical_u64);
+        ]);
 
         let output = MdsMatrixMersenne31.permute(input);
 
-        let expected: [Mersenne31; 32] = [
+        let expected: [Mersenne31; 32] = Mersenne31::new_array([
             1439049928, 890642852, 694402307, 713403244, 553213342, 1049445650, 321709533,
             1195683415, 2118492257, 623077773, 96734062, 990488164, 1674607608, 749155000,
             353377854, 966432998, 1114654884, 1370359248, 1624965859, 685087760, 1631836645,
             1615931812, 2061986317, 1773551151, 1449911206, 1951762557, 545742785, 582866449,
             1379774336, 229242759, 1871227547, 752848413,
-        ]
-        .map(Mersenne31::from_canonical_u64);
+        ]);
 
         assert_eq!(output, expected);
     }
 
     #[test]
     fn mersenne64() {
-        let input: [Mersenne31; 64] = [
+        let input: [Mersenne31; 64] = Mersenne31::new_array([
             837269696, 1509031194, 413915480, 1889329185, 315502822, 1529162228, 1454661012,
             1015826742, 973381409, 1414676304, 1449029961, 1968715566, 2027226497, 1721820509,
             434042616, 1436005045, 1680352863, 651591867, 260585272, 1078022153, 703990572,
@@ -363,12 +384,11 @@ mod tests {
             608714758, 1553060084, 1558941605, 980281686, 2014426559, 650527801, 53015148,
             1521176057, 720530872, 713593252, 88228433, 1194162313, 1922416934, 1075145779,
             344403794,
-        ]
-        .map(Mersenne31::from_canonical_u64);
+        ]);
 
         let output = MdsMatrixMersenne31.permute(input);
 
-        let expected: [Mersenne31; 64] = [
+        let expected: [Mersenne31; 64] = Mersenne31::new_array([
             1599981950, 252630853, 1171557270, 116468420, 1269245345, 666203050, 46155642,
             1701131520, 530845775, 508460407, 630407239, 1731628135, 1199144768, 295132047,
             77536342, 1472377703, 30752443, 1300339617, 18647556, 1267774380, 1194573079,
@@ -379,8 +399,7 @@ mod tests {
             968523062, 1958918704, 1866282698, 849808680, 1193306222, 794153281, 822835360,
             135282913, 1149868448, 2068162123, 1474283743, 2039088058, 720305835, 746036736,
             671006610,
-        ]
-        .map(Mersenne31::from_canonical_u64);
+        ]);
 
         assert_eq!(output, expected);
     }

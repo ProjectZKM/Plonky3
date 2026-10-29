@@ -1,0 +1,4093 @@
+//! AIR zerocheck: prove the alpha-batched constraint vanishes on every trace row.
+//!
+//! Evaluating the alpha-batched constraint on each of the `2^k` trace rows yields a multilinear polynomial `g`.
+//! Vanishing on every row is equivalent, for a random point `tau`, to a single sum being zero:
+//!
+//! ```text
+//!     sum_x eq(tau, x) * g(x) = 0
+//! ```
+//!
+//! The generic-degree sumcheck proves that sum.
+//! A zerocheck always claims zero, so the verifier rejects any proof that claims a different sum.
+
+#[cfg(test)]
+pub(crate) mod backend_tests;
+#[cfg(test)]
+mod prime_transcript_tests;
+pub mod transcript;
+
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::iter;
+
+use hashbrown::HashSet;
+use p3_air::symbolic::{BaseEntry, BaseLeaf, ExtLeaf, SymbolicExpr};
+use p3_air::{Air, AirLayout, BaseAir};
+use p3_bus::{BusArgumentError, BusReductionOutput};
+use p3_challenger::fs::TranscriptField;
+use p3_challenger::{FieldChallenger, GrindingChallenger};
+use p3_field::{ExtensionField, Field};
+use p3_lookup::InteractionSymbolicBuilder as SymbolicAirBuilder;
+use p3_multilinear_util::point::Point;
+use p3_multilinear_util::poly::Poly;
+use p3_sumcheck::generic_degree::{
+    GenericDegreeError, GenericDegreeProof, GenericDegreeShape, ProverTranscript,
+    RoundPolyInterpolator, RoundProver,
+};
+use p3_sumcheck::layout::Table;
+use thiserror::Error;
+
+use crate::backend::{GenericBackend, ZerocheckBackend};
+use crate::bus::composition::BusCompositionProver;
+use crate::bus::{BusBindingError, BusContext};
+use crate::config::DEFAULT_SLICED_ROUNDS;
+use crate::folder::{
+    InteractionMultilinearFolder, MultilinearFolder, ProverAir, VerifierAir, boundary_io_pins,
+};
+use crate::lookup::{ActiveLookupRuntime, AirLinkClaim, LookupRuntime};
+use crate::opening::{OpeningClaims, TableOpening};
+use crate::rounds::{AirDegrees, AirOpenings, AirProfile, RoundStateBase, Stage, StageCoupling};
+use crate::selectors::{
+    BoundaryEvals, PeriodicError, air_periodic_evals_at, periodic_num_variables,
+};
+use crate::zerocheck::transcript::{
+    ZerocheckChallenges, ZerocheckProverTranscript, ZerocheckShape, ZerocheckVerifierTranscript,
+};
+
+/// Reasons the zerocheck verifier rejects a proof.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ZerocheckError {
+    /// The inner sumcheck transcript failed to verify.
+    #[error("zerocheck sumcheck: {0}")]
+    Sumcheck(GenericDegreeError),
+    /// The proof claimed a nonzero sum, but a zerocheck always sums to zero.
+    #[error("zerocheck claimed sum is nonzero")]
+    NonZeroClaimedSum,
+    /// The product-tree output cannot be batched into the bus claim.
+    #[error("zerocheck bus claim: {0}")]
+    BusClaim(BusArgumentError),
+    /// The bus family cannot be rebuilt from the committed openings.
+    #[error("zerocheck bus binding: {0}")]
+    BusBinding(BusBindingError),
+    /// The sumcheck claim does not match the lookup-derived AIR-link claim.
+    #[error("AIR sumcheck claimed sum does not match the lookup link")]
+    ClaimedSumMismatch,
+    /// The current-row openings did not carry exactly one value per main column.
+    #[error("zerocheck current-row opening count mismatch: expected {expected}, got {actual}")]
+    OpeningCountMismatch {
+        /// Number of main columns the AIR declares.
+        expected: usize,
+        /// Number of current-row values the proof carries.
+        actual: usize,
+    },
+    /// The next-row openings did not carry exactly one value per next-row column.
+    #[error("zerocheck next-row opening count mismatch: expected {expected}, got {actual}")]
+    NextOpeningCountMismatch {
+        /// Number of columns the AIR reads on the next row.
+        expected: usize,
+        /// Number of next-row values the proof carries.
+        actual: usize,
+    },
+    /// The preprocessed current-row openings did not carry one value per preprocessed column.
+    #[error(
+        "zerocheck preprocessed current-row opening count mismatch: expected {expected}, got {actual}"
+    )]
+    PreprocessedOpeningCountMismatch {
+        /// Number of preprocessed columns the AIR declares.
+        expected: usize,
+        /// Number of preprocessed current-row values the proof carries.
+        actual: usize,
+    },
+    /// The preprocessed next-row openings did not carry one value per preprocessed next-row column.
+    #[error(
+        "zerocheck preprocessed next-row opening count mismatch: expected {expected}, got {actual}"
+    )]
+    PreprocessedNextOpeningCountMismatch {
+        /// Number of preprocessed columns the AIR reads on the next row.
+        expected: usize,
+        /// Number of preprocessed next-row values the proof carries.
+        actual: usize,
+    },
+    /// An AIR's periodic column declaration does not fit its trace.
+    #[error("zerocheck periodic column: {0}")]
+    Periodic(#[from] PeriodicError),
+    /// An AIR declares lookups but the reduction supplies no link for it, or the reverse.
+    ///
+    /// Folding either half without the other would drop the lookup argument silently.
+    #[error("zerocheck AIR {air} lookup declarations and lookup link disagree")]
+    LookupLinkMismatch {
+        /// Position of the offending AIR in caller order.
+        air: usize,
+    },
+    /// The reduced sum did not match the constraint evaluated at the random point.
+    #[error("zerocheck final sum does not match the constraint at the challenge point")]
+    FinalSumMismatch,
+    /// Every lookup payload and count of an AIR is constant.
+    ///
+    /// Such a family has no round polynomial of its own to send.
+    #[error("zerocheck AIR {air} declares only constant lookup tuples")]
+    ConstantInteractions {
+        /// Position of the offending AIR in caller order.
+        air: usize,
+    },
+}
+
+/// Opening claims and the sumcheck transcript produced by the zerocheck prover.
+#[derive(Clone, Debug)]
+pub struct ZerocheckProof<F, EF> {
+    /// Generic-degree sumcheck transcript for `sum_x eq(tau, x) * g(x) = 0`.
+    pub sumcheck: GenericDegreeProof<F, EF>,
+    /// Current-row values at the sumcheck point, grouped by input AIR order.
+    ///
+    /// Each group holds one value per main column of its AIR.
+    pub local: Vec<Vec<EF>>,
+    /// Repeat-last successor values at the sumcheck point, grouped by input AIR order.
+    ///
+    /// Each group holds one value per main column its AIR reads on the next row.
+    pub next: Vec<Vec<EF>>,
+    /// Current-row preprocessed values at the sumcheck point, grouped by input AIR order.
+    pub preprocessed_local: Vec<Vec<EF>>,
+    /// Repeat-last preprocessed successor values, grouped by input AIR order.
+    pub preprocessed_next: Vec<Vec<EF>>,
+}
+
+/// The binary-bus family one zerocheck run folds into its sumcheck.
+///
+/// The product-tree reduction left one terminal claim per direction.
+/// Its row compositions share the AIR sumcheck, weighted apart by one fresh challenge.
+///
+/// ```text
+///     claim = eta * lookup + lambda * (push + lambda * pull)
+/// ```
+#[derive(Clone, Copy)]
+pub(crate) struct BusFamily<'a, F: Field, EF: ExtensionField<F>> {
+    /// Checked declarations and the physical layout of every bus share.
+    pub(crate) context: &'a BusContext<F, EF>,
+    /// Terminal claims and challenges the product-tree reduction left.
+    pub(crate) output: &'a BusReductionOutput<EF>,
+}
+
+/// A batched AIR zerocheck instance.
+///
+/// Bundles the AIRs and the grinding parameter shared by the prover and verifier.
+/// The field and transcript are chosen per call, so one instance serves any field.
+#[derive(Debug)]
+pub struct AirZerocheck<'a, A> {
+    /// AIRs whose alpha-batched constraints are checked.
+    airs: &'a [&'a A],
+    /// Setup-time AIR metadata, absent for standalone reductions.
+    profiles: Option<&'a [AirProfile]>,
+    /// Grinding difficulty per sumcheck round, or `0` to skip.
+    pow_bits: usize,
+}
+
+/// Native per-variable degrees of one AIR's ordinary constraints and lookup links.
+///
+/// See [`get_air_profile`], which also counts the batched constraints.
+pub(crate) fn get_air_degrees<F, EF, A>(air: &A) -> AirDegrees
+where
+    F: Field,
+    EF: ExtensionField<F>,
+    A: Air<SymbolicAirBuilder<F, EF>>,
+{
+    get_air_profile::<F, EF, A>(air).degrees
+}
+
+/// Native per-variable degrees of one AIR's ordinary constraints and lookup links,
+/// the number of constraints the folder batches, and which lookup families the AIR declares.
+///
+/// Both families come from one symbolic pass and are measured with the eq weight stripped.
+/// A degree of zero means the AIR declares nothing in that family.
+///
+/// Every expression is scored at domain size two, where a column and a boundary selector
+/// each count as degree one.
+/// A materialized periodic column is multilinear, so it scores the same as a trace column.
+/// The symbolic value is therefore exact rather than an upper bound.
+///
+/// An AIR may instead hint its own constraint degree, which must be at least the true one:
+///
+/// ```text
+///     hint too small -> round polynomials lose evaluations -> soundness broken
+///     hint too large -> larger proof and more per-row work, nothing else
+/// ```
+///
+/// The symbolic degree is a lower bound even when the AIR supplies a smaller hint.
+///
+/// A hint never covers the public boundary pins the folder injects:
+///
+/// ```text
+///     hint -> the AIR's own constraints
+///     pins -> one per cell the AIR lists as a public input, scored separately
+/// ```
+///
+/// A hinted degree of one therefore still yields two once an AIR lists a cell.
+///
+/// # Panics
+///
+/// Panics if the AIR declares mutually-exclusive interactions.
+/// Panics if a declared family is constant and no listed cell lifts it,
+/// since a constant has no round polynomial of its own.
+/// Panics if the AIR declares neither constraints nor lookup interactions.
+pub(crate) fn get_air_profile<F, EF, A>(air: &A) -> AirProfile
+where
+    F: Field,
+    EF: ExtensionField<F>,
+    A: Air<SymbolicAirBuilder<F, EF>>,
+{
+    // One pass yields the constraints and the interactions together.
+    let layout = AirLayout::from_air::<F>(air);
+    let builder = SymbolicAirBuilder::<F, EF>::from_air(air, layout);
+    get_air_profile_from_builder(air, &builder)
+}
+
+/// Score constraints and lookup links from an AIR's existing symbolic evaluation.
+///
+/// Applies the same validation and degree hints as [`get_air_profile`].
+pub(crate) fn get_air_profile_from_builder<F, EF, A>(
+    air: &A,
+    builder: &SymbolicAirBuilder<F, EF>,
+) -> AirProfile
+where
+    F: Field,
+    EF: ExtensionField<F>,
+    A: BaseAir<F>,
+{
+    assert!(
+        builder.exclusive_interactions().is_empty(),
+        "multi-STARK zerocheck does not support exclusive lookup interactions"
+    );
+
+    let base_constraints = builder.base_constraints();
+    let extension_constraints = builder.extension_constraints();
+    validate_successor_columns(air, builder, &base_constraints, &extension_constraints);
+    let has_own_constraints = !base_constraints.is_empty() || !extension_constraints.is_empty();
+    let pins = boundary_io_pins(air.public_boundary_io());
+    let has_constraints = has_own_constraints || pins.count > 0;
+    let symbolic_constraint_degree = base_constraints
+        .iter()
+        .map(|expression| expression.poly_degree(2, &[]))
+        .chain(
+            extension_constraints
+                .iter()
+                .map(|expression| expression.poly_degree(2, &[])),
+        )
+        .max()
+        .unwrap_or(0);
+    let own_constraint_degree = if has_own_constraints {
+        air.max_constraint_degree()
+            .map_or(symbolic_constraint_degree, |degree| {
+                degree.max(symbolic_constraint_degree)
+            })
+    } else {
+        0
+    };
+
+    // Neither source above sees the pins.
+    // Score them here so the round polynomials carry enough evaluations for both groups.
+    let constraint_degree = own_constraint_degree.max(pins.degree);
+
+    // The lookup family is scored apart from the constraints, with its own degree.
+    let interactions = builder.interaction_degree();
+    let has_interactions = interactions.is_some();
+    let interaction_degree = interactions.unwrap_or(0);
+
+    assert!(
+        !has_constraints || constraint_degree > 0,
+        "zerocheck requires every nonempty constraint family to have positive symbolic degree"
+    );
+    assert!(
+        !has_interactions || interaction_degree > 0,
+        "zerocheck requires every nonempty interaction family to have positive symbolic degree"
+    );
+    // A bus declaration is reduced outside the zerocheck and leaves no round polynomial here.
+    // An AIR carried by one alone therefore still owes this batch a constraint of its own.
+    assert!(
+        has_constraints || has_interactions,
+        "zerocheck requires every AIR to contribute constraints or lookup interactions; \
+         binary-bus declarations are reduced separately and do not count"
+    );
+    AirProfile {
+        degrees: AirDegrees {
+            constraints: constraint_degree,
+            interactions: interaction_degree,
+        },
+        // The folder batches every asserted constraint, then one pin per listed cell.
+        num_constraints: base_constraints.len() + extension_constraints.len() + pins.count,
+        declares_lookups: !builder.global_interactions().is_empty()
+            || !builder.local_interactions().is_empty(),
+        declares_indexed: !builder.indexed_reads().is_empty()
+            || !builder.indexed_tables().is_empty(),
+    }
+}
+
+/// Visit each DAG node once, including shared subexpressions across constraints.
+///
+/// Nodes are keyed by address.
+///
+/// Every expression reachable from a call must outlive that call.
+///
+/// A freed address would otherwise hide a live node later allocated there.
+fn visit_leaves<A>(
+    expression: &SymbolicExpr<A>,
+    seen: &mut HashSet<*const SymbolicExpr<A>>,
+    visit: &mut impl FnMut(&A),
+) {
+    if !seen.insert(expression) {
+        return;
+    }
+    match expression {
+        SymbolicExpr::Leaf(leaf) => visit(leaf),
+        SymbolicExpr::Add { x, y, .. }
+        | SymbolicExpr::Sub { x, y, .. }
+        | SymbolicExpr::Mul { x, y, .. } => {
+            visit_leaves(x, seen, visit);
+            visit_leaves(y, seen, visit);
+        }
+        SymbolicExpr::Neg { x, .. } => visit_leaves(x, seen, visit),
+    }
+}
+
+/// Undeclared successor values would otherwise be replaced by zero in the verifier's folder.
+fn validate_successor_columns<F: Field, EF: ExtensionField<F>, A: BaseAir<F>>(
+    air: &A,
+    builder: &SymbolicAirBuilder<F, EF>,
+    base: &[SymbolicExpr<BaseLeaf<F>>],
+    extension: &[SymbolicExpr<ExtLeaf<F, EF>>],
+) {
+    let main = air.main_next_row_columns();
+    let preprocessed = air.preprocessed_next_row_columns();
+    for (columns, width) in [
+        (&main, air.width()),
+        (&preprocessed, air.preprocessed_width()),
+    ] {
+        assert!(
+            columns.iter().all(|&column| column < width),
+            "successor column is outside the trace width"
+        );
+        assert_eq!(
+            columns.iter().collect::<BTreeSet<_>>().len(),
+            columns.len(),
+            "duplicate successor column"
+        );
+    }
+    let mut check = |leaf: &BaseLeaf<F>| {
+        if let BaseLeaf::Variable(variable) = leaf {
+            let declared = match variable.entry {
+                BaseEntry::Main { offset: 1 } => Some(&main),
+                BaseEntry::Preprocessed { offset: 1 } => Some(&preprocessed),
+                _ => None,
+            };
+            assert!(
+                declared.is_none_or(|columns| columns.contains(&variable.index)),
+                "AIR reads an undeclared successor column"
+            );
+        }
+    };
+    let mut seen = HashSet::new();
+    for expression in base {
+        visit_leaves(expression, &mut seen, &mut check);
+    }
+    let mut seen_ext = HashSet::new();
+    for expression in extension {
+        visit_leaves(expression, &mut seen_ext, &mut |leaf| {
+            if let ExtLeaf::Base(expression) = leaf {
+                visit_leaves(expression, &mut seen, &mut check);
+            }
+        });
+    }
+    for interaction in builder.global_interactions() {
+        for expression in interaction
+            .fields
+            .iter()
+            .chain(iter::once(&interaction.count))
+        {
+            visit_leaves(expression, &mut seen, &mut check);
+        }
+    }
+    // Reading a local count yields an owned root.
+    //
+    // Every root is collected before the scan starts.
+    //
+    // Why: the memo keys on address, and a root dropped mid-scan frees its key.
+    let local_counts: Vec<_> = builder
+        .local_interactions()
+        .iter()
+        .flat_map(|interaction| interaction.tuples.iter())
+        .map(|(_, count)| count.clone().into_parts().0)
+        .collect();
+    for interaction in builder.local_interactions() {
+        for (fields, _) in &interaction.tuples {
+            for expression in fields {
+                visit_leaves(expression, &mut seen, &mut check);
+            }
+        }
+    }
+    // Counts share one memo with every other expression.
+    //
+    // A subexpression reachable from several paths is then visited once.
+    for count in &local_counts {
+        visit_leaves(count, &mut seen, &mut check);
+    }
+}
+
+/// Pair each AIR's lookup declarations with the link the reduction supplies for it.
+///
+/// An AIR that declares lookups must have a link, and one that declares none must have no link:
+///
+/// ```text
+///     declares lookups | link present | outcome
+///     -----------------+--------------+---------
+///     no               | no           | ordinary constraints only
+///     yes              | yes          | constraints and lookup link
+///     yes              | no           | rejected: the lookup argument would be dropped
+///     no               | yes          | rejected: the link belongs to no AIR
+/// ```
+///
+/// Without this, a lookup AIR would run through the folder that drops its declarations.
+///
+/// # Errors
+///
+/// Returns the position of the first AIR whose declarations and link disagree.
+fn validate_lookup_links<EF: Field>(
+    degrees: &[AirDegrees],
+    lookup: Option<&AirLinkClaim<EF>>,
+) -> Result<(), ZerocheckError> {
+    for (air, degrees) in degrees.iter().enumerate() {
+        // A positive lookup-link degree is exactly the "this AIR declares lookups" test.
+        let declares = degrees.interactions > 0;
+        let linked = lookup.is_some_and(|lookup| lookup.links_by_air.contains_key(&air));
+        if declares != linked {
+            return Err(ZerocheckError::LookupLinkMismatch { air });
+        }
+    }
+    Ok(())
+}
+
+impl<'a, A> AirZerocheck<'a, A> {
+    /// Create a zerocheck instance for AIRs that may have different trace heights.
+    ///
+    /// AIRs are batched in the order supplied here; proof opening claims use the same order.
+    pub const fn new(airs: &'a [&'a A], pow_bits: usize) -> Self {
+        Self {
+            airs,
+            profiles: None,
+            pow_bits,
+        }
+    }
+
+    /// Reuse the symbolic AIR pass performed by multi-STARK setup.
+    pub(crate) fn with_profiles(
+        airs: &'a [&'a A],
+        profiles: &'a [AirProfile],
+        pow_bits: usize,
+    ) -> Self {
+        assert_eq!(
+            airs.len(),
+            profiles.len(),
+            "one cached AIR profile is required for each AIR",
+        );
+        Self {
+            airs,
+            profiles: Some(profiles),
+            pow_bits,
+        }
+    }
+
+    /// Check that prover inputs are aligned with the AIR batch and its declared layouts.
+    fn validate_inputs<F>(
+        &self,
+        tables: &[&Table<F>],
+        preprocessed: &[Option<&Table<F>>],
+        public_values: &[&[F]],
+    ) where
+        F: Field,
+        A: BaseAir<F>,
+    {
+        assert!(!self.airs.is_empty());
+        assert_eq!(self.airs.len(), tables.len());
+        assert_eq!(self.airs.len(), preprocessed.len());
+        assert_eq!(self.airs.len(), public_values.len());
+
+        self.airs
+            .iter()
+            .zip(tables)
+            .zip(preprocessed)
+            .zip(public_values)
+            .for_each(|(((&air, table), preprocessed), public_values)| {
+                let layout = AirLayout::from_air::<F>(air);
+                // A height-1 trace has zero variables and never activates a stage.
+                // Reject it here, matching the verifier's `log_height > 0` guard.
+                assert!(
+                    table.num_variables() > 0,
+                    "zerocheck requires each trace height to be at least two"
+                );
+                assert_eq!(table.num_polys(), layout.main_width);
+                assert_eq!(
+                    preprocessed.map_or(0, |table| table.num_polys()),
+                    layout.preprocessed_width
+                );
+                if let Some(preprocessed) = preprocessed {
+                    assert_eq!(preprocessed.num_variables(), table.num_variables());
+                }
+                assert_eq!(public_values.len(), air.num_public_values());
+                periodic_num_variables(
+                    layout.num_periodic_columns,
+                    &air.periodic_periods(),
+                    table.num_variables(),
+                )
+                .expect("periodic column declaration must fit the trace height");
+            });
+    }
+
+    /// Prove that every AIR in the batch vanishes on its trace.
+    ///
+    /// `tables[i]`, `preprocessed[i]`, and `public_values[i]` correspond to `airs[i]`.
+    ///
+    /// Every trace commitment and every public value must already be in the transcript.
+    ///
+    /// Periodic columns, if any, are folded into the sumcheck but produce no opening claim.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input lengths disagree with the number of AIRs.
+    /// Panics if a periodic column's period is not a power of two dividing the trace height.
+    /// Panics if any trace height is less than two.
+    pub fn prove<F, EF, Challenger>(
+        &self,
+        preprocessed: &[Option<&Table<F>>],
+        tables: &[&Table<F>],
+        public_values: &[&[F]],
+        challenger: &mut Challenger,
+    ) -> (ZerocheckProof<F, EF>, Point<EF>)
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: ProverAir<F, EF>,
+        <EF as ExtensionField<F>>::ExtensionPacking: From<EF> + From<<F as Field>::Packing>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        self.prove_with_lookup::<F, EF, GenericBackend, Challenger>(
+            preprocessed,
+            tables,
+            public_values,
+            LookupRuntime::Inactive,
+            DEFAULT_SLICED_ROUNDS,
+            challenger,
+        )
+    }
+
+    /// Prove the batch with the lookup argument coupled in.
+    ///
+    /// The reduction has already opened the lookup fractions at a random point.
+    /// This sumcheck therefore starts from that claim instead of from zero, and each AIR
+    /// stage takes over its own share when the cube reaches that AIR's trace height.
+    ///
+    /// Backend `B` computes each stage's round polynomials, folds, and openings.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input lengths disagree with the number of AIRs.
+    /// Panics if an AIR declares lookups but the batch carries no link for it.
+    /// Panics if a periodic column's period is not a power of two dividing the trace height.
+    /// Panics if any trace height is less than two.
+    pub(crate) fn prove_with_lookup<F, EF, B, Challenger>(
+        &self,
+        preprocessed: &[Option<&Table<F>>],
+        tables: &[&Table<F>],
+        public_values: &[&[F]],
+        lookup: LookupRuntime<EF>,
+        sliced_rounds: usize,
+        challenger: &mut Challenger,
+    ) -> (ZerocheckProof<F, EF>, Point<EF>)
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: BaseAir<F> + Air<SymbolicAirBuilder<F, EF>>,
+        B: ZerocheckBackend<F, EF, A>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        self.prove_with_lookup_and_bus::<F, EF, B, Challenger>(
+            preprocessed,
+            tables,
+            public_values,
+            lookup,
+            None,
+            sliced_rounds,
+            challenger,
+        )
+    }
+
+    /// Prove AIR constraints, lookup links, and binary-bus shares in one sumcheck.
+    ///
+    /// The bus family is back-loaded like every short table.
+    ///
+    /// ```text
+    ///     rounds       : | missing prefix x_1 .. x_k | own rows x_(k+1) .. x_n |
+    ///     short share  : |    x_1 * ... * x_k        |  eq(q, x) * (f(x) - 1)  |
+    /// ```
+    ///
+    /// The prefix factor is the all-one-vertex selector of the missing coordinates.
+    /// Its Boolean-cube sum is one in every characteristic, including two.
+    ///
+    /// # Panics
+    ///
+    /// Every reason [`Self::prove_with_lookup`] panics for.
+    #[tracing::instrument(skip_all)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prove_with_lookup_and_bus<F, EF, B, Challenger>(
+        &self,
+        preprocessed: &[Option<&Table<F>>],
+        tables: &[&Table<F>],
+        public_values: &[&[F]],
+        lookup: LookupRuntime<EF>,
+        bus: Option<BusFamily<'_, F, EF>>,
+        sliced_rounds: usize,
+        challenger: &mut Challenger,
+    ) -> (ZerocheckProof<F, EF>, Point<EF>)
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: BaseAir<F> + Air<SymbolicAirBuilder<F, EF>>,
+        B: ZerocheckBackend<F, EF, A>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        self.validate_inputs(tables, preprocessed, public_values);
+        lookup.validate(self.airs.len());
+        // Lower the protocol-boundary enum once.
+        // Inactive lookup state becomes empty collections from here on.
+        // The round loop then never branches on whether a lookup exists.
+        let (
+            lookup_point,
+            lookup_claimed_sum,
+            mut claims_by_air,
+            theta_beta_powers,
+            mut links_by_air,
+        ) = match lookup {
+            LookupRuntime::Inactive => (
+                Point::new(Vec::new()),
+                EF::ZERO,
+                BTreeMap::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            ),
+            LookupRuntime::Active(ActiveLookupRuntime {
+                claims_by_air,
+                air_link:
+                    AirLinkClaim {
+                        point,
+                        claimed_sum,
+                        theta_beta_powers,
+                        links_by_air,
+                    },
+            }) => (
+                point,
+                claimed_sum,
+                claims_by_air,
+                theta_beta_powers,
+                links_by_air,
+            ),
+        };
+
+        // Ordinary constraints and lookup links keep their native symbolic degrees.
+        // The round state evaluates an AIR up to the larger of the two degrees.
+        // It stops accumulating the lower-degree family at that family's own final node.
+        let owned_profiles;
+        let profiles = match self.profiles {
+            Some(profiles) => profiles,
+            None => {
+                owned_profiles = self
+                    .airs
+                    .iter()
+                    .map(|&air| get_air_profile::<F, EF, A>(air))
+                    .collect::<Vec<_>>();
+                &owned_profiles
+            }
+        };
+        let degrees = profiles
+            .iter()
+            .map(|profile| profile.degrees)
+            .collect::<Vec<_>>();
+
+        // Mirror the verifier's rule: every AIR that declares lookups must carry a link.
+        // Proving without one would fold the ordinary constraints and drop the lookups.
+        for (air, degrees) in degrees.iter().enumerate() {
+            assert_eq!(
+                degrees.interactions > 0,
+                links_by_air.contains_key(&air),
+                "AIR {air} declares lookups but the batch carries no lookup reduction for it"
+            );
+        }
+
+        // Bucket AIR indices by trace height.
+        // The map gives deterministic height order; stages are built largest-first below.
+        let mut indices_by_height = BTreeMap::<usize, Vec<usize>>::new();
+        tables.iter().enumerate().for_each(|(index, table)| {
+            indices_by_height
+                .entry(table.num_variables())
+                .or_default()
+                .push(index);
+        });
+
+        // All stages contribute to one transmitted round polynomial.
+        // Its evaluation buffer therefore carries the largest AIR degree in the batch.
+        // A lower-degree group is extrapolated only when it joins the shared accumulator.
+        let max_degree = degrees.iter().copied().map(AirDegrees::max).max().unwrap();
+
+        // The global cube must contain the tallest AIR trace and the whole reduction point.
+        // Block selectors can make that point longer than any trace.
+        //
+        //     rounds : | block selectors | tallest trace | ... | shortest trace |
+        //                | no AIR stage is active yet
+        let air_log_height = indices_by_height.keys().copied().max().unwrap();
+        let log_height = air_log_height.max(lookup_point.num_variables());
+
+        // Every bus share lives in one of the tables above, so the cube already covers it.
+        let bus_degree = bus.map(|family| family.context.composition_degree());
+        let mut shape = ZerocheckShape::new(
+            &degrees,
+            log_height,
+            lookup_point.num_variables(),
+            self.pow_bits,
+        );
+        if let Some(degree) = bus_degree {
+            shape = shape.with_bus(degree);
+        }
+
+        // One driver covers the whole zerocheck, challenges and delegated sumcheck alike.
+        let mut transcript = ZerocheckProverTranscript::<Challenger, F, EF>::new(challenger, shape);
+        let ZerocheckChallenges {
+            alpha,
+            beta,
+            eta,
+            lambda,
+            tau,
+        } = transcript.challenges(lookup_point.as_slice());
+        let tau = Point::new(tau);
+        // Beta batches AIR contributions in caller order.
+        // When a stage activates, it selects the beta powers for its original AIR indices.
+        let beta_powers = beta.powers().collect_n(self.airs.len());
+
+        // Each stage contains the AIRs sharing one trace height.
+        // Lookup claims and links are aligned here once using the same AIR indices.
+        // Original AIR indices stay attached so final openings can return in caller order.
+        let mut stages = indices_by_height
+            .into_iter()
+            .rev()
+            .map(|(_, indices)| {
+                let claims = indices
+                    .iter()
+                    .filter_map(|&air_index| {
+                        claims_by_air
+                            .remove(&air_index)
+                            .map(|claim| (air_index, claim))
+                    })
+                    .collect();
+                let links = indices
+                    .iter()
+                    .filter_map(|&air_index| {
+                        links_by_air
+                            .remove(&air_index)
+                            .map(|link| (air_index, link))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+
+                let coupling = StageCoupling::new(claims, links, theta_beta_powers.clone());
+
+                let tables = indices.iter().map(|&i| tables[i]).collect::<Vec<_>>();
+                let preprocessed = indices.iter().map(|&i| preprocessed[i]).collect::<Vec<_>>();
+                let airs = indices.iter().map(|&i| self.airs[i]).collect::<Vec<_>>();
+                let public_values = indices
+                    .iter()
+                    .map(|&i| public_values[i])
+                    .collect::<Vec<_>>();
+                let profiles = indices.iter().map(|&i| profiles[i]).collect::<Vec<_>>();
+                Stage::new(
+                    airs,
+                    public_values,
+                    indices,
+                    preprocessed,
+                    tables,
+                    profiles,
+                    coupling,
+                )
+            })
+            .peekable();
+
+        // The bus family carries its own equality weight, anchored at the product-tree point.
+        // Its running claim is kept apart, since the AIR stages never see it.
+        let mut bus_family = bus.map(|family| {
+            let claim = family
+                .output
+                .batched_terminal_claim(lambda)
+                .expect("the prover's own product-tree output has one claim per direction");
+            let num_variables = tables
+                .iter()
+                .map(|table| table.num_variables())
+                .collect::<Vec<_>>();
+            let periodic = family.context.period_vectors(self.airs, &num_variables);
+            let prover = BusCompositionProver::new(
+                family.context,
+                family.output,
+                tables,
+                preprocessed,
+                &periodic,
+                public_values,
+                lambda,
+                log_height,
+                B::to_repr,
+                B::from_repr,
+            );
+            (prover, claim)
+        });
+        let bus_claim = bus_family.as_ref().map_or(EF::ZERO, |&(_, claim)| claim);
+        let air_claimed_sum = eta * lookup_claimed_sum;
+        let claimed_sum = air_claimed_sum + lambda * bus_claim;
+
+        // A transmitted round polynomial is one degree wider than the internal one.
+        // The zerocheck's equality weight contributes that extra degree.
+        // A bus family of higher degree widens the shared message instead.
+        let air_degree = max_degree + 1;
+        let transmitted_degree = bus_degree.map_or(air_degree, |degree| air_degree.max(degree));
+
+        // The rounds below drive the delegated sumcheck transcript.
+        // They never touch the challenger directly, so this loop cannot drift from the
+        // verifier, which replays the same description.
+        let (proof, challenges, states) = transcript.constraint_sumcheck(|challenger| {
+            let shape = GenericDegreeShape::new(log_height, transmitted_degree, self.pow_bits);
+            let mut sumcheck =
+                ProverTranscript::<Challenger, F, EF>::new(challenger, shape, claimed_sum);
+
+            let mut proof = GenericDegreeProof {
+                claimed_sum,
+                round_polys: Vec::with_capacity(log_height),
+                pow_witnesses: Vec::with_capacity(if self.pow_bits > 0 { log_height } else { 0 }),
+            };
+
+            let mut challenges = Vec::with_capacity(log_height);
+            // Active stages live as the backend's folded states.
+            // claims[i] is the current reduced claim for states[i].
+            let mut states = Vec::new();
+            let mut claims = Vec::<EF>::new();
+
+            // Before any height activates, the full lookup claim is dormant.
+            // The bus claim is not part of it: the bus family tracks its own.
+            let mut pending_claim = air_claimed_sum;
+
+            // All stages share the same global sumcheck point.
+            // eq_prefix covers folded rounds; eq_suffix covers the tail still inside each state.
+            let mut eq_prefix = EF::ONE;
+            // Lookup block selectors can add dormant rounds before any AIR activates.
+            // The suffix is needed only once the tallest AIR begins its row rounds.
+            let mut eq_suffix = None;
+
+            // Barycentric interpolators, indexed by internal degree, built once.
+            // A lower-degree stage is extrapolated up to the batch's max degree.
+            // Reusing prebuilt weights avoids recomputing them every round.
+            let interpolators = (0..=max_degree)
+                .map(RoundPolyInterpolator::<EF>::new)
+                .collect::<Vec<_>>();
+            let air_interpolator = RoundPolyInterpolator::<EF>::new(air_degree);
+            let bus_interpolator = bus_degree.map(RoundPolyInterpolator::<EF>::new);
+
+            for round in 0..log_height {
+                let num_vars = log_height - round;
+                let tau_round = tau.as_slice()[round];
+                let tau_round_inv = tau_round.inverse();
+
+                // `peek` only borrows the next stage; `next` below moves it into the round state.
+                let activates_stage = stages
+                    .peek()
+                    .is_some_and(|stage| num_vars == stage.num_vars);
+                let activating_claim = if activates_stage {
+                    stages.peek().unwrap().lookup_claim(eta)
+                } else {
+                    EF::ZERO
+                };
+                pending_claim -= activating_claim;
+                if activates_stage && eq_suffix.is_none() {
+                    eq_suffix = Some(Poly::new_from_point(&tau.as_slice()[round + 1..], EF::ONE));
+                }
+
+                // Not-yet-active lookup stages remain represented by one dormant constant.
+                let mut round_poly_acc = vec![pending_claim; max_degree];
+                let mut round_polys = Vec::with_capacity(states.len());
+
+                // Existing stages already live over the extension field.
+                // Extend each stage's internal round polynomial to the global degree and accumulate it.
+                for (state, &claim) in states.iter_mut().zip(claims.iter()) {
+                    let round_poly = B::round(
+                        state,
+                        eq_suffix
+                            .as_ref()
+                            .expect("active AIR has an equality suffix"),
+                    );
+                    let q1 = (claim - (EF::ONE - tau_round) * round_poly[0]) * tau_round_inv;
+                    let unweighted_claim = round_poly[0] + q1;
+                    let round_poly = interpolators[round_poly.len()].extend_evals(
+                        &round_poly,
+                        unweighted_claim,
+                        max_degree,
+                    );
+                    EF::add_slices(&mut round_poly_acc, &round_poly);
+                    round_polys.push(round_poly);
+                }
+
+                // A stage activates when the global cube reaches its trace height.
+                // Its private lookup claim supplies the omitted node-one evaluation.
+                let mut new_state = None;
+                if activates_stage {
+                    let stage = stages.next().unwrap();
+                    let tau = Point::new(tau.as_slice()[round..].to_vec());
+                    let betas = stage
+                        .indices
+                        .iter()
+                        .map(|&air_index| beta_powers[air_index])
+                        .collect::<Vec<_>>();
+                    let mut state =
+                        RoundStateBase::new(stage, alpha, eta, betas, tau, sliced_rounds);
+                    let round_poly = B::round0(
+                        &mut state,
+                        eq_suffix
+                            .as_ref()
+                            .expect("activating AIR has an equality suffix"),
+                    );
+                    let q1 =
+                        (activating_claim - (EF::ONE - tau_round) * round_poly[0]) * tau_round_inv;
+                    let unweighted_claim = round_poly[0] + q1;
+                    let round_poly = interpolators[round_poly.len()].extend_evals(
+                        &round_poly,
+                        unweighted_claim,
+                        max_degree,
+                    );
+                    EF::add_slices(&mut round_poly_acc, &round_poly);
+                    new_state = Some((state, round_poly));
+                }
+
+                // The verifier sees one global sumcheck round.
+                // Convert the accumulated internal q-evals back to eq-weighted standard evals.
+                let interpolator = interpolators.last().unwrap();
+                let air_claim =
+                    claims.iter().copied().sum::<EF>() + activating_claim + pending_claim;
+                let (mut standard_evals, _) = standard_round_from_q_evals(
+                    interpolator,
+                    &round_poly_acc,
+                    air_claim,
+                    eq_prefix,
+                    tau.as_slice()[round],
+                );
+
+                // Both families are raised to the shared degree, then added under lambda.
+                //
+                //     s(X) = s_air(X) + lambda * s_bus(X)
+                //
+                // Each extension reads its own family's running sum s(0) + s(1).
+                if air_degree < transmitted_degree {
+                    standard_evals = air_interpolator.extend_evals(
+                        &standard_evals,
+                        eq_prefix * air_claim,
+                        transmitted_degree,
+                    );
+                }
+                let bus_evals = bus_family.as_ref().zip(bus_interpolator.as_ref()).map(
+                    |((prover, claim), interpolator)| {
+                        let evals = prover.round_poly();
+                        let raised = interpolator.extend_evals(&evals, *claim, transmitted_degree);
+                        for (combined, bus) in standard_evals.iter_mut().zip(raised) {
+                            *combined += lambda * bus;
+                        }
+                        evals
+                    },
+                );
+
+                // Bind the polynomial, grind, and draw this round's challenge.
+                let (r, witness) = sumcheck.round(&standard_evals);
+
+                // The bus family folds through the same challenge as every AIR table.
+                if let (Some((prover, claim)), Some(interpolator), Some(evals)) =
+                    (bus_family.as_mut(), bus_interpolator.as_ref(), bus_evals)
+                {
+                    *claim = interpolator.eval(&evals, *claim, r);
+                    prover.fold(r);
+                }
+
+                // Store what the round produced alongside what it bound.
+                proof.round_polys.push(standard_evals);
+                proof.pow_witnesses.extend(witness);
+                challenges.push(r);
+
+                // Fold every already-active state at the sampled challenge.
+                // Update its reduced claim using the same internal round polynomial used above.
+                for ((state, claim), round_poly) in states
+                    .iter_mut()
+                    .zip(claims.iter_mut())
+                    .zip(round_polys.iter())
+                {
+                    let q1 = (*claim - (EF::ONE - tau_round) * round_poly[0]) * tau_round_inv;
+                    let unweighted_claim = round_poly[0] + q1;
+                    *claim = interpolator.eval(round_poly, unweighted_claim, r);
+                    B::fold(state, r);
+                }
+
+                // The newly activated stage joins the active list only after this round.
+                // Its first reduced claim comes from the private lookup claim supplied at activation.
+                // Ordinary constraints contribute nothing there.
+                if let Some((state, round_poly)) = new_state {
+                    let q1 =
+                        (activating_claim - (EF::ONE - tau_round) * round_poly[0]) * tau_round_inv;
+                    let unweighted_claim = round_poly[0] + q1;
+                    claims.push(interpolator.eval(&round_poly, unweighted_claim, r));
+                    states.push(B::fold0(state, r));
+                }
+
+                // Advance the shared equality factors to the next round.
+                // The prefix absorbs r; the suffix drops the variable just bound.
+                eq_prefix *= Point::eval_eq(&[tau_round], &[r]);
+                if round + 1 < log_height
+                    && let Some(eq_suffix) = &mut eq_suffix
+                {
+                    eq_suffix.sum_prefix_var_mut();
+                }
+            }
+
+            // Require that every described step of the delegated run was played.
+            sumcheck.finish();
+
+            assert!(
+                stages.next().is_none(),
+                "every zerocheck stage must activate"
+            );
+            debug_assert_eq!(
+                pending_claim,
+                EF::ZERO,
+                "activated AIR interactions must reconstruct the fractional-GKR claim"
+            );
+
+            (proof, challenges, states)
+        });
+
+        // The bracket was the zerocheck's last described step.
+        transcript.finish();
+
+        // States are ordered by activation height, not caller AIR order.
+        // Each state retains its original AIR indices and scatters its openings back here.
+        let mut openings = iter::repeat_with(|| None)
+            .take(self.airs.len())
+            .collect::<Vec<Option<AirOpenings<EF>>>>();
+        for state in states {
+            for (air_index, opening) in B::openings(state) {
+                openings[air_index] = Some(opening);
+            }
+        }
+
+        // Split the per-AIR openings into the four proof vectors, in caller order.
+        let mut local = Vec::with_capacity(self.airs.len());
+        let mut next = Vec::with_capacity(self.airs.len());
+        let mut preprocessed_local = Vec::with_capacity(self.airs.len());
+        let mut preprocessed_next = Vec::with_capacity(self.airs.len());
+        for opening in openings {
+            let opening = opening.expect("every AIR must have openings");
+            local.push(opening.local);
+            next.push(opening.next);
+            preprocessed_local.push(opening.preprocessed_local);
+            preprocessed_next.push(opening.preprocessed_next);
+        }
+
+        (
+            ZerocheckProof {
+                sumcheck: proof,
+                local,
+                next,
+                preprocessed_local,
+                preprocessed_next,
+            },
+            Point::new(challenges),
+        )
+    }
+
+    /// Verify a zerocheck proof.
+    ///
+    /// The opened column values are trusted at this layer.
+    /// Binding them to a commitment is the job of the polynomial commitment scheme in a later step.
+    ///
+    /// Every trace commitment and every public value must already be in the transcript.
+    ///
+    /// # Arguments
+    ///
+    /// - `proof`: the zerocheck proof.
+    /// - `log_heights`: base-two logarithm of each AIR's trace height, in caller order.
+    /// - `public_values`: public inputs forwarded to each AIR, in caller order.
+    /// - `challenger`: the Fiat-Shamir transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    /// - the per-AIR opening groups do not number one per AIR,
+    /// - an AIR's current-row openings do not carry one value per main column,
+    /// - an AIR's next-row openings do not carry one value per next-row column,
+    /// - an AIR's periodic column declaration does not fit its trace height,
+    /// - an AIR declares lookups, which this entry point cannot check,
+    /// - the claimed sum is nonzero,
+    /// - the inner sumcheck transcript fails to verify,
+    /// - the reduced sum does not match the constraints at the random point.
+    pub fn verify<F, EF, Challenger>(
+        &self,
+        proof: &ZerocheckProof<F, EF>,
+        log_heights: &[usize],
+        public_values: &[&[F]],
+        challenger: &mut Challenger,
+    ) -> Result<Point<EF>, ZerocheckError>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: VerifierAir<F, EF>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        self.verify_with_lookup(proof, log_heights, public_values, None, challenger)
+    }
+
+    /// Verify the batch with the lookup argument coupled in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for every reason the lookup-free entry point does.
+    /// Returns an error when an AIR's lookup declarations and its link disagree.
+    /// Returns an error when the claimed sum does not match the lookup reduction.
+    pub(crate) fn verify_with_lookup<F, EF, Challenger>(
+        &self,
+        proof: &ZerocheckProof<F, EF>,
+        log_heights: &[usize],
+        public_values: &[&[F]],
+        lookup: Option<&AirLinkClaim<EF>>,
+        challenger: &mut Challenger,
+    ) -> Result<Point<EF>, ZerocheckError>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: VerifierAir<F, EF>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        assert!(!self.airs.is_empty(), "zerocheck requires at least one AIR");
+        assert_eq!(
+            self.airs.len(),
+            public_values.len(),
+            "one public-value group is required for each AIR"
+        );
+        assert_eq!(
+            self.airs.len(),
+            log_heights.len(),
+            "one trace height is required for each AIR"
+        );
+        assert!(
+            log_heights.iter().all(|&log_height| log_height > 0),
+            "zerocheck requires each trace height to be at least two"
+        );
+
+        for (&air, public_values) in self.airs.iter().zip(public_values.iter()) {
+            let layout = AirLayout::from_air::<F>(air);
+            assert_ne!(layout.main_width, 0);
+            assert_eq!(public_values.len(), air.num_public_values());
+        }
+
+        let next_columns = self
+            .airs
+            .iter()
+            .map(|&air| air.main_next_row_columns())
+            .collect::<Vec<_>>();
+        let preprocessed_next_columns = self
+            .airs
+            .iter()
+            .map(|&air| air.preprocessed_next_row_columns())
+            .collect::<Vec<_>>();
+        if proof.local.len() != self.airs.len() {
+            return Err(ZerocheckError::OpeningCountMismatch {
+                expected: self.airs.len(),
+                actual: proof.local.len(),
+            });
+        }
+        // Every next-row column must contribute exactly one successor opening.
+        if proof.next.len() != self.airs.len() {
+            return Err(ZerocheckError::NextOpeningCountMismatch {
+                expected: self.airs.len(),
+                actual: proof.next.len(),
+            });
+        }
+        if proof.preprocessed_local.len() != self.airs.len() {
+            return Err(ZerocheckError::PreprocessedOpeningCountMismatch {
+                expected: self.airs.len(),
+                actual: proof.preprocessed_local.len(),
+            });
+        }
+        if proof.preprocessed_next.len() != self.airs.len() {
+            return Err(ZerocheckError::PreprocessedNextOpeningCountMismatch {
+                expected: self.airs.len(),
+                actual: proof.preprocessed_next.len(),
+            });
+        }
+
+        // Verify the sumcheck reduction, then close on the proof's own opened values.
+        let reduction = self.verify_reduction_with_lookup::<F, EF, _>(
+            &proof.sumcheck,
+            log_heights,
+            public_values,
+            lookup,
+            challenger,
+        )?;
+        let main = proof
+            .local
+            .iter()
+            .zip(next_columns.iter())
+            .zip(proof.next.iter())
+            .map(|((local, next_columns), next_values)| {
+                TableOpening::new(local, next_columns, next_values)
+            })
+            .collect::<Vec<_>>();
+        let preprocessed = proof
+            .preprocessed_local
+            .iter()
+            .zip(preprocessed_next_columns.iter())
+            .zip(proof.preprocessed_next.iter())
+            .map(|((local, next_columns), next_values)| {
+                TableOpening::new(local, next_columns, next_values)
+            })
+            .collect::<Vec<_>>();
+        self.check_constraint_with_lookup::<F, EF>(
+            &reduction,
+            &main,
+            &preprocessed,
+            log_heights,
+            public_values,
+            lookup,
+        )?;
+        Ok(reduction.point)
+    }
+
+    /// Verify the zerocheck sumcheck and return the data the final check needs.
+    ///
+    /// This stops short of recomputing the constraint.
+    /// The opened column values are not yet known.
+    /// The committed verifier opens them through a commitment scheme.
+    ///
+    /// Every trace commitment and every public value must already be in the transcript.
+    ///
+    /// # Arguments
+    ///
+    /// - Zerocheck sumcheck transcript.
+    /// - Base-two logarithm of each AIR's trace height, in caller order.
+    /// - Public inputs forwarded to each AIR, in caller order.
+    /// - Fiat-Shamir transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the claimed sum is nonzero.
+    /// Returns an error when an AIR declares lookups, which this entry point cannot check.
+    /// Returns an error when the sumcheck transcript fails to verify.
+    pub fn verify_reduction<F, EF, Challenger>(
+        &self,
+        sumcheck: &GenericDegreeProof<F, EF>,
+        log_heights: &[usize],
+        public_values: &[&[F]],
+        challenger: &mut Challenger,
+    ) -> Result<ZerocheckReduction<EF>, ZerocheckError>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: Air<SymbolicAirBuilder<F, EF>>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        self.verify_reduction_with_lookup(sumcheck, log_heights, public_values, None, challenger)
+    }
+
+    /// Verify the sumcheck reduction with the lookup argument coupled in.
+    ///
+    /// This is where the two arguments are tied together: the zerocheck point takes the
+    /// reduction's own output point as its tail, and the claimed sum must match the
+    /// reduction's folded opening.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an AIR's lookup declarations and its link disagree.
+    /// Returns an error when the claimed sum does not match the lookup reduction.
+    /// Returns an error when the sumcheck transcript fails to verify.
+    pub(crate) fn verify_reduction_with_lookup<F, EF, Challenger>(
+        &self,
+        sumcheck: &GenericDegreeProof<F, EF>,
+        log_heights: &[usize],
+        public_values: &[&[F]],
+        lookup: Option<&AirLinkClaim<EF>>,
+        challenger: &mut Challenger,
+    ) -> Result<ZerocheckReduction<EF>, ZerocheckError>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: Air<SymbolicAirBuilder<F, EF>>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        self.verify_reduction_with_lookup_and_bus(
+            sumcheck,
+            log_heights,
+            public_values,
+            lookup,
+            None,
+            challenger,
+        )
+    }
+
+    /// Verify the shared sumcheck with lookup links and binary-bus shares coupled in.
+    ///
+    /// The starting claim is rebuilt from the two reductions that ran before it.
+    ///
+    /// ```text
+    ///     claim = eta * lookup + lambda * (push + lambda * pull)
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Every reason [`Self::verify_reduction_with_lookup`] rejects for.
+    /// Returns an error when the product-tree output carries the wrong number of claims.
+    pub(crate) fn verify_reduction_with_lookup_and_bus<F, EF, Challenger>(
+        &self,
+        sumcheck: &GenericDegreeProof<F, EF>,
+        log_heights: &[usize],
+        public_values: &[&[F]],
+        lookup: Option<&AirLinkClaim<EF>>,
+        bus: Option<BusFamily<'_, F, EF>>,
+        challenger: &mut Challenger,
+    ) -> Result<ZerocheckReduction<EF>, ZerocheckError>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: Air<SymbolicAirBuilder<F, EF>>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        assert!(!self.airs.is_empty(), "zerocheck requires at least one AIR");
+        assert_eq!(
+            self.airs.len(),
+            public_values.len(),
+            "one public-value group is required for each AIR"
+        );
+        assert_eq!(
+            self.airs.len(),
+            log_heights.len(),
+            "one trace height is required for each AIR"
+        );
+        assert!(
+            log_heights.iter().all(|&log_height| log_height > 0),
+            "zerocheck requires each trace height to be at least two"
+        );
+
+        let air_log_height = log_heights.iter().copied().max().unwrap();
+        let max_log_height = lookup.map_or(air_log_height, |lookup| {
+            air_log_height.max(lookup.point.num_variables())
+        });
+
+        // The same symbolic pass fixes the round degree and says which AIRs declare lookups.
+        let degrees = self.profiles.map_or_else(
+            || {
+                self.airs
+                    .iter()
+                    .map(|&air| get_air_degrees::<F, EF, A>(air))
+                    .collect::<Vec<_>>()
+            },
+            |profiles| profiles.iter().map(|profile| profile.degrees).collect(),
+        );
+        validate_lookup_links(&degrees, lookup)?;
+
+        // One extra degree for the eq weight the sumcheck carries.
+        // A bus family of higher degree widens the shared message instead.
+        let bus_degree = bus.map(|family| family.context.composition_degree());
+        let air_degree = degrees.iter().copied().map(AirDegrees::max).max().unwrap() + 1;
+        let degree = bus_degree.map_or(air_degree, |bus_degree| air_degree.max(bus_degree));
+
+        if lookup.is_none() && bus.is_none() && sumcheck.claimed_sum != EF::ZERO {
+            return Err(ZerocheckError::NonZeroClaimedSum);
+        }
+
+        // The reduction point of the lookup argument becomes the tail of the zerocheck point.
+        let lookup_tail = lookup.map_or(&[][..], |lookup| lookup.point.as_slice());
+
+        // One driver covers the whole zerocheck, challenges and delegated sumcheck alike.
+        let mut shape =
+            ZerocheckShape::new(&degrees, max_log_height, lookup_tail.len(), self.pow_bits);
+        if let Some(bus_degree) = bus_degree {
+            shape = shape.with_bus(bus_degree);
+        }
+        let mut transcript =
+            ZerocheckVerifierTranscript::<Challenger, F, EF>::new(challenger, shape);
+        let ZerocheckChallenges {
+            alpha,
+            beta,
+            eta,
+            lambda,
+            tau,
+        } = transcript.challenges(lookup_tail);
+
+        // Lambda is drawn after the product tree fixed both terminal claims.
+        // A malformed output is rejected before any sumcheck work.
+        let bus_claim = match bus.map(|family| family.output.batched_terminal_claim(lambda)) {
+            Some(Ok(claim)) => claim,
+            Some(Err(error)) => {
+                transcript.abort();
+                return Err(ZerocheckError::BusClaim(error));
+            }
+            None => EF::ZERO,
+        };
+
+        // The claim the sumcheck starts from is fixed by the reductions, so it is checked here.
+        //
+        // Releasing the completeness check keeps this rejection the only failure.
+        let expected_claim =
+            lookup.map_or(EF::ZERO, |lookup| eta * lookup.claimed_sum) + lambda * bus_claim;
+        if sumcheck.claimed_sum != expected_claim {
+            transcript.abort();
+            return Err(ZerocheckError::ClaimedSumMismatch);
+        }
+
+        // The bracket is the last described step, so a rejected sumcheck still closes it.
+        let reduced = transcript
+            .constraint_sumcheck(|challenger| {
+                sumcheck.verify(challenger, max_log_height, degree, self.pow_bits)
+            })
+            .map_err(ZerocheckError::Sumcheck);
+        transcript.finish();
+        let (point, final_sum) = reduced?;
+
+        Ok(ZerocheckReduction {
+            alpha,
+            beta,
+            eta,
+            lambda,
+            tau,
+            point,
+            final_sum,
+        })
+    }
+
+    /// Close the zerocheck: recompute the alpha-batched constraints and match the reduced sum.
+    ///
+    /// Opened values are grouped in the same order as the batched AIRs.
+    /// They may come from the proof itself or from commitment openings.
+    ///
+    /// Periodic columns carry no opening.
+    /// Their values are recomputed here in closed form.
+    ///
+    /// # Errors
+    ///
+    /// - An opening group does not carry one value per declared column.
+    /// - An AIR's periodic column declaration does not fit its trace height.
+    /// - The reduced sum does not match the constraints at the point.
+    pub fn check_constraint<F, EF>(
+        &self,
+        reduction: &ZerocheckReduction<EF>,
+        main: &[TableOpening<'_, EF>],
+        preprocessed: &[TableOpening<'_, EF>],
+        log_heights: &[usize],
+        public_values: &[&[F]],
+    ) -> Result<(), ZerocheckError>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: VerifierAir<F, EF>,
+    {
+        self.check_constraint_with_lookup(
+            reduction,
+            main,
+            preprocessed,
+            log_heights,
+            public_values,
+            None,
+        )
+    }
+
+    /// Close the zerocheck with the lookup argument coupled in.
+    ///
+    /// A linked AIR is run through the lookup-aware folder, which rebuilds both the
+    /// ordinary constraints and the lookup link from the same opened column values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an opening group does not carry one value per declared column.
+    /// Returns an error when an AIR's periodic declaration does not fit its trace height.
+    /// Returns an error when the reduced sum does not match the recomputed value.
+    pub(crate) fn check_constraint_with_lookup<F, EF>(
+        &self,
+        reduction: &ZerocheckReduction<EF>,
+        main: &[TableOpening<'_, EF>],
+        preprocessed: &[TableOpening<'_, EF>],
+        log_heights: &[usize],
+        public_values: &[&[F]],
+        lookup: Option<&AirLinkClaim<EF>>,
+    ) -> Result<(), ZerocheckError>
+    where
+        F: Field,
+        EF: ExtensionField<F>,
+        A: VerifierAir<F, EF>,
+    {
+        self.check_constraint_with_lookup_and_bus(
+            reduction,
+            main,
+            preprocessed,
+            log_heights,
+            public_values,
+            lookup,
+            None,
+        )
+    }
+
+    /// Close the shared sumcheck with lookup links and binary-bus shares coupled in.
+    ///
+    /// Both families are rebuilt from the same opened values at the same point.
+    ///
+    /// ```text
+    ///     final_sum = eq(tau, r) * g_air(r) + lambda * g_bus(r)
+    /// ```
+    ///
+    /// The bus family never goes through the AIR folder.
+    /// Its product-tree terminal claims are therefore authenticated only here.
+    ///
+    /// # Errors
+    ///
+    /// Every reason [`Self::check_constraint_with_lookup`] rejects for.
+    /// Returns an error when a bus declaration cannot be evaluated from the openings.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn check_constraint_with_lookup_and_bus<F, EF>(
+        &self,
+        reduction: &ZerocheckReduction<EF>,
+        main: &[TableOpening<'_, EF>],
+        preprocessed: &[TableOpening<'_, EF>],
+        log_heights: &[usize],
+        public_values: &[&[F]],
+        lookup: Option<&AirLinkClaim<EF>>,
+        bus: Option<BusFamily<'_, F, EF>>,
+    ) -> Result<(), ZerocheckError>
+    where
+        F: Field,
+        EF: ExtensionField<F>,
+        A: VerifierAir<F, EF>,
+    {
+        assert!(!self.airs.is_empty(), "zerocheck requires at least one AIR");
+        assert_eq!(
+            self.airs.len(),
+            public_values.len(),
+            "one public-value group is required for each AIR"
+        );
+        assert_eq!(
+            self.airs.len(),
+            log_heights.len(),
+            "one trace height is required for each AIR"
+        );
+        assert!(
+            log_heights.iter().all(|&log_height| log_height > 0),
+            "zerocheck requires each trace height to be at least two"
+        );
+
+        if main.len() != self.airs.len() {
+            return Err(ZerocheckError::OpeningCountMismatch {
+                expected: self.airs.len(),
+                actual: main.len(),
+            });
+        }
+        if preprocessed.len() != self.airs.len() {
+            return Err(ZerocheckError::PreprocessedOpeningCountMismatch {
+                expected: self.airs.len(),
+                actual: preprocessed.len(),
+            });
+        }
+
+        let max_log_height = reduction.tau.len();
+        assert_eq!(reduction.point.as_slice().len(), max_log_height);
+
+        let mut g = EF::ZERO;
+        let mut periodic_by_air = Vec::with_capacity(self.airs.len());
+        for (air_index, ((((&air, &log_height), main), preprocessed), beta)) in self
+            .airs
+            .iter()
+            .zip(log_heights.iter())
+            .zip(main.iter())
+            .zip(preprocessed.iter())
+            .zip(reduction.beta.powers())
+            .enumerate()
+        {
+            let layout = AirLayout::from_air::<F>(air);
+            assert_ne!(layout.main_width, 0);
+            assert_eq!(public_values[air_index].len(), air.num_public_values());
+
+            if main.local.len() != layout.main_width {
+                return Err(ZerocheckError::OpeningCountMismatch {
+                    expected: layout.main_width,
+                    actual: main.local.len(),
+                });
+            }
+            if main.next_values.len() != main.next_columns.len() {
+                return Err(ZerocheckError::NextOpeningCountMismatch {
+                    expected: main.next_columns.len(),
+                    actual: main.next_values.len(),
+                });
+            }
+            if preprocessed.local.len() != layout.preprocessed_width {
+                return Err(ZerocheckError::PreprocessedOpeningCountMismatch {
+                    expected: layout.preprocessed_width,
+                    actual: preprocessed.local.len(),
+                });
+            }
+            if preprocessed.next_values.len() != preprocessed.next_columns.len() {
+                return Err(ZerocheckError::PreprocessedNextOpeningCountMismatch {
+                    expected: preprocessed.next_columns.len(),
+                    actual: preprocessed.next_values.len(),
+                });
+            }
+
+            let activation_round = max_log_height - log_height;
+            let point = Point::new(reduction.point.as_slice()[activation_round..].to_vec());
+            let boundary = BoundaryEvals::at(point.as_slice());
+            let claims = OpeningClaims::new(
+                point.clone(),
+                main.local.to_vec(),
+                main.next_columns,
+                main.next_values,
+            );
+            let next_row = claims.next_row(layout.main_width);
+            let preprocessed_claims = OpeningClaims::new(
+                point,
+                preprocessed.local.to_vec(),
+                preprocessed.next_columns,
+                preprocessed.next_values,
+            );
+            let preprocessed_next_row = preprocessed_claims.next_row(layout.preprocessed_width);
+
+            // Periodic columns are not committed and nothing opens them.
+            // Recompute each column's multilinear extension at the bound point instead.
+            // An AIR with a closed form, such as a sparse image, supplies it itself.
+            //
+            //     declaration too large for this AIR's height → rejected here
+            let periodic = air_periodic_evals_at::<F, EF, _>(air, claims.point.as_slice())?;
+
+            let folder = MultilinearFolder::new(
+                &claims.local,
+                &next_row,
+                boundary,
+                public_values[air_index],
+                reduction.alpha,
+            )
+            .with_preprocessed(&preprocessed_claims.local, &preprocessed_next_row)
+            .with_periodic(&periodic);
+
+            // A linked AIR contributes both families from one evaluation, batched apart:
+            // beta separates the AIRs, eta separates the lookup link from the constraints.
+            match lookup.and_then(|lookup| Some((lookup, lookup.links_by_air.get(&air_index)?))) {
+                Some((lookup, link)) => {
+                    let evaluations = InteractionMultilinearFolder::new(
+                        folder,
+                        link,
+                        &lookup.theta_beta_powers,
+                        true,
+                    )
+                    .eval_air(air);
+                    g += beta * evaluations.constraints + reduction.eta * evaluations.interactions;
+                }
+                // Declaring no lookup was already checked against having no link.
+                None => g += beta * folder.eval_air(air),
+            }
+            periodic_by_air.push(periodic);
+        }
+
+        // Every opening group was checked against its declared width above.
+        // The bus evaluator can therefore index any column a declaration names.
+        let bus_term = match bus {
+            Some(family) => {
+                let main = main.iter().map(|opening| opening.local).collect::<Vec<_>>();
+                let preprocessed = preprocessed
+                    .iter()
+                    .map(|opening| opening.local)
+                    .collect::<Vec<_>>();
+                let periodic = periodic_by_air
+                    .iter()
+                    .map(Vec::as_slice)
+                    .collect::<Vec<_>>();
+                family
+                    .context
+                    .terminal_composition(
+                        family.output,
+                        reduction.lambda,
+                        &reduction.point,
+                        &main,
+                        &preprocessed,
+                        &periodic,
+                        public_values,
+                    )
+                    .map_err(ZerocheckError::BusBinding)?
+            }
+            None => EF::ZERO,
+        };
+
+        let eq_at_point = Point::eval_eq(&reduction.tau, reduction.point.as_slice());
+        if reduction.final_sum != eq_at_point * g + reduction.lambda * bus_term {
+            return Err(ZerocheckError::FinalSumMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Data yielded before the opened values are known.
+///
+/// The reduction verifier produces it from the sumcheck transcript.
+/// The closing check consumes it together with the opened column values.
+#[derive(Clone, Debug)]
+pub struct ZerocheckReduction<EF> {
+    /// Random scalar batching the AIR constraints.
+    pub alpha: EF,
+    /// Random scalar batching AIRs together in caller order.
+    pub beta: EF,
+    /// Random scalar separating lookup-link expressions from ordinary constraints.
+    pub eta: EF,
+    /// Random scalar batching the binary-bus family, or zero when no bus shares the sumcheck.
+    pub lambda: EF,
+    /// Zerocheck point sampled before the sumcheck.
+    pub tau: Vec<EF>,
+    /// Bound sumcheck point with every variable fixed to one challenge.
+    pub point: Point<EF>,
+    /// Reduced sum bound by the sumcheck.
+    pub final_sum: EF,
+}
+
+/// Rebuild the verifier-facing round message from the prover's internal evaluations.
+///
+/// # Overview
+///
+/// The optimized prover evaluates an internal polynomial with the active equality
+/// factor stripped out, which lowers its degree by one:
+/// ```text
+/// q(X) = sum over x of eq(suffix, x) * g(prefix, X, x)
+/// ```
+///
+/// The verifier still expects the full weighted round polynomial:
+/// ```text
+/// s(X) = eq_prefix * eq(tau, X) * q(X)
+/// ```
+///
+/// This restores `s` from the transmitted internal evaluations.
+///
+/// Node one never travels: the verifier rebuilds it from the previous round's claim.
+///
+/// The equality weighting and the inter-round claim relation are specific to this
+/// zerocheck, which is why the generic interpolator knows nothing about them.
+///
+/// # Arguments
+///
+/// - `interpolator`: barycentric helper for the internal degree, reused across rounds.
+/// - `evals`: internal evaluations at nodes `0, 2, 3, ..., deg - 1`.
+/// - `claim`: previous round's reduced value, tying `q(0)` and `q(1)` together.
+/// - `eq_prefix`: product of equality factors at the already-bound challenges.
+/// - `tau`: this round's zerocheck point coordinate.
+///
+/// # Returns
+///
+/// - the weighted evaluations `s(0), s(2), ..., s(deg)` sent to the verifier;
+/// - the unweighted sum `q(0) + q(1)` used to reduce the internal claim next round.
+///
+/// # Panics
+///
+/// Panics if `tau` is zero, since recovering `q(1)` divides by it.
+/// Both transcripts redraw every coordinate until nonzero.
+/// That covers the fresh coordinates and those inherited from the lookup reduction.
+/// So an honest run never reaches this panic.
+fn standard_round_from_q_evals<EF>(
+    interpolator: &RoundPolyInterpolator<EF>,
+    evals: &[EF],
+    claim: EF,
+    eq_prefix: EF,
+    tau: EF,
+) -> (Vec<EF>, EF)
+where
+    EF: Field,
+{
+    // Recover the dropped node one from the inter-round relation.
+    //
+    //     claim = (1 - tau) * q(0) + tau * q(1)
+    //  => q(1)  = (claim - (1 - tau) * q(0)) / tau
+    //
+    // The unweighted sum q(0) + q(1) is what reduces the internal claim next round.
+    let unweighted_sum = evals[0] + (claim - (EF::ONE - tau) * evals[0]) * tau.inverse();
+
+    // The weighted message carries one extra degree from the equality factor.
+    // Extrapolate the internal polynomial to that top node.
+    let degree = evals.len() + 1;
+    let last = interpolator.eval(evals, unweighted_sum, EF::interpolation_node(degree));
+
+    // Weight every transmitted node, skipping node one as the verifier rebuilds it.
+    //
+    //     nodes : 0, 2, 3, ..., deg
+    //     values: q(0), q(2), ..., q(deg - 1), q(deg)
+    //     s(node) = eq_prefix * eq(tau, node) * q(node)
+    let standard_evals = (0..=degree)
+        .filter(|&node| node != 1)
+        .zip(evals.iter().copied().chain(core::iter::once(last)))
+        .map(|(node, q)| eq_prefix * Point::eval_eq(&[tau], &[EF::interpolation_node(node)]) * q)
+        .collect();
+
+    (standard_evals, unweighted_sum)
+}
+
+#[cfg(test)]
+#[allow(
+    deprecated,
+    reason = "Keep Poseidon2 AIR regression coverage until p3-poseidon2-air is removed."
+)]
+mod tests {
+    extern crate std;
+
+    use alloc::borrow::Cow;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::borrow::Borrow;
+
+    use p3_air::{Air, AirBuilder, BaseAir, BoundaryEnd, BoundaryPublic, WindowAccess};
+    use p3_baby_bear::{
+        BABYBEAR_POSEIDON2_HALF_FULL_ROUNDS, BABYBEAR_POSEIDON2_PARTIAL_ROUNDS_16,
+        BABYBEAR_S_BOX_DEGREE, BabyBear, GenericPoseidon2LinearLayersBabyBear, Poseidon2BabyBear,
+    };
+    use p3_binary_field::{BinaryChallenger, BinaryField128};
+    use p3_blake3_air::Blake3Air;
+    use p3_challenger::{DuplexChallenger, HashChallenger};
+    use p3_field::PrimeCharacteristicRing;
+    use p3_field::extension::BinomialExtensionField;
+    use p3_keccak::Keccak256Hash;
+    use p3_lookup::{Count, IndexedLookupBuilder, InteractionBuilder, TraceWindow};
+    use p3_matrix::Matrix;
+    use p3_matrix::dense::RowMajorMatrix;
+    use p3_multilinear_util::poly::Poly;
+    use p3_poseidon2_air::{Poseidon2Air, RoundConstants};
+    use p3_util::log2_strict_usize;
+    use rand::distr::{Distribution, StandardUniform};
+    use rand::rngs::SmallRng;
+    use rand::{RngExt, SeedableRng};
+
+    use super::*;
+    use crate::selectors::periodic_evals_at;
+
+    type F = BabyBear;
+    type EF = BinomialExtensionField<F, 4>;
+    type Perm = Poseidon2BabyBear<16>;
+    type Ch = DuplexChallenger<F, Perm, 16, 8>;
+
+    const NUM_COLS: usize = 2;
+    const POSEIDON2_WIDTH: usize = 16;
+    const POSEIDON2_SBOX_DEGREE: u64 = BABYBEAR_S_BOX_DEGREE;
+    const POSEIDON2_SBOX_REGISTERS: usize = 1;
+    const POSEIDON2_HALF_FULL_ROUNDS: usize = BABYBEAR_POSEIDON2_HALF_FULL_ROUNDS;
+    const POSEIDON2_PARTIAL_ROUNDS: usize = BABYBEAR_POSEIDON2_PARTIAL_ROUNDS_16;
+
+    type BabyBearPoseidon2Air = Poseidon2Air<
+        F,
+        GenericPoseidon2LinearLayersBabyBear,
+        POSEIDON2_WIDTH,
+        POSEIDON2_SBOX_DEGREE,
+        POSEIDON2_SBOX_REGISTERS,
+        POSEIDON2_HALF_FULL_ROUNDS,
+        POSEIDON2_PARTIAL_ROUNDS,
+    >;
+
+    fn fresh_challenger() -> Ch {
+        // Fixed seed so prover and verifier transcripts match exactly.
+        let mut rng = SmallRng::seed_from_u64(0xC0FFEE);
+        let perm = Perm::new_from_rng_128(&mut rng);
+        Ch::new(perm)
+    }
+
+    fn prove_traces<A>(
+        zerocheck: &AirZerocheck<'_, A>,
+        traces: &[&RowMajorMatrix<F>],
+        public_values: &[&[F]],
+        challenger: &mut Ch,
+    ) -> (ZerocheckProof<F, EF>, Point<EF>)
+    where
+        A: ProverAir<F, EF>,
+        <EF as ExtensionField<F>>::ExtensionPacking: From<EF> + From<<F as Field>::Packing>,
+    {
+        let tables = traces
+            .iter()
+            .map(|trace| Table::new(trace.transpose()))
+            .collect::<Vec<_>>();
+        let preprocessed = tables.iter().map(|_| None).collect::<Vec<_>>();
+        let table_refs = tables.iter().collect::<Vec<_>>();
+        zerocheck.prove::<F, EF, _>(&preprocessed, &table_refs, public_values, challenger)
+    }
+
+    /// Fibonacci AIR.
+    ///
+    /// - first row: `left == public[0]` and `right == public[1]`
+    /// - transition: `next.left == right` and `next.right == left + right`
+    /// - last row: `right == public[2]`
+    struct FibAir;
+
+    struct FibRow<T> {
+        left: T,
+        right: T,
+    }
+
+    impl<T> Borrow<FibRow<T>> for [T] {
+        fn borrow(&self) -> &FibRow<T> {
+            // Safety: two fields of type T in declaration order match the layout of [T; 2].
+            debug_assert_eq!(self.len(), NUM_COLS);
+            let ptr = self.as_ptr() as *const FibRow<T>;
+            unsafe { &*ptr }
+        }
+    }
+
+    impl<X> BaseAir<X> for FibAir {
+        fn width(&self) -> usize {
+            NUM_COLS
+        }
+        fn num_public_values(&self) -> usize {
+            3
+        }
+    }
+
+    impl<AB: AirBuilder> Air<AB> for FibAir {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let pis = builder.public_values();
+            let (a, b, x) = (pis[0], pis[1], pis[2]);
+
+            let local: &FibRow<AB::Var> = main.current_slice().borrow();
+            let next: &FibRow<AB::Var> = main.next_slice().borrow();
+
+            let mut first = builder.when_first_row();
+            first.assert_eq(local.left, a);
+            first.assert_eq(local.right, b);
+
+            let mut trans = builder.when_transition();
+            trans.assert_eq(local.right, next.left);
+            trans.assert_eq(local.left + local.right, next.right);
+
+            builder.when_last_row().assert_eq(local.right, x);
+        }
+    }
+
+    struct InteractionDegreeAir;
+
+    struct UnderstatedDegreeAir;
+    impl<X> BaseAir<X> for UnderstatedDegreeAir {
+        fn width(&self) -> usize {
+            1
+        }
+        fn max_constraint_degree(&self) -> Option<usize> {
+            Some(1)
+        }
+    }
+    impl<AB: AirBuilder> Air<AB> for UnderstatedDegreeAir {
+        fn eval(&self, builder: &mut AB) {
+            let x: AB::Expr = builder.main().current_slice()[0].into();
+            builder.assert_zero(x.clone() * x);
+        }
+    }
+    #[test]
+    fn understated_degree_hint_uses_symbolic_degree() {
+        assert_eq!(
+            get_air_degrees::<F, EF, _>(&UnderstatedDegreeAir).constraints,
+            2
+        );
+    }
+
+    struct UndeclaredSuccessorAir {
+        preprocessed: bool,
+        lookup: bool,
+    }
+    impl<X> BaseAir<X> for UndeclaredSuccessorAir {
+        fn width(&self) -> usize {
+            1
+        }
+        fn preprocessed_width(&self) -> usize {
+            1
+        }
+        fn main_next_row_columns(&self) -> Vec<usize> {
+            vec![]
+        }
+        fn preprocessed_next_row_columns(&self) -> Vec<usize> {
+            vec![]
+        }
+    }
+    impl<AB: InteractionBuilder> Air<AB> for UndeclaredSuccessorAir {
+        fn eval(&self, builder: &mut AB) {
+            let next = if self.preprocessed {
+                builder.preprocessed().next_slice()[0]
+            } else {
+                builder.main().next_slice()[0]
+            };
+            if self.lookup {
+                builder
+                    .push_local_interaction([(vec![next.into()], Count::provided(AB::Expr::ONE))]);
+            } else {
+                builder.assert_zero(next);
+            }
+        }
+    }
+
+    #[test]
+    fn undeclared_successor_columns_are_rejected() {
+        for preprocessed in [false, true] {
+            for lookup in [false, true] {
+                assert!(
+                    std::panic::catch_unwind(|| get_air_degrees::<F, EF, _>(
+                        &UndeclaredSuccessorAir {
+                            preprocessed,
+                            lookup
+                        }
+                    ))
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    struct EmptyLocalInteractionAir;
+
+    impl<X> BaseAir<X> for EmptyLocalInteractionAir {
+        fn width(&self) -> usize {
+            1
+        }
+    }
+
+    impl<AB: InteractionBuilder> Air<AB> for EmptyLocalInteractionAir {
+        fn eval(&self, builder: &mut AB) {
+            builder.assert_zero(builder.main().current_slice()[0]);
+            builder.push_local_interaction(core::iter::empty::<(Vec<AB::Expr>, Count<AB::Expr>)>());
+        }
+    }
+
+    #[test]
+    fn empty_local_interactions_are_inert() {
+        assert_eq!(
+            get_air_degrees::<F, EF, _>(&EmptyLocalInteractionAir),
+            AirDegrees {
+                constraints: 1,
+                interactions: 0
+            }
+        );
+        assert!(
+            crate::lookup::LookupPlan::<F>::build::<EF, _>(&[&EmptyLocalInteractionAir], &[3])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// One constraint and one global interaction, and no local one.
+    struct GlobalInteractionAir;
+
+    impl<X> BaseAir<X> for GlobalInteractionAir {
+        fn width(&self) -> usize {
+            1
+        }
+    }
+
+    impl<AB: InteractionBuilder> Air<AB> for GlobalInteractionAir {
+        fn eval(&self, builder: &mut AB) {
+            let cell: AB::Expr = builder.main().current_slice()[0].into();
+            builder.assert_zero(cell.clone() * cell.clone());
+            builder.push_interaction("global", [cell.clone()], Count::bounded(cell, 1));
+        }
+    }
+
+    /// One constraint, and either one indexed read or one indexed table.
+    struct IndexedDeclarationAir {
+        /// Whether the AIR provides the table rather than reading it.
+        table: bool,
+    }
+
+    impl<X> BaseAir<X> for IndexedDeclarationAir {
+        fn width(&self) -> usize {
+            2
+        }
+    }
+
+    impl<AB: IndexedLookupBuilder> Air<AB> for IndexedDeclarationAir {
+        fn eval(&self, builder: &mut AB) {
+            builder.assert_zero(builder.main().current_slice()[0]);
+            if self.table {
+                builder.push_indexed_table("indexed", TraceWindow::Main, [1]);
+            } else {
+                builder.push_indexed_read("indexed", 0, [1]);
+            }
+        }
+    }
+
+    #[test]
+    fn the_profile_records_which_lookup_families_an_air_declares() {
+        // Invariant: a family counts as declared once the AIR names it, whatever it names.
+        //
+        //     plain constraints        -> neither
+        //     one global interaction   -> lookups
+        //     a local one of no tuple  -> lookups, though the plan finds it inert
+        //     an indexed read alone    -> indexed
+        //     an indexed table alone   -> indexed
+        let declared = |profile: AirProfile| (profile.declares_lookups, profile.declares_indexed);
+        assert_eq!(
+            declared(get_air_profile::<F, EF, _>(&FibAir)),
+            (false, false)
+        );
+        assert_eq!(
+            declared(get_air_profile::<F, EF, _>(&GlobalInteractionAir)),
+            (true, false)
+        );
+        assert_eq!(
+            declared(get_air_profile::<F, EF, _>(&EmptyLocalInteractionAir)),
+            (true, false)
+        );
+        for table in [false, true] {
+            assert_eq!(
+                declared(get_air_profile::<F, EF, _>(&IndexedDeclarationAir {
+                    table
+                })),
+                (false, true),
+                "table: {table}"
+            );
+        }
+    }
+
+    struct ConstantInteractionAir;
+
+    impl<X> BaseAir<X> for ConstantInteractionAir {
+        fn width(&self) -> usize {
+            1
+        }
+    }
+
+    impl<AB: InteractionBuilder> Air<AB> for ConstantInteractionAir {
+        fn eval(&self, builder: &mut AB) {
+            builder.push_interaction(
+                "constant",
+                [AB::Expr::ONE],
+                Count::bounded(AB::Expr::ONE, 1),
+            );
+        }
+    }
+
+    impl<X> BaseAir<X> for InteractionDegreeAir {
+        fn width(&self) -> usize {
+            4
+        }
+    }
+
+    impl<AB: InteractionBuilder> Air<AB> for InteractionDegreeAir {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let local = main.current_slice();
+            let x0: AB::Expr = local[0].into();
+            let x1: AB::Expr = local[1].into();
+            let x2: AB::Expr = local[2].into();
+            let x3: AB::Expr = local[3].into();
+
+            builder.assert_zero(x0.clone() * x1.clone());
+            builder.push_interaction(
+                "degree",
+                [x0.clone() * x1.clone() * x2.clone()],
+                Count::bounded(x3.clone(), 1),
+            );
+            builder
+                .push_local_interaction([(vec![x0.clone()], Count::bounded(x0 * x1 * x2 * x3, 1))]);
+        }
+    }
+
+    #[test]
+    fn interaction_aware_degree_includes_payloads_and_multiplicities() {
+        // Invariant: a lookup's degree is the largest degree over its payloads and its counts,
+        // measured independently of the ordinary constraints.
+        //
+        // Fixture state:
+        //
+        //     constraint          : x0 * x1                -> degree 2
+        //     global payload      : x0 * x1 * x2           -> degree 3
+        //     local multiplicity  : x0 * x1 * x2 * x3      -> degree 4
+        //     -----> the count, not the payload, sets the lookup degree
+        assert_eq!(
+            get_air_degrees::<F, EF, _>(&InteractionDegreeAir),
+            AirDegrees {
+                constraints: 2,
+                interactions: 4,
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "zerocheck requires every nonempty interaction family to have positive symbolic degree"
+    )]
+    fn interaction_aware_degree_rejects_constant_airs() {
+        // A constant family has no round polynomial to send, so its degree group would be
+        // empty while its claim still had to be reduced.
+        //
+        //     payload : ONE  -> degree 0
+        //     count   : ONE  -> degree 0
+        //     -----> rejected rather than silently given a zero-degree group
+        get_air_degrees::<F, EF, _>(&ConstantInteractionAir);
+    }
+
+    /// Build a length-`n` Fibonacci trace seeded with `(0, 1)`.
+    fn fib_trace(n: usize) -> RowMajorMatrix<F> {
+        let mut left = F::ZERO;
+        let mut right = F::ONE;
+        let mut values = Vec::with_capacity(NUM_COLS * n);
+        for _ in 0..n {
+            values.push(left);
+            values.push(right);
+            let next_left = right;
+            let next_right = left + right;
+            left = next_left;
+            right = next_right;
+        }
+        RowMajorMatrix::new(values, NUM_COLS)
+    }
+
+    /// Public inputs `(F_0, F_1, F_n)` for the length-`n` trace.
+    fn fib_public_values(n: usize) -> [F; 3] {
+        let trace = fib_trace(n);
+        let last = trace.values[(n - 1) * NUM_COLS + 1];
+        [F::ZERO, F::ONE, last]
+    }
+
+    #[test]
+    fn zerocheck_accepts_valid_fibonacci() {
+        // A satisfying trace must prove and verify, with the final sum matching
+        // the constraint evaluated at the random point.
+        let n = 8;
+        let trace = fib_trace(n);
+        let pis = fib_public_values(n);
+        let air = FibAir;
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let traces = [&trace];
+        let public_values = [&pis[..]];
+        let (proof, _) = prove_traces(&zerocheck, &traces, &public_values, &mut prover_challenger);
+
+        let mut verifier_challenger = fresh_challenger();
+        let log_heights = [log2_strict_usize(n)];
+        let _ = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &log_heights,
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .expect("valid trace must verify");
+    }
+
+    #[test]
+    fn cached_profile_preserves_the_proof() {
+        // The setup-time profile must replace only symbolic analysis.
+        // Identical transcripts must therefore produce identical proof data and challenges.
+        let trace = fib_trace(8);
+        let public_values = fib_public_values(8);
+        let air = FibAir;
+        let airs = [&air];
+        let traces = [&trace];
+        let public_values = [&public_values[..]];
+
+        // The standalone path derives its metadata immediately before proving.
+        let uncached = AirZerocheck::new(&airs, 0);
+        let (uncached_proof, uncached_point) =
+            prove_traces(&uncached, &traces, &public_values, &mut fresh_challenger());
+
+        // The keyed path receives the same metadata derived during setup.
+        let profiles = [get_air_profile::<F, EF, _>(&air)];
+        let cached = AirZerocheck::with_profiles(&airs, &profiles, 0);
+        let (cached_proof, cached_point) =
+            prove_traces(&cached, &traces, &public_values, &mut fresh_challenger());
+
+        // Every transmitted field is compared because no proof serialization is defined here.
+        assert_eq!(
+            cached_proof.sumcheck.claimed_sum,
+            uncached_proof.sumcheck.claimed_sum
+        );
+        assert_eq!(
+            cached_proof.sumcheck.round_polys,
+            uncached_proof.sumcheck.round_polys
+        );
+        assert_eq!(
+            cached_proof.sumcheck.pow_witnesses,
+            uncached_proof.sumcheck.pow_witnesses
+        );
+        assert_eq!(cached_proof.local, uncached_proof.local);
+        assert_eq!(cached_proof.next, uncached_proof.next);
+        assert_eq!(
+            cached_proof.preprocessed_local,
+            uncached_proof.preprocessed_local
+        );
+        assert_eq!(
+            cached_proof.preprocessed_next,
+            uncached_proof.preprocessed_next
+        );
+        assert_eq!(cached_point, uncached_point);
+    }
+
+    #[test]
+    fn zerocheck_round_polys_have_expected_shape() {
+        // Degree-consistency: the proof has one round per variable, and each round
+        // carries exactly `degree` transmitted evaluations.
+        let n = 8;
+        let trace = fib_trace(n);
+        let pis = fib_public_values(n);
+
+        let mut challenger = fresh_challenger();
+        let air = FibAir;
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+        let traces = [&trace];
+        let public_values = [&pis[..]];
+        let (proof, point) = prove_traces(&zerocheck, &traces, &public_values, &mut challenger);
+
+        // Each Fibonacci constraint is per-variable degree 2 (a degree-1 selector
+        // times a degree-1 column), so the eq-weighted integrand is degree 3.
+        let degree = get_air_degrees::<F, EF, FibAir>(&air).max() + 1;
+        assert_eq!(degree, 3);
+        assert_eq!(proof.sumcheck.num_rounds(), log2_strict_usize(n));
+        assert_eq!(point.num_variables(), log2_strict_usize(n));
+        for round in &proof.sumcheck.round_polys {
+            assert_eq!(round.len(), degree);
+        }
+    }
+
+    #[test]
+    fn zerocheck_round_trip_with_grinding() {
+        // The prover inlines its own grind / observe / sample loop per round.
+        // Every test above runs with pow_bits = 0, so the grinding branch is otherwise unexercised.
+        //
+        // Fixture state:
+        //
+        //     trace height : 8  -> log_height = 3 rounds
+        //     pow_bits     : 4  -> one witness ground per round
+        //
+        // Invariant:
+        //
+        //     a valid trace proves and verifies, and the proof carries one witness per round.
+        let n = 8;
+        let pow_bits = 4;
+        let trace = fib_trace(n);
+        let pis = fib_public_values(n);
+        let air = FibAir;
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, pow_bits);
+
+        // Prove with grinding enabled.
+        let mut prover_challenger = fresh_challenger();
+        let traces = [&trace];
+        let public_values = [&pis[..]];
+        let (proof, _) = prove_traces(&zerocheck, &traces, &public_values, &mut prover_challenger);
+
+        // Grinding emits exactly one witness per sumcheck round.
+        assert_eq!(proof.sumcheck.pow_witnesses.len(), log2_strict_usize(n));
+
+        // The verifier re-checks each round's witness while replaying the transcript.
+        let mut verifier_challenger = fresh_challenger();
+        let log_heights = [log2_strict_usize(n)];
+        let _ = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &log_heights,
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .expect("valid trace must verify with grinding");
+    }
+
+    #[test]
+    fn zerocheck_rejects_violated_constraint() {
+        // Flip one trace cell so a constraint no longer holds.
+        // The claimed sum of zero is then false and the final check must reject.
+        let n = 8;
+        let mut trace = fib_trace(n);
+        trace.values[2 * NUM_COLS] += F::ONE;
+        let pis = fib_public_values(n);
+        let air = FibAir;
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let traces = [&trace];
+        let public_values = [&pis[..]];
+        let (proof, _) = prove_traces(&zerocheck, &traces, &public_values, &mut prover_challenger);
+
+        let mut verifier_challenger = fresh_challenger();
+        let log_heights = [log2_strict_usize(n)];
+        let err = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &log_heights,
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ZerocheckError::FinalSumMismatch));
+    }
+
+    #[test]
+    fn zerocheck_rejects_tampered_opening() {
+        // Corrupt an opening claim; the final check must reject.
+        let n = 8;
+        let trace = fib_trace(n);
+        let pis = fib_public_values(n);
+        let air = FibAir;
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let traces = [&trace];
+        let public_values = [&pis[..]];
+        let (mut proof, _) =
+            prove_traces(&zerocheck, &traces, &public_values, &mut prover_challenger);
+        proof.local[0][0] += EF::ONE;
+
+        let mut verifier_challenger = fresh_challenger();
+        let log_heights = [log2_strict_usize(n)];
+        let err = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &log_heights,
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ZerocheckError::FinalSumMismatch));
+    }
+
+    #[test]
+    fn zerocheck_rejects_tampered_next_opening() {
+        // Corrupt a next-row (successor) opening; the final check must reject.
+        // Fibonacci reads both columns on the next row, so a next claim exists to corrupt.
+        let n = 8;
+        let trace = fib_trace(n);
+        let pis = fib_public_values(n);
+        let air = FibAir;
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let traces = [&trace];
+        let public_values = [&pis[..]];
+        let (mut proof, _) =
+            prove_traces(&zerocheck, &traces, &public_values, &mut prover_challenger);
+        proof.next[0][0] += EF::ONE;
+
+        let mut verifier_challenger = fresh_challenger();
+        let log_heights = [log2_strict_usize(n)];
+        let err = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &log_heights,
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ZerocheckError::FinalSumMismatch));
+    }
+
+    #[test]
+    fn zerocheck_rejects_nonzero_claimed_sum() {
+        // A zerocheck always claims the sum is zero.
+        //
+        // Mutation: take an honest proof and bump its claimed sum off zero.
+        let n = 8;
+        let trace = fib_trace(n);
+        let pis = fib_public_values(n);
+        let air = FibAir;
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let traces = [&trace];
+        let public_values = [&pis[..]];
+        let (mut proof, _) =
+            prove_traces(&zerocheck, &traces, &public_values, &mut prover_challenger);
+
+        // Declare a nonzero sum; the verifier must reject before any further work.
+        proof.sumcheck.claimed_sum += EF::ONE;
+
+        let mut verifier_challenger = fresh_challenger();
+        let log_heights = [log2_strict_usize(n)];
+        let err = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &log_heights,
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ZerocheckError::NonZeroClaimedSum));
+    }
+
+    #[test]
+    fn zerocheck_rejects_wrong_opening_count() {
+        // Each of the two main columns must contribute exactly one current-row opening.
+        //
+        // Fixture state: width-2 AIR, so two local openings are expected.
+        //
+        // Mutation: drop one local opening.
+        //
+        //     local openings: [col_0]        (len 1)
+        //     expected width: 2
+        //     -> 1 != 2 -> reject
+        let n = 8;
+        let trace = fib_trace(n);
+        let pis = fib_public_values(n);
+        let air = FibAir;
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let traces = [&trace];
+        let public_values = [&pis[..]];
+        let (mut proof, _) =
+            prove_traces(&zerocheck, &traces, &public_values, &mut prover_challenger);
+
+        // Remove one opened value so the count no longer matches the AIR width.
+        proof.local[0].pop();
+
+        let mut verifier_challenger = fresh_challenger();
+        let log_heights = [log2_strict_usize(n)];
+        let err = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &log_heights,
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ZerocheckError::OpeningCountMismatch {
+                expected: 2,
+                actual: 1
+            }
+        ));
+    }
+
+    /// Width-2 AIR that holds column 0 constant and reads only column 0 on the next row.
+    ///
+    /// It declares a next-row subset, so only one column needs a successor claim.
+    struct ConstColAir;
+
+    impl<X> BaseAir<X> for ConstColAir {
+        fn width(&self) -> usize {
+            2
+        }
+        fn main_next_row_columns(&self) -> Vec<usize> {
+            // Only column 0 is read on the next row; column 1 is current-row only.
+            alloc::vec![0]
+        }
+    }
+
+    impl<AB: AirBuilder> Air<AB> for ConstColAir {
+        fn eval(&self, builder: &mut AB) {
+            // Bind the current row and the single shifted entry the constraint reads.
+            let main = builder.main();
+            let local0 = main.current_slice()[0];
+            let next0 = main.next_slice()[0];
+
+            // Column 0 keeps its value from one row to the next.
+            builder.when_transition().assert_eq(local0, next0);
+        }
+    }
+
+    /// Trace whose column 0 is the constant `5` and column 1 counts up by row.
+    fn const_col_trace(n: usize) -> RowMajorMatrix<F> {
+        let mut values = Vec::with_capacity(2 * n);
+        for i in 0..n {
+            // Column 0 is constant, so the transition constraint always holds.
+            values.push(F::from_u64(5));
+            // Column 1 is unconstrained filler.
+            values.push(F::from_u64(i as u64));
+        }
+        RowMajorMatrix::new(values, 2)
+    }
+
+    #[test]
+    fn next_claims_cover_only_declared_columns() {
+        // This AIR commits two columns but reads only column 0 on the next row.
+        // So it needs a successor claim for that one column, not for both.
+        //
+        //     current-row (Eq) claims : column 0, column 1   -> 2
+        //     next-row    (Next) claim: column 0              -> 1
+        let n = 8;
+        let trace = const_col_trace(n);
+        let air = ConstColAir;
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let traces = [&trace];
+        let public_values = [&[] as &[F]];
+        let (proof, _) = prove_traces(&zerocheck, &traces, &public_values, &mut prover_challenger);
+
+        // Two committed columns yield two current-row claims.
+        assert_eq!(proof.local.len(), 1);
+        assert_eq!(proof.local[0].len(), 2);
+        // Only the read-ahead column yields a next-row claim.
+        assert_eq!(proof.next.len(), 1);
+        assert_eq!(proof.next[0].len(), 1);
+
+        // The reduction still verifies end to end.
+        let mut verifier_challenger = fresh_challenger();
+        let log_heights = [log2_strict_usize(n)];
+        let _ = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &log_heights,
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .expect("subset-next AIR must verify");
+    }
+
+    type BinaryChal = BinaryChallenger<BinaryField128, HashChallenger<u8, Keccak256Hash, 32>>;
+
+    fn binary_challenger() -> BinaryChal {
+        BinaryChal::from_hasher(b"p3-multi-stark-zerocheck-test".to_vec(), Keccak256Hash)
+    }
+
+    /// Degree-three AIR reading main columns 3 and 1 and preprocessed column 1 on the next row.
+    ///
+    /// ```text
+    ///     transition: next.main[1] = main[0] * main[2]
+    ///     transition: next.main[3] = main[3] * main[1] + main[0]
+    ///     transition: next.prep[1] = prep[0] * main[2]
+    /// ```
+    ///
+    /// With `declare_all`, the AIR keeps the default declaration of every column instead.
+    /// Both declarations describe the same constraints.
+    struct SuccessorSubsetAir {
+        declare_all: bool,
+    }
+
+    impl<X> BaseAir<X> for SuccessorSubsetAir {
+        fn width(&self) -> usize {
+            4
+        }
+        fn preprocessed_width(&self) -> usize {
+            2
+        }
+        fn main_next_row_columns(&self) -> Vec<usize> {
+            // Out of order on purpose: the declaration is a set, not a layout.
+            if self.declare_all {
+                (0..4).collect()
+            } else {
+                vec![3, 1]
+            }
+        }
+        fn preprocessed_next_row_columns(&self) -> Vec<usize> {
+            if self.declare_all {
+                (0..2).collect()
+            } else {
+                vec![1]
+            }
+        }
+    }
+
+    impl<AB: AirBuilder> Air<AB> for SuccessorSubsetAir {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let (local, next) = (main.current_slice(), main.next_slice());
+            let preprocessed = builder.preprocessed();
+            let prep = preprocessed.current_slice()[0];
+            let prep_next = preprocessed.next_slice()[1];
+
+            let mut transition = builder.when_transition();
+            transition.assert_eq(next[1], local[0] * local[2]);
+            transition.assert_eq(next[3], local[3] * local[1] + local[0]);
+            transition.assert_eq(prep_next, prep * local[2]);
+        }
+    }
+
+    /// Satisfying main and preprocessed traces for [`SuccessorSubsetAir`].
+    ///
+    /// Every column the AIR never reads ahead is fresh randomness on each row.
+    fn successor_subset_traces<F: Field>(n: usize) -> (RowMajorMatrix<F>, RowMajorMatrix<F>)
+    where
+        StandardUniform: Distribution<F>,
+    {
+        let mut rng = SmallRng::seed_from_u64(0x5ECC);
+        let mut main: Vec<F> = (0..4).map(|_| rng.random()).collect();
+        let mut prep: Vec<F> = (0..2).map(|_| rng.random()).collect();
+        for row in 1..n {
+            let [m0, m1, m2, m3] = main[4 * (row - 1)..4 * row] else {
+                unreachable!()
+            };
+            let p0 = prep[2 * (row - 1)];
+            main.extend([rng.random(), m0 * m2, rng.random(), m3 * m1 + m0]);
+            prep.extend([rng.random(), p0 * m2]);
+        }
+        (RowMajorMatrix::new(main, 4), RowMajorMatrix::new(prep, 2))
+    }
+
+    /// Degree-two AIR that reads no successor column at all.
+    ///
+    /// With `declare_all`, the AIR keeps the default declaration of every column instead.
+    struct SuccessorFreeAir {
+        declare_all: bool,
+    }
+
+    impl<X> BaseAir<X> for SuccessorFreeAir {
+        fn width(&self) -> usize {
+            3
+        }
+        fn main_next_row_columns(&self) -> Vec<usize> {
+            if self.declare_all {
+                (0..3).collect()
+            } else {
+                vec![]
+            }
+        }
+    }
+
+    impl<AB: AirBuilder> Air<AB> for SuccessorFreeAir {
+        fn eval(&self, builder: &mut AB) {
+            let main = builder.main();
+            let local = main.current_slice();
+            builder.assert_eq(local[2], local[0] * local[1]);
+        }
+    }
+
+    /// Satisfying trace for [`SuccessorFreeAir`].
+    fn successor_free_trace<F: Field>(n: usize) -> RowMajorMatrix<F>
+    where
+        StandardUniform: Distribution<F>,
+    {
+        let mut rng = SmallRng::seed_from_u64(0xF12EE);
+        let values = (0..n)
+            .flat_map(|_| {
+                let (a, b): (F, F) = (rng.random(), rng.random());
+                [a, b, a * b]
+            })
+            .collect();
+        RowMajorMatrix::new(values, 3)
+    }
+
+    /// Prove one AIR through the zerocheck, then verify the proof.
+    fn prove_and_verify<F, EF, A, Ch>(
+        air: &A,
+        main: &RowMajorMatrix<F>,
+        preprocessed: Option<&RowMajorMatrix<F>>,
+        challenger: impl Fn() -> Ch,
+    ) -> (ZerocheckProof<F, EF>, Point<EF>)
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: ProverAir<F, EF>,
+        EF::ExtensionPacking: From<EF> + From<F::Packing>,
+        Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        let airs = [air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+        let table = Table::new(main.transpose());
+        let preprocessed = preprocessed.map(|trace| Table::new(trace.transpose()));
+        let proven = zerocheck.prove::<F, EF, _>(
+            &[preprocessed.as_ref()],
+            &[&table],
+            &[&[]],
+            &mut challenger(),
+        );
+        let point = zerocheck
+            .verify::<F, EF, _>(
+                &proven.0,
+                &[table.num_variables()],
+                &[&[]],
+                &mut challenger(),
+            )
+            .expect("honest proof must verify");
+        assert_eq!(point, proven.1);
+        proven
+    }
+
+    /// Prove an AIR declaring only the successor columns it reads, and its twin declaring all.
+    ///
+    /// The declaration is not bound into the zerocheck transcript.
+    /// So both proofs must carry the same round polynomials, point, and current-row openings.
+    /// The declared successor openings must match the corresponding entries of the full set.
+    fn check_declared_successors_match_all<F, EF, A, Ch>(
+        declared: &A,
+        all: &A,
+        main: &RowMajorMatrix<F>,
+        preprocessed: Option<&RowMajorMatrix<F>>,
+        challenger: impl Fn() -> Ch,
+    ) where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        A: ProverAir<F, EF>,
+        EF::ExtensionPacking: From<EF> + From<F::Packing>,
+        Ch: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        let (declared_proof, declared_point) =
+            prove_and_verify::<F, EF, _, _>(declared, main, preprocessed, &challenger);
+        let (all_proof, all_point) =
+            prove_and_verify::<F, EF, _, _>(all, main, preprocessed, &challenger);
+
+        assert_eq!(
+            declared_proof.sumcheck.round_polys,
+            all_proof.sumcheck.round_polys
+        );
+        assert_eq!(declared_point, all_point);
+        assert_eq!(declared_proof.local, all_proof.local);
+        assert_eq!(
+            declared_proof.preprocessed_local,
+            all_proof.preprocessed_local
+        );
+
+        // Each declared successor opening is the full set's entry for that column.
+        let pick = |columns: Vec<usize>, all_values: &[EF]| {
+            columns
+                .into_iter()
+                .map(|column| all_values[column])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            declared_proof.next[0],
+            pick(declared.main_next_row_columns(), &all_proof.next[0])
+        );
+        assert_eq!(
+            declared_proof.preprocessed_next[0],
+            pick(
+                declared.preprocessed_next_row_columns(),
+                &all_proof.preprocessed_next[0]
+            )
+        );
+    }
+
+    /// Trace heights for the prime-field successor twins.
+    ///
+    /// A round runs the packed kernel only while half its rows fill a SIMD lane group.
+    ///
+    /// ```text
+    ///     64 rows : packed first rounds, then scalar once the residual rows run short
+    ///     4, 2    : below a lane group of every SIMD packing, so scalar from the first round
+    /// ```
+    const PRIME_SUCCESSOR_HEIGHTS: [usize; 3] = [64, 4, 2];
+
+    #[test]
+    fn successor_subset_matches_full_declaration_over_a_prime_field() {
+        for height in PRIME_SUCCESSOR_HEIGHTS {
+            let (main, preprocessed) = successor_subset_traces::<F>(height);
+            check_declared_successors_match_all::<F, EF, _, _>(
+                &SuccessorSubsetAir { declare_all: false },
+                &SuccessorSubsetAir { declare_all: true },
+                &main,
+                Some(&preprocessed),
+                fresh_challenger,
+            );
+        }
+    }
+
+    #[test]
+    fn successor_free_matches_full_declaration_over_a_prime_field() {
+        for height in PRIME_SUCCESSOR_HEIGHTS {
+            let main = successor_free_trace::<F>(height);
+            check_declared_successors_match_all::<F, EF, _, _>(
+                &SuccessorFreeAir { declare_all: false },
+                &SuccessorFreeAir { declare_all: true },
+                &main,
+                None,
+                fresh_challenger,
+            );
+        }
+    }
+
+    #[test]
+    fn successor_subset_matches_full_declaration_over_a_binary_field() {
+        let (main, preprocessed) = successor_subset_traces::<BinaryField128>(32);
+        check_declared_successors_match_all::<BinaryField128, BinaryField128, _, _>(
+            &SuccessorSubsetAir { declare_all: false },
+            &SuccessorSubsetAir { declare_all: true },
+            &main,
+            Some(&preprocessed),
+            binary_challenger,
+        );
+    }
+
+    #[test]
+    fn successor_free_matches_full_declaration_over_a_binary_field() {
+        let main = successor_free_trace::<BinaryField128>(32);
+        check_declared_successors_match_all::<BinaryField128, BinaryField128, _, _>(
+            &SuccessorFreeAir { declare_all: false },
+            &SuccessorFreeAir { declare_all: true },
+            &main,
+            None,
+            binary_challenger,
+        );
+    }
+
+    #[test]
+    fn zerocheck_poseidon2() {
+        // Invariant on the Poseidon2 permutation AIR:
+        //   - each current-row opening equals the column multilinear at the bound point;
+        //   - each next-row opening equals the shifted column at that point;
+        //   - prover and verifier bind the same sumcheck point.
+        //
+        // Trace height is the only axis, swept exhaustively over 1..10.
+        for num_vars in 1..10 {
+            // Trace height 2^num_vars, i.e. one hashed input per row.
+            let num_hashes = 1 << num_vars;
+
+            // Deterministic round constants, so the trace and transcript are reproducible.
+            let mut rng = SmallRng::seed_from_u64(1);
+            let constants = RoundConstants::from_rng(&mut rng);
+            let air: BabyBearPoseidon2Air = Poseidon2Air::new(constants);
+
+            // Witness trace: each row is one full permutation, satisfying every constraint.
+            let trace =
+                tracing::info_span!("zerocheck_poseidon2_generate_trace", num_vars, num_hashes)
+                    .in_scope(|| air.generate_random_trace_rows(num_hashes, 0));
+
+            // Prove the alpha-batched constraint vanishes on every row.
+            let airs = [&air];
+            let zerocheck = AirZerocheck::new(&airs, 0);
+            let mut prover_challenger = fresh_challenger();
+            let traces = [&trace];
+            let public_values = [&[] as &[F]];
+            let (proof, point_prover) =
+                prove_traces(&zerocheck, &traces, &public_values, &mut prover_challenger);
+
+            // Reference columns: one multilinear per trace column, in row order.
+            //
+            //     row-major trace --transpose--> one row per column
+            let columns = trace.transpose();
+            let columns = columns
+                .row_slices()
+                .map(|col| Poly::new(col.to_vec()))
+                .collect::<Vec<_>>();
+
+            // Each current-row opening must equal the column multilinear at the bound point.
+            columns
+                .iter()
+                .zip(proof.local[0].iter())
+                .for_each(|(col, &local)| {
+                    assert_eq!(col.eval_base(&point_prover), local);
+                });
+
+            // Each next-row opening must equal the same column shifted by one row.
+            air.main_next_row_columns()
+                .iter()
+                .zip(proof.next[0].iter())
+                .for_each(|(&column, &next)| {
+                    assert_eq!(columns[column].eval_next_base(&point_prover), next);
+                });
+
+            // Replaying the transcript must reproduce the prover's bound point exactly.
+            let mut verifier_challenger = fresh_challenger();
+            let log_heights = [num_vars];
+            let point_verifier = zerocheck
+                .verify::<F, EF, _>(
+                    &proof,
+                    &log_heights,
+                    &public_values,
+                    &mut verifier_challenger,
+                )
+                .unwrap();
+            assert_eq!(point_prover, point_verifier);
+        }
+    }
+
+    #[allow(clippy::large_enum_variant)]
+    enum MixedAir {
+        Poseidon2(BabyBearPoseidon2Air),
+        Blake3(Blake3Air),
+        Fib(FibAir),
+    }
+
+    impl BaseAir<F> for MixedAir {
+        fn width(&self) -> usize {
+            match self {
+                Self::Poseidon2(air) => <BabyBearPoseidon2Air as BaseAir<F>>::width(air),
+                Self::Blake3(air) => <Blake3Air as BaseAir<F>>::width(air),
+                Self::Fib(air) => <FibAir as BaseAir<F>>::width(air),
+            }
+        }
+
+        fn num_public_values(&self) -> usize {
+            match self {
+                Self::Poseidon2(air) => {
+                    <BabyBearPoseidon2Air as BaseAir<F>>::num_public_values(air)
+                }
+                Self::Blake3(air) => <Blake3Air as BaseAir<F>>::num_public_values(air),
+                Self::Fib(air) => <FibAir as BaseAir<F>>::num_public_values(air),
+            }
+        }
+
+        fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
+            match self {
+                Self::Poseidon2(air) => {
+                    <BabyBearPoseidon2Air as BaseAir<F>>::preprocessed_trace(air)
+                }
+                Self::Blake3(air) => <Blake3Air as BaseAir<F>>::preprocessed_trace(air),
+                Self::Fib(air) => <FibAir as BaseAir<F>>::preprocessed_trace(air),
+            }
+        }
+
+        fn preprocessed_width(&self) -> usize {
+            match self {
+                Self::Poseidon2(air) => {
+                    <BabyBearPoseidon2Air as BaseAir<F>>::preprocessed_width(air)
+                }
+                Self::Blake3(air) => <Blake3Air as BaseAir<F>>::preprocessed_width(air),
+                Self::Fib(air) => <FibAir as BaseAir<F>>::preprocessed_width(air),
+            }
+        }
+
+        fn main_next_row_columns(&self) -> Vec<usize> {
+            match self {
+                Self::Poseidon2(air) => {
+                    <BabyBearPoseidon2Air as BaseAir<F>>::main_next_row_columns(air)
+                }
+                Self::Blake3(air) => <Blake3Air as BaseAir<F>>::main_next_row_columns(air),
+                Self::Fib(air) => <FibAir as BaseAir<F>>::main_next_row_columns(air),
+            }
+        }
+
+        fn preprocessed_next_row_columns(&self) -> Vec<usize> {
+            match self {
+                Self::Poseidon2(air) => {
+                    <BabyBearPoseidon2Air as BaseAir<F>>::preprocessed_next_row_columns(air)
+                }
+                Self::Blake3(air) => <Blake3Air as BaseAir<F>>::preprocessed_next_row_columns(air),
+                Self::Fib(air) => <FibAir as BaseAir<F>>::preprocessed_next_row_columns(air),
+            }
+        }
+
+        fn num_constraints(&self) -> Option<usize> {
+            match self {
+                Self::Poseidon2(air) => <BabyBearPoseidon2Air as BaseAir<F>>::num_constraints(air),
+                Self::Blake3(air) => <Blake3Air as BaseAir<F>>::num_constraints(air),
+                Self::Fib(air) => <FibAir as BaseAir<F>>::num_constraints(air),
+            }
+        }
+
+        fn max_constraint_degree(&self) -> Option<usize> {
+            match self {
+                Self::Poseidon2(air) => {
+                    <BabyBearPoseidon2Air as BaseAir<F>>::max_constraint_degree(air)
+                }
+                Self::Blake3(air) => <Blake3Air as BaseAir<F>>::max_constraint_degree(air),
+                Self::Fib(air) => <FibAir as BaseAir<F>>::max_constraint_degree(air),
+            }
+        }
+    }
+
+    impl<AB> Air<AB> for MixedAir
+    where
+        AB: AirBuilder<F = F>,
+        BabyBearPoseidon2Air: Air<AB>,
+        Blake3Air: Air<AB>,
+        FibAir: Air<AB>,
+    {
+        fn eval(&self, builder: &mut AB) {
+            match self {
+                Self::Poseidon2(air) => air.eval(builder),
+                Self::Blake3(air) => air.eval(builder),
+                Self::Fib(air) => air.eval(builder),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "O(num_vars^2) staged Poseidon2/Blake3/Fib proofs; run from heavy CI"]
+    fn staged_zerocheck_mixed_poseidon2_blake3_fib() {
+        for num_vars in 1..10 {
+            let mut rng = SmallRng::seed_from_u64(1);
+            let poseidon_constants = RoundConstants::from_rng(&mut rng);
+            let poseidon_air: BabyBearPoseidon2Air = Poseidon2Air::new(poseidon_constants);
+
+            let mut airs = Vec::<MixedAir>::with_capacity(3 * num_vars);
+            let mut traces = Vec::with_capacity(3 * num_vars);
+            let mut public_values = Vec::<Vec<F>>::with_capacity(3 * num_vars);
+            let mut log_heights = Vec::with_capacity(3 * num_vars);
+
+            for log_height in (1..=num_vars).rev() {
+                let height = 1 << log_height;
+
+                airs.push(MixedAir::Poseidon2(poseidon_air.clone()));
+                traces.push(
+                    tracing::info_span!(
+                        "staged_zerocheck_poseidon2_stage_trace",
+                        num_vars,
+                        log_height
+                    )
+                    .in_scope(|| poseidon_air.generate_random_trace_rows(height, 0)),
+                );
+                public_values.push(Vec::new());
+                log_heights.push(log_height);
+
+                airs.push(MixedAir::Blake3(Blake3Air {}));
+                traces.push(
+                    tracing::info_span!(
+                        "staged_zerocheck_blake3_stage_trace",
+                        num_vars,
+                        log_height
+                    )
+                    .in_scope(|| Blake3Air {}.generate_random_trace_rows(height, 0)),
+                );
+                public_values.push(Vec::new());
+                log_heights.push(log_height);
+
+                airs.push(MixedAir::Fib(FibAir));
+                traces.push(fib_trace(height));
+                public_values.push(fib_public_values(height).to_vec());
+                log_heights.push(log_height);
+            }
+
+            let air_refs = airs.iter().collect::<Vec<_>>();
+            let trace_refs = traces.iter().collect::<Vec<_>>();
+            let public_refs = public_values
+                .iter()
+                .map(|values| &values[..])
+                .collect::<Vec<_>>();
+            let zerocheck = AirZerocheck::new(&air_refs, 0);
+
+            let mut prover_challenger = fresh_challenger();
+            let (proof, point_prover) = prove_traces(
+                &zerocheck,
+                &trace_refs,
+                &public_refs,
+                &mut prover_challenger,
+            );
+
+            assert_eq!(proof.sumcheck.num_rounds(), num_vars);
+            let max_degree = airs
+                .iter()
+                .map(|air| get_air_degrees::<F, EF, MixedAir>(air).max() + 1)
+                .max()
+                .unwrap();
+            for round in &proof.sumcheck.round_polys {
+                assert_eq!(round.len(), max_degree);
+            }
+            assert_eq!(proof.local.len(), airs.len());
+            assert_eq!(proof.next.len(), airs.len());
+
+            for ((((air, trace), &log_height), local), next) in airs
+                .iter()
+                .zip(traces.iter())
+                .zip(log_heights.iter())
+                .zip(proof.local.iter())
+                .zip(proof.next.iter())
+            {
+                let activation_round = num_vars - log_height;
+                let point = Point::new(point_prover.as_slice()[activation_round..].to_vec());
+                assert_eq!(local.len(), trace.width());
+
+                let columns = trace.transpose();
+                let columns = columns
+                    .row_slices()
+                    .map(|col| Poly::new(col.to_vec()))
+                    .collect::<Vec<_>>();
+
+                columns.iter().zip(local.iter()).for_each(|(col, &local)| {
+                    assert_eq!(col.eval_base(&point), local);
+                });
+
+                let next_columns = air.main_next_row_columns();
+                assert_eq!(next.len(), next_columns.len());
+                next_columns
+                    .iter()
+                    .zip(next.iter())
+                    .for_each(|(&column, &next)| {
+                        assert_eq!(columns[column].eval_next_base(&point), next);
+                    });
+            }
+
+            let mut verifier_challenger = fresh_challenger();
+            let point_verifier = zerocheck
+                .verify::<F, EF, _>(&proof, &log_heights, &public_refs, &mut verifier_challenger)
+                .unwrap();
+            assert_eq!(point_prover, point_verifier);
+        }
+    }
+
+    /// Width-1 main AIR tied to a fixed width-1 preprocessed column.
+    ///
+    /// With the main trace equal to the preprocessed trace on every row, both constraints vanish:
+    ///
+    /// - first row: main current value equals preprocessed current value
+    /// - transition: main next value equals preprocessed next value
+    ///
+    /// The transition reads both the main and the preprocessed next row, so every opening path runs.
+    struct PreprocessedAir;
+
+    impl<X> BaseAir<X> for PreprocessedAir {
+        fn width(&self) -> usize {
+            1
+        }
+        fn preprocessed_width(&self) -> usize {
+            1
+        }
+    }
+
+    impl<AB: AirBuilder> Air<AB> for PreprocessedAir {
+        fn eval(&self, builder: &mut AB) {
+            // Read the current and next entry of each single-column window.
+            let main = builder.main();
+            let main_local = main.current_slice()[0];
+            let main_next = main.next_slice()[0];
+            let preprocessed = builder.preprocessed();
+            let preprocessed_local = preprocessed.current_slice()[0];
+            let preprocessed_next = preprocessed.next_slice()[0];
+
+            // The main column equals the fixed column at the boundary and along every step.
+            builder
+                .when_first_row()
+                .assert_eq(main_local, preprocessed_local);
+            builder
+                .when_transition()
+                .assert_eq(main_next, preprocessed_next);
+        }
+    }
+
+    /// A satisfying main / preprocessed pair: both columns hold the same fixed values.
+    fn preprocessed_pair(n: usize) -> (RowMajorMatrix<F>, RowMajorMatrix<F>) {
+        // Any injective column works; an odd arithmetic progression keeps the values distinct.
+        let values: Vec<F> = (0..n).map(|i| F::from_u64(3 + 2 * i as u64)).collect();
+        (
+            RowMajorMatrix::new(values.clone(), 1),
+            RowMajorMatrix::new(values, 1),
+        )
+    }
+
+    /// Build a preprocessed batch of two tall AIRs plus one short AIR.
+    ///
+    /// The two tall AIRs land in one stage, so the second carries nonzero column offsets.
+    /// The short AIR activates one round later, exercising staging with preprocessed columns.
+    ///
+    /// ```text
+    ///     stage tall (num_vars):     air0, air1
+    ///     stage short (num_vars-1):  air2   (activates one round later)
+    /// ```
+    fn preprocessed_batch(
+        num_vars: usize,
+    ) -> ([usize; 3], Vec<RowMajorMatrix<F>>, Vec<RowMajorMatrix<F>>) {
+        // Two AIRs at the tall height share a stage; one AIR sits one height below.
+        let log_heights = [num_vars, num_vars, num_vars - 1];
+        // Split each satisfying pair into its main matrix and its preprocessed matrix.
+        let (mains, preprocessed) = log_heights
+            .iter()
+            .map(|&log_height| preprocessed_pair(1 << log_height))
+            .unzip();
+        (log_heights, mains, preprocessed)
+    }
+
+    #[test]
+    fn staged_zerocheck_preprocessed_multi_air() {
+        for num_vars in 2..6 {
+            // Fixture: three preprocessed AIRs, two sharing the tall stage, one activating late.
+            let (log_heights, mains, preprocessed) = preprocessed_batch(num_vars);
+            let air = PreprocessedAir;
+            let airs = [&air, &air, &air];
+
+            // Transpose each main and preprocessed matrix into the column-major table layout.
+            let main_tables = mains
+                .iter()
+                .map(|main| Table::new(main.transpose()))
+                .collect::<Vec<_>>();
+            let preprocessed_tables = preprocessed
+                .iter()
+                .map(|preprocessed| Table::new(preprocessed.transpose()))
+                .collect::<Vec<_>>();
+            let table_refs = main_tables.iter().collect::<Vec<_>>();
+            let preprocessed_refs = preprocessed_tables.iter().map(Some).collect::<Vec<_>>();
+            let empty: &[F] = &[];
+            let public_values = alloc::vec![empty; 3];
+
+            let zerocheck = AirZerocheck::new(&airs, 0);
+            let mut prover_challenger = fresh_challenger();
+            let (proof, point) = zerocheck.prove::<F, EF, _>(
+                &preprocessed_refs,
+                &table_refs,
+                &public_values,
+                &mut prover_challenger,
+            );
+
+            // One opening group per AIR, in caller order.
+            assert_eq!(proof.preprocessed_local.len(), 3);
+            assert_eq!(proof.preprocessed_next.len(), 3);
+
+            // Each preprocessed opening equals the preprocessed column at that AIR's sub-point.
+            for (air_index, &log_height) in log_heights.iter().enumerate() {
+                // A shorter AIR binds only the last `log_height` coordinates of the global point.
+                let activation_round = num_vars - log_height;
+                let sub_point = Point::new(point.as_slice()[activation_round..].to_vec());
+                let column = preprocessed_tables[air_index].poly(0);
+                assert_eq!(
+                    proof.preprocessed_local[air_index],
+                    [column.eval_base(&sub_point)]
+                );
+                assert_eq!(
+                    proof.preprocessed_next[air_index],
+                    [column.eval_next_base(&sub_point)]
+                );
+            }
+
+            // The whole batch verifies end to end.
+            let mut verifier_challenger = fresh_challenger();
+            let _ = zerocheck
+                .verify::<F, EF, _>(
+                    &proof,
+                    &log_heights,
+                    &public_values,
+                    &mut verifier_challenger,
+                )
+                .expect("preprocessed batch must verify");
+        }
+    }
+
+    #[test]
+    fn staged_zerocheck_rejects_tampered_preprocessed_in_batch() {
+        // Invariant: corrupting one AIR's preprocessed opening in a batch must fail the close.
+        //
+        // Mutation: bump the current-row preprocessed opening of the second tall AIR.
+        //
+        //     air1 shares the tall stage with air0, so its columns sit at a nonzero offset.
+        let num_vars = 4;
+        let (log_heights, mains, preprocessed) = preprocessed_batch(num_vars);
+        let air = PreprocessedAir;
+        let airs = [&air, &air, &air];
+
+        let main_tables = mains
+            .iter()
+            .map(|main| Table::new(main.transpose()))
+            .collect::<Vec<_>>();
+        let preprocessed_tables = preprocessed
+            .iter()
+            .map(|preprocessed| Table::new(preprocessed.transpose()))
+            .collect::<Vec<_>>();
+        let table_refs = main_tables.iter().collect::<Vec<_>>();
+        let preprocessed_refs = preprocessed_tables.iter().map(Some).collect::<Vec<_>>();
+        let empty: &[F] = &[];
+        let public_values = alloc::vec![empty; 3];
+
+        let zerocheck = AirZerocheck::new(&airs, 0);
+        let mut prover_challenger = fresh_challenger();
+        let (mut proof, _) = zerocheck.prove::<F, EF, _>(
+            &preprocessed_refs,
+            &table_refs,
+            &public_values,
+            &mut prover_challenger,
+        );
+
+        // Corrupt the second AIR's preprocessed current-row opening.
+        proof.preprocessed_local[1][0] += EF::ONE;
+
+        let mut verifier_challenger = fresh_challenger();
+        let err = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &log_heights,
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ZerocheckError::FinalSumMismatch));
+    }
+
+    /// Build a Fibonacci batch of two tall AIRs plus one short AIR.
+    ///
+    /// The two tall AIRs share a stage; the short one activates a round later.
+    fn fib_batch(num_vars: usize) -> ([usize; 3], Vec<RowMajorMatrix<F>>, Vec<Vec<F>>) {
+        let log_heights = [num_vars, num_vars, num_vars - 1];
+        let traces = log_heights
+            .iter()
+            .map(|&log_height| fib_trace(1 << log_height))
+            .collect::<Vec<_>>();
+        let public_values = log_heights
+            .iter()
+            .map(|&log_height| fib_public_values(1 << log_height).to_vec())
+            .collect::<Vec<_>>();
+        (log_heights, traces, public_values)
+    }
+
+    #[test]
+    fn staged_zerocheck_rejects_violated_air_in_batch() {
+        // Invariant: one unsatisfied AIR in a batch makes the batched final check reject.
+        //
+        // Mutation: break a transition row of the second tall AIR, leaving the others valid.
+        //
+        //     beta batches the AIRs, so a single nonzero constraint sum survives w.h.p.
+        let num_vars = 4;
+        let (log_heights, mut traces, public_values) = fib_batch(num_vars);
+
+        // Break the transition constraint at row 2 of the second AIR.
+        traces[1].values[2 * NUM_COLS] += F::ONE;
+
+        let air = FibAir;
+        let airs = [&air, &air, &air];
+        let trace_refs = traces.iter().collect::<Vec<_>>();
+        let public_refs = public_values
+            .iter()
+            .map(|values| &values[..])
+            .collect::<Vec<_>>();
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let (proof, _) = prove_traces(
+            &zerocheck,
+            &trace_refs,
+            &public_refs,
+            &mut prover_challenger,
+        );
+
+        let mut verifier_challenger = fresh_challenger();
+        let err = zerocheck
+            .verify::<F, EF, _>(&proof, &log_heights, &public_refs, &mut verifier_challenger)
+            .unwrap_err();
+        assert!(matches!(err, ZerocheckError::FinalSumMismatch));
+    }
+
+    #[test]
+    fn staged_zerocheck_rejects_tampered_opening_in_late_stage() {
+        // Invariant: tampering a late-activating AIR's opening is caught at its own sub-point.
+        //
+        // Mutation: bump a current-row opening of the short AIR, which activates one round late.
+        let num_vars = 4;
+        let (log_heights, traces, public_values) = fib_batch(num_vars);
+
+        let air = FibAir;
+        let airs = [&air, &air, &air];
+        let trace_refs = traces.iter().collect::<Vec<_>>();
+        let public_refs = public_values
+            .iter()
+            .map(|values| &values[..])
+            .collect::<Vec<_>>();
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let (mut proof, _) = prove_traces(
+            &zerocheck,
+            &trace_refs,
+            &public_refs,
+            &mut prover_challenger,
+        );
+
+        // The short AIR is the last entry; corrupt its first current-row opening.
+        proof.local[2][0] += EF::ONE;
+
+        let mut verifier_challenger = fresh_challenger();
+        let err = zerocheck
+            .verify::<F, EF, _>(&proof, &log_heights, &public_refs, &mut verifier_challenger)
+            .unwrap_err();
+        assert!(matches!(err, ZerocheckError::FinalSumMismatch));
+    }
+
+    /// The seed and output cells the Fibonacci AIR below can bind by position.
+    ///
+    /// ```text
+    ///     column 0, first row -> public value 0
+    ///     column 1, first row -> public value 1
+    ///     column 1, last  row -> public value 2
+    /// ```
+    const FIB_IO_CELLS: [BoundaryPublic; 3] = [
+        BoundaryPublic::new(0, BoundaryEnd::First, 0),
+        BoundaryPublic::new(1, BoundaryEnd::First, 1),
+        BoundaryPublic::new(1, BoundaryEnd::Last, 2),
+    ];
+
+    /// Fibonacci recurrence with no boundary constraint, parameterized by its listed cells.
+    ///
+    /// Every instantiation asserts the same two transition constraints.
+    /// Only the listed cells set two instantiations apart.
+    struct FibRecurrenceAir {
+        cells: &'static [BoundaryPublic],
+    }
+
+    impl<X> BaseAir<X> for FibRecurrenceAir {
+        fn width(&self) -> usize {
+            NUM_COLS
+        }
+
+        fn num_public_values(&self) -> usize {
+            3
+        }
+
+        fn public_boundary_io(&self) -> &[BoundaryPublic] {
+            self.cells
+        }
+    }
+
+    impl<AB: AirBuilder> Air<AB> for FibRecurrenceAir {
+        fn eval(&self, builder: &mut AB) {
+            // Read the current row and the row after it.
+            let main = builder.main();
+            let local: &FibRow<AB::Var> = main.current_slice().borrow();
+            let next: &FibRow<AB::Var> = main.next_slice().borrow();
+
+            // Advance the recurrence on every row but the last.
+            //
+            //     next.left  = right
+            //     next.right = left + right
+            let mut trans = builder.when_transition();
+            trans.assert_eq(local.right, next.left);
+            trans.assert_eq(local.left + local.right, next.right);
+        }
+    }
+
+    #[test]
+    fn constraint_count_includes_the_boundary_io_pins() {
+        // The folder batches the AIR's own constraints, then one pin per listed cell.
+        //
+        //     no cell     : 2 transitions            -> 2
+        //     three cells : 2 transitions + 3 pins   -> 5
+        let loose = get_air_profile::<F, EF, _>(&FibRecurrenceAir { cells: &[] });
+        assert_eq!(loose.num_constraints, 2);
+        let pinned = get_air_profile::<F, EF, _>(&FibRecurrenceAir {
+            cells: &FIB_IO_CELLS,
+        });
+        assert_eq!(pinned.num_constraints, 5);
+    }
+
+    #[test]
+    fn boundary_io_pin_binds_the_public_value_to_the_folded_trace() {
+        // Invariant: the pin ties the folded cell value to the public value.
+        //
+        // Without it nothing in this AIR reads the claim at all:
+        //
+        //     transitions : hold on the honest trace, whatever is claimed
+        //     public value: never mentioned by a constraint
+        //                   → any output claim passes
+        //
+        // Fixture state: an honest length-8 trace, output claim shifted by one.
+        //
+        //     trace last right : X
+        //     public values    : [0, 1, X + 1]
+        let n = 8;
+        let trace = fib_trace(n);
+        let mut pis = fib_public_values(n);
+        pis[2] += F::ONE;
+        let log_heights = [log2_strict_usize(n)];
+        let traces = [&trace];
+        let public_values = [&pis[..]];
+
+        // Control: the AIR that declares nothing never reads public value 2.
+        // Its fold sums to zero, and the shifted claim slips through unnoticed.
+        let loose_air = FibRecurrenceAir { cells: &[] };
+        let loose_airs = [&loose_air];
+        let loose = AirZerocheck::new(&loose_airs, 0);
+        let (loose_proof, _) =
+            prove_traces(&loose, &traces, &public_values, &mut fresh_challenger());
+        let _ = loose
+            .verify::<F, EF, _>(
+                &loose_proof,
+                &log_heights,
+                &public_values,
+                &mut fresh_challenger(),
+            )
+            .expect("an unbound public value is not checked at all");
+
+        // With the declaration one pin survives on the folded trace:
+        //
+        //     is_last_row * (right - public) = X - (X + 1) = -1
+        //
+        // The fold no longer sums to zero, and the claimed zero sum fails to close.
+        let pinned_air = FibRecurrenceAir {
+            cells: &FIB_IO_CELLS,
+        };
+        let pinned_airs = [&pinned_air];
+        let pinned = AirZerocheck::new(&pinned_airs, 0);
+        let (pinned_proof, _) =
+            prove_traces(&pinned, &traces, &public_values, &mut fresh_challenger());
+        let err = pinned
+            .verify::<F, EF, _>(
+                &pinned_proof,
+                &log_heights,
+                &public_values,
+                &mut fresh_challenger(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ZerocheckError::FinalSumMismatch));
+    }
+
+    #[test]
+    fn boundary_io_pin_raises_the_sumcheck_degree() {
+        // Invariant: a pin can set the sumcheck degree on its own.
+        //
+        //     own constraint : col_0 - col_1              -> degree 1
+        //     injected pin   : is_first_row * (col_0 - p) -> degree 2
+        //     eq weight      : + 1                        -> sumcheck degree 3
+        let air = EqualColumnsIoAir;
+        assert_eq!(
+            get_air_degrees::<F, EF, EqualColumnsIoAir>(&air).constraints,
+            2
+        );
+        assert_eq!(
+            get_air_degrees::<F, EF, EqualColumnsIoAir>(&air).max() + 1,
+            3
+        );
+
+        // Fixture state: 8 rows, both columns holding the public value 7.
+        //
+        //     col_0 - col_1              = 0
+        //     is_first_row * (7 - 7)     = 0
+        //                                  → an honest proof must verify
+        let n = 8;
+        let public = F::from_u64(7);
+        let trace = RowMajorMatrix::new(alloc::vec![public; 2 * n], 2);
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let traces = [&trace];
+        let public_values = [&[public] as &[F]];
+        let (proof, _) = prove_traces(&zerocheck, &traces, &public_values, &mut fresh_challenger());
+
+        // Scoring the pins at degree 1 would send 2 evaluations per round instead of 3.
+        for round in &proof.sumcheck.round_polys {
+            assert_eq!(round.len(), 3);
+        }
+
+        // A truncated round polynomial would not reduce to the constraint at the point.
+        let _ = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &[log2_strict_usize(n)],
+                &public_values,
+                &mut fresh_challenger(),
+            )
+            .expect("a degree-one AIR with a boundary cell must still verify");
+    }
+
+    /// The one cell the degree probe AIR below binds by position.
+    const EQUAL_COLUMNS_IO_CELLS: [BoundaryPublic; 1] =
+        [BoundaryPublic::new(0, BoundaryEnd::First, 0)];
+
+    /// AIR whose own constraint scores degree one, with one cell bound by position.
+    ///
+    /// The equality is ungated.
+    /// No selector lifts its degree above one.
+    struct EqualColumnsIoAir;
+
+    impl<X> BaseAir<X> for EqualColumnsIoAir {
+        fn width(&self) -> usize {
+            2
+        }
+
+        fn num_public_values(&self) -> usize {
+            1
+        }
+
+        fn public_boundary_io(&self) -> &[BoundaryPublic] {
+            &EQUAL_COLUMNS_IO_CELLS
+        }
+    }
+
+    impl<AB: AirBuilder> Air<AB> for EqualColumnsIoAir {
+        fn eval(&self, builder: &mut AB) {
+            // Both columns agree on every row, with no selector in front.
+            let main = builder.main();
+            let row = main.current_slice();
+            builder.assert_eq(row[0], row[1]);
+        }
+    }
+
+    /// Both ends of one column, listed on the shortest trace a zerocheck accepts.
+    ///
+    /// ```text
+    ///     column 0, first row -> public value 0
+    ///     column 0, last  row -> public value 1
+    /// ```
+    const BOTH_ENDS_CELLS: [BoundaryPublic; 2] = [
+        BoundaryPublic::new(0, BoundaryEnd::First, 0),
+        BoundaryPublic::new(0, BoundaryEnd::Last, 1),
+    ];
+
+    /// Single-column AIR asserting nothing, with both of its ends listed.
+    struct BothEndsIoAir;
+
+    impl<X> BaseAir<X> for BothEndsIoAir {
+        fn width(&self) -> usize {
+            1
+        }
+
+        fn num_public_values(&self) -> usize {
+            2
+        }
+
+        fn main_next_row_columns(&self) -> Vec<usize> {
+            // Current-row only: a pin never reads the successor.
+            Vec::new()
+        }
+
+        fn public_boundary_io(&self) -> &[BoundaryPublic] {
+            &BOTH_ENDS_CELLS
+        }
+    }
+
+    impl<AB: AirBuilder> Air<AB> for BothEndsIoAir {
+        fn eval(&self, _builder: &mut AB) {
+            // Empty: both public values are bound by position, not by a constraint.
+        }
+    }
+
+    #[test]
+    fn boundary_io_pins_both_ends_of_a_two_row_trace() {
+        // Invariant: the two ends stay distinct when they are adjacent rows.
+        //
+        // Fixture state: the shortest trace a zerocheck accepts.
+        //
+        //     rows            : [5, 9]
+        //     is_first_row    : 1 on row 0
+        //     is_last_row     : 1 on row 1
+        //                       → one pin each, on neighbouring rows
+        let trace = RowMajorMatrix::new(alloc::vec![F::from_u64(5), F::from_u64(9)], 1);
+        let airs = [&BothEndsIoAir];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+        let traces = [&trace];
+
+        let honest = [F::from_u64(5), F::from_u64(9)];
+        let public_values = [&honest[..]];
+        let (proof, _) = prove_traces(&zerocheck, &traces, &public_values, &mut fresh_challenger());
+        let _ = zerocheck
+            .verify::<F, EF, _>(&proof, &[1], &public_values, &mut fresh_challenger())
+            .expect("both ends of a two-row trace must verify");
+
+        // Mutation: swap the two claims, which only inverted ends would accept.
+        //
+        // Two pins sharing one selector would already fail the honest half above,
+        // since 5 - 9 is nonzero on whichever row both would read.
+        let swapped = [F::from_u64(9), F::from_u64(5)];
+        let public_values = [&swapped[..]];
+        let (proof, _) = prove_traces(&zerocheck, &traces, &public_values, &mut fresh_challenger());
+        let err = zerocheck
+            .verify::<F, EF, _>(&proof, &[1], &public_values, &mut fresh_challenger())
+            .unwrap_err();
+        assert!(matches!(err, ZerocheckError::FinalSumMismatch), "{err:?}");
+    }
+
+    #[test]
+    #[should_panic = "at least two"]
+    fn zerocheck_rejects_height_one_trace() {
+        // A single-row trace has zero sumcheck variables, so no stage ever activates.
+        // The prover rejects it up front rather than failing deep inside the fold.
+        let trace = fib_trace(1);
+        let pis = fib_public_values(1);
+        let air = FibAir;
+        let airs = [&air];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let traces = [&trace];
+        let public_values = [&pis[..]];
+        let mut challenger = fresh_challenger();
+        let _ = prove_traces(&zerocheck, &traces, &public_values, &mut challenger);
+    }
+
+    /// Period of the first periodic column.
+    const PERIOD_A: usize = 2;
+    /// Period of the second periodic column.
+    const PERIOD_B: usize = 4;
+
+    /// The two period vectors, of different lengths.
+    ///
+    /// ```text
+    ///     column 0: [10, 20]        repeats every 2 rows
+    ///     column 1: [1, 2, 3, 4]    repeats every 4 rows
+    /// ```
+    fn periodic_columns() -> Vec<Vec<F>> {
+        vec![
+            vec![F::from_u64(10), F::from_u64(20)],
+            vec![
+                F::from_u64(1),
+                F::from_u64(2),
+                F::from_u64(3),
+                F::from_u64(4),
+            ],
+        ]
+    }
+
+    /// Width-1 main AIR tied to two current-row periodic columns of different periods.
+    ///
+    /// Every row asserts that the main column holds the sum of the two periodic values.
+    ///
+    /// The AIR reads no next row.
+    /// It therefore declares an empty main next-row set.
+    struct PeriodicAir;
+
+    impl BaseAir<F> for PeriodicAir {
+        fn width(&self) -> usize {
+            1
+        }
+        fn num_periodic_columns(&self) -> usize {
+            periodic_columns().len()
+        }
+        fn periodic_columns(&self) -> Cow<'_, [Vec<F>]> {
+            Cow::Owned(periodic_columns())
+        }
+        fn main_next_row_columns(&self) -> Vec<usize> {
+            // Current-row only: no successor claim is needed.
+            Vec::new()
+        }
+    }
+
+    impl<AB: AirBuilder<F = F>> Air<AB> for PeriodicAir {
+        fn eval(&self, builder: &mut AB) {
+            // Read the single main column and both periodic values at the current row.
+            let main = builder.main().current_slice()[0];
+            let periodic = builder.periodic_values();
+
+            // One ungated constraint, degree one in each periodic value.
+            let sum: AB::Expr = periodic[0].into() + periodic[1].into();
+            builder.assert_eq(main, sum);
+        }
+    }
+
+    /// A satisfying trace for the sum AIR.
+    ///
+    ///     main[i] = periodic_0[i mod 2] + periodic_1[i mod 4]
+    fn periodic_trace(n: usize) -> RowMajorMatrix<F> {
+        let cols = periodic_columns();
+        let values = (0..n)
+            .map(|i| cols[0][i % PERIOD_A] + cols[1][i % PERIOD_B])
+            .collect();
+        RowMajorMatrix::new(values, 1)
+    }
+
+    #[test]
+    fn zerocheck_accepts_periodic() {
+        // Invariant, swept over every height both periods divide:
+        //
+        //     closed form at the point == materialized full column at the point
+        //     periodic columns         -> no opening claim
+        //     satisfying trace         -> proves and verifies
+        //
+        // num_vars starts at 2 so the height is a multiple of the larger period, 4.
+        let air = PeriodicAir;
+        let airs = [&air];
+        let empty: &[F] = &[];
+        let public_values: [&[F]; 1] = [empty];
+
+        for num_vars in 2..10 {
+            let n = 1 << num_vars;
+            let trace = periodic_trace(n);
+            let zerocheck = AirZerocheck::new(&airs, 0);
+
+            let mut prover_challenger = fresh_challenger();
+            let (proof, point) = prove_traces(
+                &zerocheck,
+                &[&trace],
+                &public_values,
+                &mut prover_challenger,
+            );
+
+            // Periodic columns are uncommitted, and this AIR reads no next row.
+            // The single opening group therefore carries neither preprocessed nor next-row values.
+            assert!(proof.preprocessed_local[0].is_empty());
+            assert!(proof.next[0].is_empty());
+
+            // The closed form must equal the full-height column folded to the same point.
+            let cols = periodic_columns();
+            let closed = periodic_evals_at::<F, EF>(cols.len(), &cols, point.as_slice())
+                .expect("period vectors fit the trace height");
+            for (col, &value) in cols.iter().zip(closed.iter()) {
+                let full = Poly::new((0..n).map(|i| col[i % col.len()]).collect::<Vec<_>>());
+                assert_eq!(full.eval_base(&point), value);
+            }
+
+            let mut verifier_challenger = fresh_challenger();
+            let _ = zerocheck
+                .verify::<F, EF, _>(
+                    &proof,
+                    &[num_vars],
+                    &public_values,
+                    &mut verifier_challenger,
+                )
+                .expect("periodic AIR must verify");
+        }
+    }
+
+    #[test]
+    fn zerocheck_rejects_violated_periodic_constraint() {
+        // Mutation: break row 0 so the main column no longer holds the periodic sum.
+        //
+        //     row 0 main : sum + 1
+        //                  → the batched constraint is nonzero somewhere
+        //                  → the claimed zero sum cannot close
+        let num_vars = 3;
+        let n = 1 << num_vars;
+        let mut trace = periodic_trace(n);
+        trace.values[0] += F::ONE;
+        let air = PeriodicAir;
+        let airs = [&air];
+        let empty: &[F] = &[];
+        let public_values: [&[F]; 1] = [empty];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let (proof, _) = prove_traces(
+            &zerocheck,
+            &[&trace],
+            &public_values,
+            &mut prover_challenger,
+        );
+
+        let mut verifier_challenger = fresh_challenger();
+        let err = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &[num_vars],
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ZerocheckError::FinalSumMismatch));
+    }
+
+    /// AIR carrying all three column groups at once, with a product of periodic values.
+    ///
+    /// Every row asserts:
+    ///
+    /// ```text
+    ///     main[0] = preprocessed[0] + periodic[0] * periodic[1]
+    /// ```
+    ///
+    /// The periodic product makes the constraint degree two, above every column's own degree.
+    ///
+    /// Nothing is read on the next row.
+    /// No group therefore carries a successor claim.
+    struct AllGroupsAir;
+
+    impl BaseAir<F> for AllGroupsAir {
+        fn width(&self) -> usize {
+            1
+        }
+        fn preprocessed_width(&self) -> usize {
+            1
+        }
+        fn num_periodic_columns(&self) -> usize {
+            periodic_columns().len()
+        }
+        fn periodic_columns(&self) -> Cow<'_, [Vec<F>]> {
+            Cow::Owned(periodic_columns())
+        }
+        fn main_next_row_columns(&self) -> Vec<usize> {
+            Vec::new()
+        }
+        fn preprocessed_next_row_columns(&self) -> Vec<usize> {
+            Vec::new()
+        }
+    }
+
+    impl<AB: AirBuilder<F = F>> Air<AB> for AllGroupsAir {
+        fn eval(&self, builder: &mut AB) {
+            // One value from each of the three column groups, all on the current row.
+            let main = builder.main().current_slice()[0];
+            let preprocessed = builder.preprocessed().current_slice()[0];
+            let periodic = builder.periodic_values();
+
+            // The periodic factors multiply, lifting the constraint to degree two.
+            let product: AB::Expr = periodic[0].into() * periodic[1].into();
+            builder.assert_eq(main, preprocessed.into() + product);
+        }
+    }
+
+    /// A satisfying main / preprocessed pair for the three-group AIR.
+    ///
+    ///     preprocessed[i] = 7 + i
+    ///     main[i]         = preprocessed[i] + periodic_0[i mod 2] * periodic_1[i mod 4]
+    fn all_groups_pair(n: usize) -> (RowMajorMatrix<F>, RowMajorMatrix<F>) {
+        let cols = periodic_columns();
+        let preprocessed: Vec<F> = (0..n).map(|i| F::from_u64(7 + i as u64)).collect();
+        let main = (0..n)
+            .map(|i| preprocessed[i] + cols[0][i % PERIOD_A] * cols[1][i % PERIOD_B])
+            .collect();
+        (
+            RowMajorMatrix::new(main, 1),
+            RowMajorMatrix::new(preprocessed, 1),
+        )
+    }
+
+    #[test]
+    fn zerocheck_periodic_product_raises_the_degree() {
+        // Invariant: a periodic value counts toward the constraint degree like a trace column.
+        //
+        //     periodic[0] * periodic[1] -> degree 2
+        //     eq weight                 -> + 1 -> sumcheck degree 3
+        //
+        // A materialized periodic column is multilinear.
+        // Scoring it at one per variable is therefore exact.
+        let air = AllGroupsAir;
+        assert_eq!(get_air_degrees::<F, EF, AllGroupsAir>(&air).constraints, 2);
+        assert_eq!(get_air_degrees::<F, EF, AllGroupsAir>(&air).max() + 1, 3);
+
+        // Fixture state: 8 rows carrying all three column groups.
+        let num_vars = 3;
+        let (main, preprocessed) = all_groups_pair(1 << num_vars);
+        let main_table = Table::new(main.transpose());
+        let preprocessed_table = Table::new(preprocessed.transpose());
+        let airs = [&air];
+        let empty: &[F] = &[];
+        let public_values: [&[F]; 1] = [empty];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let (proof, _) = zerocheck.prove::<F, EF, _>(
+            &[Some(&preprocessed_table)],
+            &[&main_table],
+            &public_values,
+            &mut prover_challenger,
+        );
+
+        // Each round message carries one evaluation per degree.
+        for round in &proof.sumcheck.round_polys {
+            assert_eq!(round.len(), 3);
+        }
+
+        let mut verifier_challenger = fresh_challenger();
+        let _ = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &[num_vars],
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .expect("a degree-two periodic constraint must verify");
+    }
+
+    #[test]
+    fn staged_zerocheck_periodic_multi_air() {
+        // Invariant: an AIR laid out after one with periodic columns still finds its own columns.
+        //
+        // Two AIRs share one stage. The merged column buffer then holds:
+        //
+        //     [ air0 main | air0 preproc | air0 periodic | air1 main | air1 preproc | air1 periodic ]
+        //
+        // Air 1's spans sit past air 0's periodic block.
+        // Losing that offset would hand air 1 the periodic values of air 0.
+        let num_vars = 3;
+        let n = 1 << num_vars;
+        let (main, preprocessed) = all_groups_pair(n);
+        let main_table = Table::new(main.transpose());
+        let preprocessed_table = Table::new(preprocessed.transpose());
+
+        let air = AllGroupsAir;
+        let airs = [&air, &air];
+        let empty: &[F] = &[];
+        let public_values: [&[F]; 2] = [empty, empty];
+        let zerocheck = AirZerocheck::new(&airs, 0);
+
+        let mut prover_challenger = fresh_challenger();
+        let (proof, point) = zerocheck.prove::<F, EF, _>(
+            &[Some(&preprocessed_table), Some(&preprocessed_table)],
+            &[&main_table, &main_table],
+            &public_values,
+            &mut prover_challenger,
+        );
+
+        // Both AIRs must open their own columns, not the periodic block of a neighbour.
+        let main_at_point = main_table.poly(0).eval_base(&point);
+        let preprocessed_at_point = preprocessed_table.poly(0).eval_base(&point);
+        for air_index in 0..2 {
+            assert_eq!(proof.local[air_index], [main_at_point]);
+            assert_eq!(proof.preprocessed_local[air_index], [preprocessed_at_point]);
+        }
+
+        let mut verifier_challenger = fresh_challenger();
+        let _ = zerocheck
+            .verify::<F, EF, _>(
+                &proof,
+                &[num_vars, num_vars],
+                &public_values,
+                &mut verifier_challenger,
+            )
+            .expect("a batch of periodic AIRs must verify");
+    }
+}

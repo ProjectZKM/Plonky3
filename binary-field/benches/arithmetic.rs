@@ -1,0 +1,1281 @@
+//! Tower arithmetic, comparing the recursive reference routines against whatever `Mul` and
+//! `square` dispatch to on the host.
+//!
+//! Production multiplication uses byte tables at the lower levels and carryless multiplication
+//! at 64 and 128 bits where available; squaring uses direct tower linear maps. Rerunning with
+//! `RUSTFLAGS="-C target-feature=-aes"` (AArch64) or without `+pclmulqdq` (x86-64) measures the
+//! same code with the fast path turned off.
+
+use std::hint::black_box;
+use std::ops::Mul;
+
+use criterion::measurement::Measurement;
+use criterion::{
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main,
+};
+use p3_binary_field::{
+    BinaryField8, BinaryField16, BinaryField32, BinaryField64, BinaryField128, Ghash128,
+    LinearizedPoly8b, PackedRijndael8b, Poly64, Poly192, Rijndael8b, TowerLevel, poly_basis,
+};
+use p3_field::{Algebra, BasedVectorSpace, Field, PackedValue, PrimeCharacteristicRing};
+use rand::distr::{Distribution, StandardUniform};
+use rand::rngs::SmallRng;
+use rand::{RngExt, SeedableRng};
+
+/// Multiplications performed by a single iteration of every benchmark here.
+const REPS: usize = 1000;
+
+/// Independent chains a throughput benchmark interleaves.
+const LANES: usize = 10;
+
+/// Latency and throughput of one level, for both multiplication routines.
+///
+/// The latency benchmark folds a dependent chain, as `p3_field_testing::bench_func` does, so
+/// each product waits on the previous one. The throughput benchmark runs [`LANES`] such chains
+/// side by side over the same number of products, leaving the CPU free to overlap them.
+macro_rules! bench_level {
+    ($c:expr, $t:ty, $bits:literal) => {{
+        let mut rng = SmallRng::seed_from_u64(1);
+        let operands: Vec<$t> = (0..REPS)
+            .map(|_| {
+                let x = rng.random::<$t>();
+                if x.is_zero() { <$t>::ONE } else { x }
+            })
+            .collect();
+
+        let mut group = $c.benchmark_group(concat!("mul/", $bits));
+
+        group.bench_function("reference/latency", |b| {
+            b.iter(|| {
+                black_box(&operands)
+                    .iter()
+                    .fold(<$t>::ONE, |acc, &y| acc.reference_mul(y))
+            });
+        });
+        group.bench_function("dispatched/latency", |b| {
+            b.iter(|| {
+                black_box(&operands)
+                    .iter()
+                    .fold(<$t>::ONE, |acc, &y| acc * y)
+            });
+        });
+
+        group.bench_function("reference/throughput", |b| {
+            b.iter(|| {
+                let mut acc = [<$t>::ONE; LANES];
+                for chunk in black_box(&operands).chunks_exact(LANES) {
+                    for (lane, &y) in acc.iter_mut().zip(chunk) {
+                        *lane = lane.reference_mul(y);
+                    }
+                }
+                acc
+            });
+        });
+        group.bench_function("dispatched/throughput", |b| {
+            b.iter(|| {
+                let mut acc = [<$t>::ONE; LANES];
+                for chunk in black_box(&operands).chunks_exact(LANES) {
+                    for (lane, &y) in acc.iter_mut().zip(chunk) {
+                        *lane *= y;
+                    }
+                }
+                acc
+            });
+        });
+
+        group.finish();
+    }};
+}
+
+/// Latency and throughput of squaring one level, against the multiplication that computes the
+/// same value.
+///
+/// Each step mixes the next operand into the accumulator before squaring, so the chain cannot
+/// be folded away at compile time and both benchmarks pay the same `XOR`.
+macro_rules! bench_square_level {
+    ($c:expr, $t:ty, $bits:literal) => {{
+        let mut rng = SmallRng::seed_from_u64(1);
+        let operands: Vec<$t> = (0..REPS).map(|_| rng.random::<$t>()).collect();
+
+        let mut group = $c.benchmark_group(concat!("square/", $bits));
+
+        group.bench_function("square/latency", |b| {
+            b.iter(|| {
+                black_box(&operands)
+                    .iter()
+                    .fold(<$t>::ONE, |acc, &y| (acc + y).square())
+            });
+        });
+        group.bench_function("mul/latency", |b| {
+            b.iter(|| {
+                black_box(&operands).iter().fold(<$t>::ONE, |acc, &y| {
+                    let x = acc + y;
+                    x * x
+                })
+            });
+        });
+
+        group.bench_function("square/throughput", |b| {
+            b.iter(|| {
+                let mut acc = [<$t>::ONE; LANES];
+                for chunk in black_box(&operands).chunks_exact(LANES) {
+                    for (lane, &y) in acc.iter_mut().zip(chunk) {
+                        *lane = (*lane + y).square();
+                    }
+                }
+                acc
+            });
+        });
+        group.bench_function("mul/throughput", |b| {
+            b.iter(|| {
+                let mut acc = [<$t>::ONE; LANES];
+                for chunk in black_box(&operands).chunks_exact(LANES) {
+                    for (lane, &y) in acc.iter_mut().zip(chunk) {
+                        let x = *lane + y;
+                        *lane = x * x;
+                    }
+                }
+                acc
+            });
+        });
+
+        group.finish();
+    }};
+}
+
+fn bench_mul(c: &mut Criterion) {
+    bench_level!(c, BinaryField8, 8);
+    bench_level!(c, BinaryField16, 16);
+    bench_level!(c, BinaryField32, 32);
+    bench_level!(c, BinaryField64, 64);
+    bench_level!(c, BinaryField128, 128);
+}
+
+fn bench_square(c: &mut Criterion) {
+    bench_square_level!(c, BinaryField8, 8);
+    bench_square_level!(c, BinaryField16, 16);
+    bench_square_level!(c, BinaryField32, 32);
+    bench_square_level!(c, BinaryField64, 64);
+    bench_square_level!(c, BinaryField128, 128);
+}
+
+fn bench_inverse(c: &mut Criterion) {
+    let mut rng = SmallRng::seed_from_u64(1);
+    // Inversion recurses through the level below's `Mul`, so it picks up the fast path too.
+    let operands: Vec<BinaryField128> = (0..REPS)
+        .map(|_| {
+            let x = rng.random::<BinaryField128>();
+            if x.is_zero() { BinaryField128::ONE } else { x }
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("inverse/128");
+    group.bench_function("dispatched", |b| {
+        b.iter(|| {
+            black_box(&operands)
+                .iter()
+                // Addition is `XOR`, so the fold barely adds to the inversions it accumulates.
+                .fold(BinaryField128::ZERO, |acc, &y| acc + y.inverse())
+        });
+    });
+    group.finish();
+}
+
+fn bench_mul_alpha(c: &mut Criterion) {
+    let alpha = BinaryField128::ONE.mul_alpha();
+
+    let mut rng = SmallRng::seed_from_u64(1);
+    let operands: Vec<BinaryField128> = (0..REPS).map(|_| rng.random()).collect();
+
+    let mut group = c.benchmark_group("mul_alpha/128");
+    group.bench_function("reference", |b| {
+        b.iter(|| {
+            black_box(&operands)
+                .iter()
+                .fold(BinaryField128::ZERO, |acc, &y| acc + y.reference_mul(alpha))
+        });
+    });
+    group.bench_function("dispatched", |b| {
+        b.iter(|| {
+            black_box(&operands)
+                .iter()
+                .fold(BinaryField128::ZERO, |acc, &y| acc + y * alpha)
+        });
+    });
+    group.bench_function("typed", |b| {
+        b.iter(|| {
+            black_box(&operands)
+                .iter()
+                .fold(BinaryField128::ZERO, |acc, &y| acc + y.mul_alpha())
+        });
+    });
+    group.finish();
+}
+
+/// Products of a wide element by a narrow one, at one pair of byte-aligned levels.
+///
+/// The narrow operand is fixed and the wide ones vary, which is the shape a twiddle takes.
+/// The accumulator is a bitwise exclusive-or, so the products are free to overlap.
+fn subfield_mul_arm<U, L, M: Measurement>(
+    group: &mut BenchmarkGroup<'_, M>,
+    upper: &str,
+    lower: &str,
+) where
+    U: TowerLevel + Mul<L, Output = U>,
+    L: TowerLevel,
+    StandardUniform: Distribution<U> + Distribution<L>,
+{
+    let mut rng = SmallRng::seed_from_u64(1);
+    let wide: Vec<U> = (0..REPS).map(|_| rng.random()).collect();
+    let narrow: L = rng.random();
+
+    group.bench_function(BenchmarkId::new(upper, lower), |b| {
+        b.iter(|| {
+            black_box(&wide)
+                .iter()
+                .fold(U::ZERO, |acc, &y| acc + y * black_box(narrow))
+        });
+    });
+}
+
+/// A product of a wide element by an element of a level below it, at every such pair.
+///
+/// One route expands the wide operand into coordinates over the narrow level.
+/// The other embeds the narrow operand and takes the wide level's own product.
+///
+/// Coordinate count falls as the narrow level widens, and each coordinate product costs more.
+/// These arms are what fixes where the two routes cross on a given host.
+fn bench_subfield_mul(c: &mut Criterion) {
+    let mut group = c.benchmark_group("subfield_mul");
+
+    subfield_mul_arm::<BinaryField64, BinaryField8, _>(&mut group, "64", "8");
+    subfield_mul_arm::<BinaryField64, BinaryField16, _>(&mut group, "64", "16");
+    subfield_mul_arm::<BinaryField64, BinaryField32, _>(&mut group, "64", "32");
+
+    subfield_mul_arm::<BinaryField128, BinaryField8, _>(&mut group, "128", "8");
+    subfield_mul_arm::<BinaryField128, BinaryField16, _>(&mut group, "128", "16");
+    subfield_mul_arm::<BinaryField128, BinaryField32, _>(&mut group, "128", "32");
+    subfield_mul_arm::<BinaryField128, BinaryField64, _>(&mut group, "128", "64");
+
+    group.finish();
+}
+
+/// Elements flattened by one iteration of [`bench_flatten_to_base`].
+const FLATTEN_LEN: usize = 1 << 20;
+
+/// The tower's `flatten_to_base` against `p3-field`'s default, which the tower overrides.
+///
+/// The default is reproduced here rather than called, since the override shadows it: it takes
+/// `as_basis_coefficients_slice().to_vec()` per element, so it heap-allocates once per field
+/// element on a buffer the override allocates once for.
+fn bench_flatten_to_base(c: &mut Criterion) {
+    let mut rng = SmallRng::seed_from_u64(1);
+    let elems: Vec<BinaryField128> = (0..FLATTEN_LEN).map(|_| rng.random()).collect();
+
+    let mut group = c.benchmark_group("flatten_to_base/BinaryField128");
+
+    group.bench_function("p3-field default", |b| {
+        b.iter_batched(
+            || elems.clone(),
+            |v| {
+                let out: Vec<BinaryField8> = v
+                    .into_iter()
+                    .flat_map(|x| {
+                        BasedVectorSpace::<BinaryField8>::as_basis_coefficients_slice(&x).to_vec()
+                    })
+                    .collect();
+                black_box(out)
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.bench_function("tower override", |b| {
+        b.iter_batched(
+            || elems.clone(),
+            |v| black_box(<BinaryField128 as BasedVectorSpace<BinaryField8>>::flatten_to_base(v)),
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
+/// Random operands in both representations of `GF(2^128)`, lane for lane.
+fn representation_operands() -> (Vec<BinaryField128>, Vec<Ghash128>) {
+    let mut rng = SmallRng::seed_from_u64(1);
+    let tower: Vec<BinaryField128> = (0..REPS).map(|_| rng.random()).collect();
+    let ghash = tower.iter().map(|&x| Ghash128::from(x)).collect();
+    (tower, ghash)
+}
+
+/// Multiplication in the two representations, on a dependent chain.
+///
+/// Both are the same field.
+///
+/// A tower product converts both operands and the result, sixteen lookups apiece.
+/// A polynomial-basis product is already in the basis the instruction wants.
+fn bench_representation_mul_latency(c: &mut Criterion) {
+    let (tower, ghash) = representation_operands();
+
+    let mut group = c.benchmark_group("representations/mul/latency");
+    group.bench_function("tower", |b| {
+        b.iter(|| {
+            black_box(&tower)
+                .iter()
+                .fold(BinaryField128::ONE, |acc, &y| acc * y)
+        });
+    });
+    group.bench_function("ghash", |b| {
+        b.iter(|| {
+            black_box(&ghash)
+                .iter()
+                .fold(Ghash128::ONE, |acc, &y| acc * y)
+        });
+    });
+    group.finish();
+}
+
+/// Multiplication in the two representations, on independent chains the core can overlap.
+fn bench_representation_mul_throughput(c: &mut Criterion) {
+    let (tower, ghash) = representation_operands();
+
+    let mut group = c.benchmark_group("representations/mul/throughput");
+    group.bench_function("tower", |b| {
+        b.iter(|| {
+            let mut acc = [BinaryField128::ONE; LANES];
+            let (chunks, _) = black_box(&tower).as_chunks::<LANES>();
+            for chunk in chunks {
+                for (lane, &y) in acc.iter_mut().zip(chunk) {
+                    *lane *= y;
+                }
+            }
+            acc
+        });
+    });
+    group.bench_function("ghash", |b| {
+        b.iter(|| {
+            let mut acc = [Ghash128::ONE; LANES];
+            let (chunks, _) = black_box(&ghash).as_chunks::<LANES>();
+            for chunk in chunks {
+                for (lane, &y) in acc.iter_mut().zip(chunk) {
+                    *lane *= y;
+                }
+            }
+            acc
+        });
+    });
+    group.finish();
+}
+
+/// Squaring in the two representations.
+///
+/// Each step mixes in the next operand, so the chain cannot fold away at compile time.
+fn bench_representation_square(c: &mut Criterion) {
+    let (tower, ghash) = representation_operands();
+
+    let mut group = c.benchmark_group("representations/square");
+    group.bench_function("tower", |b| {
+        b.iter(|| {
+            black_box(&tower)
+                .iter()
+                .fold(BinaryField128::ONE, |acc, &y| (acc + y).square())
+        });
+    });
+    group.bench_function("ghash", |b| {
+        b.iter(|| {
+            black_box(&ghash)
+                .iter()
+                .fold(Ghash128::ONE, |acc, &y| (acc + y).square())
+        });
+    });
+    // The dedicated squaring drops the two cross products a general multiply pays for.
+    group.bench_function("ghash, through multiplication", |b| {
+        b.iter(|| {
+            black_box(&ghash).iter().fold(Ghash128::ONE, |acc, &y| {
+                let x = acc + y;
+                x * x
+            })
+        });
+    });
+    group.finish();
+}
+
+/// Inversion in the polynomial basis, against converting to the tower and inverting there.
+///
+/// Both arms see the same operands, none of them zero, so neither can panic.
+fn bench_representation_inverse(c: &mut Criterion) {
+    let (_, ghash) = representation_operands();
+    let nonzero: Vec<Ghash128> = ghash
+        .iter()
+        .map(|&x| if x.is_zero() { Ghash128::ONE } else { x })
+        .collect();
+
+    let mut group = c.benchmark_group("representations/inverse");
+    group.bench_function("through tower", |b| {
+        // Include both basis conversions in the comparison.
+        b.iter(|| {
+            black_box(&nonzero).iter().fold(Ghash128::ZERO, |acc, &y| {
+                acc + Ghash128::from(BinaryField128::from(y).inverse())
+            })
+        });
+    });
+
+    group.bench_function("ghash", |b| {
+        b.iter(|| {
+            black_box(&nonzero)
+                .iter()
+                .fold(Ghash128::ZERO, |acc, &y| acc + y.inverse())
+        });
+    });
+    group.finish();
+}
+
+/// What the change of basis costs on its own, in both directions.
+fn bench_representation_convert(c: &mut Criterion) {
+    let (tower, ghash) = representation_operands();
+
+    let mut group = c.benchmark_group("representations/convert");
+    group.bench_function("tower to ghash", |b| {
+        b.iter(|| {
+            black_box(&tower)
+                .iter()
+                .fold(Ghash128::ZERO, |acc, &y| acc + Ghash128::from(y))
+        });
+    });
+    group.bench_function("ghash to tower", |b| {
+        b.iter(|| {
+            black_box(&ghash)
+                .iter()
+                .fold(BinaryField128::ZERO, |acc, &y| {
+                    acc + BinaryField128::from(y)
+                })
+        });
+    });
+
+    // The same conversions over a run of elements, which is how every bulk caller asks.
+    let bits: Vec<u128> = tower.iter().map(|&x| x.to_repr()).collect();
+    group.bench_function("bulk tower to ghash", |b| {
+        b.iter_batched_ref(
+            || bits.clone(),
+            |v| poly_basis::from_tower_slice(v),
+            BatchSize::SmallInput,
+        );
+    });
+    let coordinates = {
+        let mut coordinates = bits.clone();
+        poly_basis::from_tower_slice(&mut coordinates);
+        coordinates
+    };
+    group.bench_function("bulk ghash to tower", |b| {
+        b.iter_batched_ref(
+            || coordinates.clone(),
+            |v| poly_basis::to_tower_slice(v),
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+/// The packing of the polynomial-basis field against its scalar.
+///
+/// One element fills one 128-bit lane.
+/// A packed product is the scalar kernel applied to every lane at once.
+/// Both arms multiply the same number of field elements.
+fn bench_packing(c: &mut Criterion) {
+    type Packing = <Ghash128 as Field>::Packing;
+
+    let width = Packing::WIDTH;
+    let mut rng = SmallRng::seed_from_u64(1);
+
+    // A whole number of packed vectors, so neither arm has a remainder to handle.
+    let scalars: Vec<Ghash128> = (0..REPS.next_multiple_of(width))
+        .map(|_| rng.random())
+        .collect();
+    let packed: Vec<Packing> = Packing::pack_slice(&scalars).to_vec();
+
+    let mut group = c.benchmark_group("packing/mul/throughput");
+    group.throughput(criterion::Throughput::Elements(scalars.len() as u64));
+
+    group.bench_function("scalar", |b| {
+        b.iter(|| {
+            let mut acc = [Ghash128::ONE; LANES];
+            let (chunks, _) = black_box(&scalars).as_chunks::<LANES>();
+            for chunk in chunks {
+                for (lane, &y) in acc.iter_mut().zip(chunk) {
+                    *lane *= y;
+                }
+            }
+            acc
+        });
+    });
+    group.bench_function("packed", |b| {
+        b.iter(|| {
+            let mut acc = [Packing::ONE; LANES];
+            let (chunks, _) = black_box(&packed).as_chunks::<LANES>();
+            for chunk in chunks {
+                for (lane, &y) in acc.iter_mut().zip(chunk) {
+                    *lane *= y;
+                }
+            }
+            acc
+        });
+    });
+    group.finish();
+}
+
+/// Compare direct square roots with the repeated-squaring definition.
+fn bench_ghash_sqrt(c: &mut Criterion) {
+    let (_, operands) = representation_operands();
+    let mut group = c.benchmark_group("ghash/sqrt");
+    for direct in [false, true] {
+        group.bench_function(if direct { "direct" } else { "127 squares" }, |b| {
+            // Mix fresh data into the chain to keep every square root observable.
+            b.iter(|| {
+                black_box(&operands).iter().fold(Ghash128::ONE, |acc, &x| {
+                    let value = acc + x;
+                    if direct {
+                        value.try_sqrt().unwrap()
+                    } else {
+                        value.exp_power_of_2(127)
+                    }
+                })
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Compare deferred reduction with a sum of separately reduced products.
+fn bench_dot_width<P: PackedValue + PrimeCharacteristicRing + Copy, const N: usize>(
+    c: &mut Criterion,
+    label: &str,
+) where
+    StandardUniform: Distribution<P>,
+{
+    let mut rng = SmallRng::seed_from_u64(1);
+    // Both algorithms consume identical full-width random inputs.
+    let a: [P; N] = core::array::from_fn(|_| rng.random());
+    let b: [P; N] = core::array::from_fn(|_| rng.random());
+    let mut group = c.benchmark_group(format!("ghash/dot/{label}/{N}"));
+    group.bench_function("separate", |bencher| {
+        bencher.iter(|| {
+            black_box(&a)
+                .iter()
+                .zip(black_box(&b))
+                .map(|(&x, &y)| x * y)
+                .sum::<P>()
+        });
+    });
+    group.bench_function("deferred", |bencher| {
+        bencher.iter(|| P::dot_product(black_box(&a), black_box(&b)));
+    });
+    group.finish();
+}
+
+/// Packed polynomial-field values weighted by scalar base-field elements.
+fn bench_poly64_mixed_dot(c: &mut Criterion) {
+    type P = <Poly64 as Field>::Packing;
+    let mut rng = SmallRng::seed_from_u64(0x64D07);
+    let mut group = c.benchmark_group("poly64/mixed_dot");
+    macro_rules! length {
+        ($n:literal) => {{
+            let values: [P; $n] = core::array::from_fn(|_| rng.random());
+            let weights: [Poly64; $n] = core::array::from_fn(|_| rng.random());
+            group.bench_function(concat!("separate/", $n), |b| {
+                b.iter(|| {
+                    black_box(&values)
+                        .iter()
+                        .zip(black_box(&weights))
+                        .map(|(&value, &weight)| value * weight)
+                        .sum::<P>()
+                });
+            });
+            group.bench_function(concat!("dispatched/", $n), |b| {
+                b.iter(|| P::mixed_dot_product(black_box(&values), black_box(&weights)));
+            });
+        }};
+    }
+    length!(1);
+    length!(2);
+    length!(4);
+    length!(8);
+    group.finish();
+}
+
+/// Exercise small and long dot products at scalar and native packed widths.
+fn bench_ghash_dot(c: &mut Criterion) {
+    bench_dot_width::<Ghash128, 4>(c, "scalar");
+    bench_dot_width::<Ghash128, 16>(c, "scalar");
+    bench_dot_width::<Ghash128, 64>(c, "scalar");
+    bench_dot_width::<<Ghash128 as Field>::Packing, 4>(c, "packed");
+    bench_dot_width::<<Ghash128 as Field>::Packing, 16>(c, "packed");
+    bench_dot_width::<<Ghash128 as Field>::Packing, 64>(c, "packed");
+}
+
+/// Compare the three ways to weigh a block by the successive powers of the indeterminate.
+///
+/// The pinned zerocheck weights are one constant times those powers.
+///
+/// This is that fold with the constant set aside.
+fn bench_powers_width<const N: usize>(c: &mut Criterion) {
+    let mut rng = SmallRng::seed_from_u64(5);
+
+    // The values being folded.
+    let block: [Ghash128; N] = core::array::from_fn(|_| rng.random());
+
+    // The same powers, materialized as a weight table for the two multiplying baselines.
+    let mut power = Ghash128::ONE;
+    let weights: [Ghash128; N] = core::array::from_fn(|_| {
+        let current = power;
+        power *= Ghash128::from_repr(2);
+        current
+    });
+
+    let mut group = c.benchmark_group(format!("ghash/powers/{N}"));
+
+    // One product per term, each reduced on its own.
+    group.bench_function("multiply", |bencher| {
+        bencher.iter(|| {
+            black_box(&block)
+                .iter()
+                .zip(black_box(&weights))
+                .map(|(&value, &weight)| value * weight)
+                .sum::<Ghash128>()
+        });
+    });
+
+    // One product per term, with the reduction deferred to the end of the sum.
+    group.bench_function("deferred", |bencher| {
+        bencher.iter(|| Ghash128::dot_product(black_box(&block), black_box(&weights)));
+    });
+
+    // The public entry point, which picks the shift or the deferred product per target.
+    group.bench_function("powers", |bencher| {
+        bencher.iter(|| Ghash128::dot_powers_of_x(black_box(&block)));
+    });
+
+    group.finish();
+}
+
+/// Fold a run of blocks against the powers of the indeterminate, from two witness layouts.
+///
+/// A pinned zerocheck may only fold cells valued in the prime field.
+///
+/// So both layouts hold the same bits.
+///
+/// What differs is how they are stored:
+///
+/// ```text
+///     one element per cell   2 MiB   every cell a full field element
+///     one bit per cell      16 KiB   a whole block in one word
+/// ```
+fn bench_powers_stream(c: &mut Criterion) {
+    /// Cells per block, the widest a pinned zerocheck can ask for.
+    const WIDTH: usize = 128;
+    /// Blocks folded by one iteration.
+    const BLOCKS: usize = 1024;
+
+    let mut rng = SmallRng::seed_from_u64(7);
+
+    // The witness as one word per block, each bit a cell.
+    let packed: Vec<u128> = (0..BLOCKS).map(|_| rng.random()).collect();
+
+    // The same cells, written out one field element each.
+    let spelled: Vec<Ghash128> = packed
+        .iter()
+        .flat_map(|&word| (0..WIDTH).map(move |k| Ghash128::from_bool((word >> k) & 1 == 1)))
+        .collect();
+
+    // The weights the multiplying baseline needs materialized.
+    let mut power = Ghash128::ONE;
+    let weights: [Ghash128; WIDTH] = core::array::from_fn(|_| {
+        let current = power;
+        power *= Ghash128::from_repr(2);
+        current
+    });
+
+    let mut group = c.benchmark_group("ghash/powers/stream");
+
+    // One product per cell, each reduced on its own.
+    //
+    // That is what a stored weight table costs, walked one weight at a time.
+    group.bench_function("elements/multiply", |bencher| {
+        bencher.iter(|| {
+            black_box(&spelled)
+                .as_chunks::<WIDTH>()
+                .0
+                .iter()
+                .map(|block| {
+                    block
+                        .iter()
+                        .zip(black_box(&weights))
+                        .map(|(&value, &weight)| value * weight)
+                        .sum::<Ghash128>()
+                })
+                .sum::<Ghash128>()
+        });
+    });
+
+    // One product per cell, with the reduction deferred to the end of each block.
+    group.bench_function("elements/deferred", |bencher| {
+        bencher.iter(|| {
+            black_box(&spelled)
+                .as_chunks::<WIDTH>()
+                .0
+                .iter()
+                .map(|block| Ghash128::dot_product(block, black_box(&weights)))
+                .sum::<Ghash128>()
+        });
+    });
+
+    // The same cells, still one element each, through the public entry point.
+    group.bench_function("elements/powers", |bencher| {
+        bencher.iter(|| {
+            black_box(&spelled)
+                .as_chunks::<WIDTH>()
+                .0
+                .iter()
+                .map(|block| Ghash128::dot_powers_of_x(block))
+                .sum::<Ghash128>()
+        });
+    });
+
+    // The same cells bit-packed, where the fold is the reinterpretation itself.
+    group.bench_function("bits", |bencher| {
+        bencher.iter(|| {
+            black_box(&packed)
+                .iter()
+                .map(|&word| Ghash128::from_repr(word))
+                .sum::<Ghash128>()
+        });
+    });
+
+    group.finish();
+}
+
+/// Exercise the fold at every block width a pinned zerocheck can ask for.
+fn bench_powers_of_x(c: &mut Criterion) {
+    bench_powers_width::<8>(c);
+    bench_powers_width::<16>(c);
+    bench_powers_width::<32>(c);
+    bench_powers_width::<64>(c);
+    bench_powers_width::<128>(c);
+}
+
+fn bench_maps(c: &mut Criterion) {
+    let mut rng = SmallRng::seed_from_u64(17);
+    let values: Vec<BinaryField128> = (0..REPS).map(|_| rng.random()).collect();
+    {
+        let mut group = c.benchmark_group("maps/128");
+        group.bench_function("sqrt", |b| {
+            b.iter(|| {
+                black_box(&values)
+                    .iter()
+                    .map(|x| x.try_sqrt().unwrap())
+                    .sum::<BinaryField128>()
+            });
+        });
+        group.bench_function("frobenius64", |b| {
+            b.iter(|| {
+                black_box(&values)
+                    .iter()
+                    .map(|x| x.exp_power_of_2(64))
+                    .sum::<BinaryField128>()
+            });
+        });
+        group.bench_function("to_poly", |b| {
+            b.iter(|| {
+                black_box(&values)
+                    .iter()
+                    .fold(0u128, |acc, &x| acc ^ poly_basis::from_tower(x))
+            });
+        });
+        let polys: Vec<_> = values.iter().copied().map(poly_basis::from_tower).collect();
+        group.bench_function("from_poly", |b| {
+            b.iter(|| {
+                black_box(&polys)
+                    .iter()
+                    .map(|&x| poly_basis::to_tower(x))
+                    .sum::<BinaryField128>()
+            });
+        });
+        group.bench_function("poly_mul", |b| {
+            b.iter(|| {
+                black_box(&polys)
+                    .iter()
+                    .fold(1, |acc, &x| poly_basis::mul(acc, x))
+            });
+        });
+        group.finish();
+    }
+    let mut group = c.benchmark_group("mixed/128");
+    macro_rules! mixed {
+        ($t:ty, $name:literal) => {{
+            let scalar: $t = rng.random();
+            group.bench_function($name, |b| {
+                b.iter(|| {
+                    black_box(&values)
+                        .iter()
+                        .fold(BinaryField128::ONE, |acc, &x| (acc + x) * black_box(scalar))
+                });
+            });
+        }};
+    }
+    mixed!(BinaryField8, "8");
+    mixed!(BinaryField16, "16");
+    mixed!(BinaryField32, "32");
+    mixed!(BinaryField64, "64");
+    group.finish();
+}
+
+fn bench_grind(c: &mut Criterion) {
+    use p3_binary_field::BinaryChallenger;
+    use p3_challenger::{CanObserve, GrindingChallenger};
+    use p3_keccak::Keccak256Hash;
+    let mut challenger =
+        BinaryChallenger::<BinaryField128, _>::from_hasher(vec![42; 512], Keccak256Hash);
+    challenger.observe(BinaryField128::ONE);
+    c.bench_function("grind/128/12", |b| {
+        b.iter_batched(
+            || challenger.clone(),
+            |mut ch| ch.grind(black_box(12)),
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_bulk(c: &mut Criterion) {
+    use p3_binary_field::BinaryChallenger;
+    use p3_challenger::{CanObserve, CanSample};
+    use p3_keccak::Keccak256Hash;
+    let challenger =
+        BinaryChallenger::<BinaryField128, _>::from_hasher(vec![42; 32], Keccak256Hash);
+    c.bench_function("bulk/sample128", |b| {
+        b.iter_batched(
+            || challenger.clone(),
+            |mut ch| {
+                let samples: Vec<BinaryField128> = (0..1024).map(|_| ch.sample()).collect();
+                black_box(samples)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    c.bench_function("bulk/observe128", |b| {
+        b.iter_batched(
+            || challenger.clone(),
+            |mut ch| {
+                for _ in 0..1024 {
+                    ch.observe(black_box(BinaryField128::ONE));
+                }
+                black_box(ch)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    let coefficients = vec![BinaryField8::ONE; 1 << 20];
+    c.bench_function("bulk/reconstitute128", |b| {
+        b.iter_batched(
+            || coefficients.clone(),
+            <BinaryField128 as BasedVectorSpace<BinaryField8>>::reconstitute_from_base,
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_batch_kernels(c: &mut Criterion) {
+    let mut rng = SmallRng::seed_from_u64(17);
+    let scalar = rng.random::<u128>();
+    {
+        let mut group = c.benchmark_group("batch/poly128");
+        for len in [1, 16, 256, 4096] {
+            let values: Vec<u128> = (0..len).map(|_| rng.random()).collect();
+            group.bench_function(format!("mul/{len}"), |b| {
+                b.iter_batched(
+                    || values.clone(),
+                    |mut v| {
+                        poly_basis::mul_slice(&mut v, black_box(scalar));
+                        v
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+            group.bench_function(format!("butterfly/{len}"), |b| {
+                b.iter_batched(
+                    || (values.clone(), values.clone()),
+                    |(mut lo, mut hi)| {
+                        poly_basis::butterfly_forward(&mut lo, &mut hi, black_box(scalar));
+                        (lo, hi)
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+        group.finish();
+    }
+    let mut group = c.benchmark_group("dot_product");
+    macro_rules! dot {
+        ($t:ty, $n:literal) => {{
+            let a: [$t; $n] = core::array::from_fn(|_| rng.random());
+            let b: [$t; $n] = core::array::from_fn(|_| rng.random());
+            group.bench_function(concat!(stringify!($t), "/", $n), |bench| {
+                bench.iter(|| <$t>::dot_product(black_box(&a), black_box(&b)));
+            });
+        }};
+    }
+    dot!(BinaryField32, 2);
+    dot!(BinaryField32, 16);
+    dot!(BinaryField32, 128);
+    dot!(BinaryField64, 2);
+    dot!(BinaryField64, 16);
+    dot!(BinaryField64, 128);
+    dot!(BinaryField128, 2);
+    dot!(BinaryField128, 16);
+    dot!(BinaryField128, 128);
+    group.finish();
+}
+
+/// The AES field against the tower's own byte field, scalar and packed.
+///
+/// Every arm rewrites one buffer in place, so no arm pays a reduction or a copy another skips.
+///
+/// The buffer is reused across iterations rather than restored, which is sound because every
+/// routine here runs a fixed schedule: its cost does not depend on the values it reads.
+///
+/// ```text
+///     tower      byte table lookup, the representation already in the crate
+///     scalar     shift-and-fold, the portable route here
+///     packed     one instruction per register, where the target has it
+/// ```
+fn bench_aes(c: &mut Criterion) {
+    /// Bytes per buffer, comfortably inside the first level of cache.
+    const BYTES: usize = 4096;
+
+    let mut rng = SmallRng::seed_from_u64(7);
+    let left: Vec<u8> = (0..BYTES).map(|_| rng.random::<u8>() | 1).collect();
+    let right: Vec<u8> = (0..BYTES).map(|_| rng.random::<u8>() | 1).collect();
+
+    let tower_right: Vec<BinaryField8> =
+        right.iter().map(|&b| BinaryField8::from_repr(b)).collect();
+    let aes_right: Vec<Rijndael8b> = right.iter().map(|&b| Rijndael8b::from_byte(b)).collect();
+
+    let mut tower_values: Vec<BinaryField8> =
+        left.iter().map(|&b| BinaryField8::from_repr(b)).collect();
+    let mut aes_values: Vec<Rijndael8b> = left.iter().map(|&b| Rijndael8b::from_byte(b)).collect();
+
+    let block = |from: &[Rijndael8b]| -> Vec<PackedRijndael8b<64>> {
+        from.as_chunks::<64>()
+            .0
+            .iter()
+            .map(|c| *PackedRijndael8b::<64>::from_slice(c))
+            .collect()
+    };
+    let packed_right = block(&aes_values);
+    let mut packed_values = block(&aes_values);
+
+    {
+        let mut group = c.benchmark_group("aes/mul");
+        group.throughput(criterion::Throughput::Elements(BYTES as u64));
+        group.bench_function("tower", |b| {
+            b.iter(|| {
+                for (value, &factor) in black_box(&mut tower_values).iter_mut().zip(&tower_right) {
+                    *value *= factor;
+                }
+            });
+        });
+        group.bench_function("scalar", |b| {
+            b.iter(|| {
+                for (value, &factor) in black_box(&mut aes_values).iter_mut().zip(&aes_right) {
+                    *value *= factor;
+                }
+            });
+        });
+        group.bench_function("packed", |b| {
+            b.iter(|| {
+                for (value, &factor) in black_box(&mut packed_values).iter_mut().zip(&packed_right)
+                {
+                    *value *= factor;
+                }
+            });
+        });
+        group.finish();
+    }
+
+    let mut group = c.benchmark_group("aes/inverse");
+    group.throughput(criterion::Throughput::Elements(BYTES as u64));
+    group.bench_function("tower", |b| {
+        b.iter(|| {
+            for value in black_box(&mut tower_values).iter_mut() {
+                *value = value.try_inverse().unwrap_or(BinaryField8::ONE);
+            }
+        });
+    });
+    group.bench_function("scalar", |b| {
+        b.iter(|| {
+            for value in black_box(&mut aes_values).iter_mut() {
+                *value = value.invert_or_zero();
+            }
+        });
+    });
+    group.bench_function("packed", |b| {
+        b.iter(|| {
+            for block in black_box(&mut packed_values).iter_mut() {
+                *block = block.invert_or_zero();
+            }
+        });
+    });
+    group.finish();
+}
+
+/// The 64-bit polynomial-basis field and its cubic extension, against the 128-bit one.
+///
+/// There is no earlier implementation of either, so the comparison is against the field the
+/// crate already had at the same operation.
+///
+/// Every arm folds a dependent chain, so each product waits on the one before it.
+fn bench_lean_pair(c: &mut Criterion) {
+    let mut rng = SmallRng::seed_from_u64(11);
+
+    let narrow: Vec<Poly64> = (0..REPS).map(|_| rng.random()).collect();
+    let cubic: Vec<Poly192> = (0..REPS).map(|_| rng.random()).collect();
+    let wide: Vec<Ghash128> = (0..REPS).map(|_| rng.random()).collect();
+    let tower: Vec<BinaryField64> = (0..REPS).map(|_| rng.random()).collect();
+
+    {
+        let mut group = c.benchmark_group("lean/mul");
+        group.throughput(criterion::Throughput::Elements(REPS as u64));
+        group.bench_function("gf64", |b| {
+            b.iter(|| {
+                black_box(&narrow)
+                    .iter()
+                    .fold(Poly64::ONE, |acc, &y| acc * y)
+            });
+        });
+        group.bench_function("gf64/tower", |b| {
+            b.iter(|| {
+                black_box(&tower)
+                    .iter()
+                    .fold(BinaryField64::ONE, |acc, &y| acc * y)
+            });
+        });
+        group.bench_function("cubic", |b| {
+            b.iter(|| {
+                black_box(&cubic)
+                    .iter()
+                    .fold(Poly192::ONE, |acc, &y| acc * y)
+            });
+        });
+        group.bench_function("cubic/composed", |b| {
+            b.iter(|| {
+                black_box(&cubic)
+                    .iter()
+                    .fold(Poly192::ONE, |acc, &y| acc.composed_mul(y))
+            });
+        });
+        group.bench_function("gf128", |b| {
+            b.iter(|| {
+                black_box(&wide)
+                    .iter()
+                    .fold(Ghash128::ONE, |acc, &y| acc * y)
+            });
+        });
+        group.finish();
+    }
+
+    let mut group = c.benchmark_group("lean/inverse");
+    group.throughput(criterion::Throughput::Elements(REPS as u64));
+    group.bench_function("gf64", |b| {
+        b.iter(|| {
+            black_box(&narrow)
+                .iter()
+                .map(|x| x.inverse())
+                .fold(Poly64::ZERO, |acc, y| acc + y)
+        });
+    });
+    group.bench_function("cubic", |b| {
+        b.iter(|| {
+            black_box(&cubic)
+                .iter()
+                .map(|x| x.inverse())
+                .fold(Poly192::ZERO, |acc, y| acc + y)
+        });
+    });
+    group.bench_function("gf128", |b| {
+        b.iter(|| {
+            black_box(&wide)
+                .iter()
+                .map(|x| x.inverse())
+                .fold(Ghash128::ZERO, |acc, y| acc + y)
+        });
+    });
+    group.finish();
+}
+
+/// Independent four-pair cubic products, and cubic elements weighted by base-field scalars.
+fn bench_poly192_batches(c: &mut Criterion) {
+    /// Terms of the long weighted sum.
+    const TERMS: usize = 256;
+
+    let mut rng = SmallRng::seed_from_u64(0x192);
+    let quads: Vec<([Poly192; 4], [Poly192; 4])> =
+        (0..REPS).map(|_| (rng.random(), rng.random())).collect();
+    let mut products = vec![[Poly192::ZERO; 4]; REPS];
+    let values: [Poly192; TERMS] = core::array::from_fn(|_| rng.random());
+    let weights: [Poly64; TERMS] = core::array::from_fn(|_| rng.random());
+
+    {
+        let mut group = c.benchmark_group("poly192/mul4");
+        group.throughput(criterion::Throughput::Elements(4 * REPS as u64));
+        group.bench_function("throughput", |b| {
+            b.iter(|| {
+                for (out, (x, y)) in products.iter_mut().zip(black_box(&quads)) {
+                    *out = Poly192::mul4(*x, *y);
+                }
+                black_box(&products);
+            });
+        });
+        group.finish();
+    }
+
+    let mut group = c.benchmark_group("poly192/mixed_dot");
+    group.throughput(criterion::Throughput::Elements(TERMS as u64));
+    group.bench_function("256", |b| {
+        b.iter(|| Poly192::mixed_dot_product(black_box(&values), black_box(&weights)));
+    });
+    group.bench_function("chunks/8", |b| {
+        b.iter(|| {
+            let (values, _) = black_box(&values).as_chunks::<8>();
+            let (weights, _) = black_box(&weights).as_chunks::<8>();
+            values
+                .iter()
+                .zip(weights)
+                .map(|(x, k)| Poly192::mixed_dot_product(x, k))
+                .sum::<Poly192>()
+        });
+    });
+    group.bench_function("batched/64", |b| {
+        b.iter(|| {
+            let (values, _) = black_box(&values).as_chunks::<64>();
+            let (weights, _) = black_box(&weights).as_chunks::<64>();
+            values
+                .iter()
+                .zip(weights)
+                .map(|(x, k)| Poly192::batched_linear_combination(x, k))
+                .sum::<Poly192>()
+        });
+    });
+    group.finish();
+}
+
+/// Frobenius powers and linearized polynomials, tabulated against evaluated.
+///
+/// Every arm rewrites one buffer in place, so the rows are directly comparable.
+///
+/// The twist baseline multiplies rather than squaring.
+///
+/// The scalar square is itself one tabulated map, so squaring would compare one map to three.
+fn bench_frobenius(c: &mut Criterion) {
+    /// Bytes per buffer, comfortably inside the first level of cache.
+    const BYTES: usize = 4096;
+
+    /// The squaring power the twisted arms raise to.
+    const POWER_LOG: usize = 3;
+
+    let mut rng = SmallRng::seed_from_u64(13);
+    let mut scalars: Vec<Rijndael8b> = (0..BYTES).map(|_| rng.random()).collect();
+    let mut blocks: Vec<PackedRijndael8b<64>> = scalars
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .map(|c| *PackedRijndael8b::<64>::from_slice(c))
+        .collect();
+
+    let coefficients: [Rijndael8b; 8] = core::array::from_fn(|_| rng.random());
+    let weight = LinearizedPoly8b::new(coefficients);
+    let tabulated = weight.to_matrix();
+    let twist = Rijndael8b::frobenius_map(POWER_LOG);
+
+    {
+        let mut group = c.benchmark_group("frobenius/twist");
+        group.throughput(criterion::Throughput::Elements(BYTES as u64));
+        group.bench_function("product", |b| {
+            b.iter(|| {
+                for value in black_box(&mut scalars).iter_mut() {
+                    for _ in 0..POWER_LOG {
+                        *value = *value * *value;
+                    }
+                }
+            });
+        });
+        group.bench_function("tabulated", |b| {
+            b.iter(|| {
+                for value in black_box(&mut scalars).iter_mut() {
+                    *value = Rijndael8b::from_byte(twist.apply(value.to_byte()));
+                }
+            });
+        });
+        group.bench_function("packed", |b| {
+            b.iter(|| {
+                for block in black_box(&mut blocks).iter_mut() {
+                    *block = block.frobenius(POWER_LOG);
+                }
+            });
+        });
+        group.finish();
+    }
+
+    let mut group = c.benchmark_group("frobenius/linearized");
+    group.throughput(criterion::Throughput::Elements(BYTES as u64));
+    group.bench_function("evaluated", |b| {
+        b.iter(|| {
+            for value in black_box(&mut scalars).iter_mut() {
+                *value = weight.eval(*value);
+            }
+        });
+    });
+    group.bench_function("tabulated", |b| {
+        b.iter(|| {
+            for value in black_box(&mut scalars).iter_mut() {
+                *value = Rijndael8b::from_byte(tabulated.apply(value.to_byte()));
+            }
+        });
+    });
+    group.bench_function("packed", |b| {
+        b.iter(|| {
+            for block in black_box(&mut blocks).iter_mut() {
+                *block = block.apply(tabulated);
+            }
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_mul,
+    bench_square,
+    bench_inverse,
+    bench_mul_alpha,
+    bench_subfield_mul,
+    bench_flatten_to_base,
+    bench_representation_mul_latency,
+    bench_representation_mul_throughput,
+    bench_representation_square,
+    bench_representation_inverse,
+    bench_representation_convert,
+    bench_packing,
+    bench_ghash_sqrt,
+    bench_ghash_dot,
+    bench_poly64_mixed_dot,
+    bench_powers_of_x,
+    bench_powers_stream,
+    bench_maps,
+    bench_grind,
+    bench_bulk,
+    bench_batch_kernels,
+    bench_aes,
+    bench_lean_pair,
+    bench_poly192_batches,
+    bench_frobenius
+);
+criterion_main!(benches);

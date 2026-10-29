@@ -1,22 +1,20 @@
-#![no_std]
-#![cfg_attr(
-    all(
-        feature = "nightly-features",
-        target_arch = "x86_64",
-        target_feature = "avx512f"
-    ),
-    feature(stdarch_x86_avx512)
-)]
+//! The prime field known as BabyBear, defined as `F_p` where `p = 2^31 - 2^27 + 1`.
 
+#![no_std]
+
+#[cfg(test)]
 extern crate alloc;
 
 mod baby_bear;
-mod extension;
+#[cfg(test)]
+mod extension_test;
 mod mds;
+mod poseidon1;
 mod poseidon2;
 
 pub use baby_bear::*;
 pub use mds::*;
+pub use poseidon1::*;
 pub use poseidon2::*;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -27,25 +25,17 @@ pub use aarch64_neon::*;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx2",
-    not(all(feature = "nightly-features", target_feature = "avx512f"))
+    not(target_feature = "avx512f")
 ))]
 mod x86_64_avx2;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx2",
-    not(all(feature = "nightly-features", target_feature = "avx512f"))
+    not(target_feature = "avx512f")
 ))]
 pub use x86_64_avx2::*;
 
-#[cfg(all(
-    feature = "nightly-features",
-    target_arch = "x86_64",
-    target_feature = "avx512f"
-))]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 mod x86_64_avx512;
-#[cfg(all(
-    feature = "nightly-features",
-    target_arch = "x86_64",
-    target_feature = "avx512f"
-))]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 pub use x86_64_avx512::*;

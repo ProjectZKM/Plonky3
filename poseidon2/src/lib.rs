@@ -1,8 +1,8 @@
 //! The Poseidon2 permutation.
 //!
 //! This implementation was based upon the following resources:
-//! - https://github.com/HorizenLabs/poseidon2/blob/main/plain_implementations/src/poseidon2/poseidon2.rs
-//! - https://eprint.iacr.org/2023/323.pdf
+//! - `<https://github.com/HorizenLabs/poseidon2/blob/main/plain_implementations/src/poseidon2/poseidon2.rs>`
+//! - `<https://eprint.iacr.org/2023/323.pdf>`
 
 #![no_std]
 
@@ -14,27 +14,20 @@ mod internal;
 mod round_numbers;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use serde::{Deserialize, Serialize};
 
 pub use external::*;
 pub use generic::*;
 pub use internal::*;
-use p3_field::{Field, FieldAlgebra, PrimeField, PrimeField64};
+use p3_field::{Algebra, InjectiveMonomial, PrimeField, PrimeField64};
 use p3_symmetric::{CryptographicPermutation, Permutation};
-use rand::distributions::{Distribution, Standard};
-use rand::Rng;
-pub use round_numbers::poseidon2_round_numbers_128;
+use rand::distr::{Distribution, StandardUniform};
+use rand::{Rng, RngExt};
+pub use round_numbers::{Poseidon2RoundNumbersError, poseidon2_round_numbers_128};
 
-const SUPPORTED_WIDTHS: [usize; 8] = [2, 3, 4, 8, 12, 16, 20, 24];
+const SUPPORTED_WIDTHS: [usize; 9] = [2, 3, 4, 8, 12, 16, 20, 24, 32];
 
 /// The Poseidon2 permutation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "F: Serialize, ExternalPerm: Serialize, InternalPerm: Serialize"
-))]
-#[serde(bound(
-    deserialize = "F: Deserialize<'de>, ExternalPerm: Deserialize<'de>, InternalPerm: Deserialize<'de>"
-))]
+#[derive(Clone, Debug)]
 pub struct Poseidon2<F, ExternalPerm, InternalPerm, const WIDTH: usize, const D: u64> {
     /// The permutations used in External Rounds.
     external_layer: ExternalPerm,
@@ -45,21 +38,46 @@ pub struct Poseidon2<F, ExternalPerm, InternalPerm, const WIDTH: usize, const D:
     _phantom: PhantomData<F>,
 }
 
-impl<FA, ExternalPerm, InternalPerm, const WIDTH: usize, const D: u64>
-    Poseidon2<FA, ExternalPerm, InternalPerm, WIDTH, D>
+impl<F, ExternalPerm, InternalPerm, const WIDTH: usize, const D: u64>
+    Poseidon2<F, ExternalPerm, InternalPerm, WIDTH, D>
 where
-    FA: FieldAlgebra,
-    FA::F: PrimeField,
-    ExternalPerm: ExternalLayerConstructor<FA, WIDTH>,
-    InternalPerm: InternalLayerConstructor<FA>,
+    F: PrimeField,
+    ExternalPerm: ExternalLayerConstructor<F, WIDTH>,
+    InternalPerm: InternalLayerConstructor<F>,
 {
     /// Create a new Poseidon2 configuration.
     /// This internally converts the given constants to the relevant packed versions.
     pub fn new(
-        external_constants: ExternalLayerConstants<FA::F, WIDTH>,
-        internal_constants: Vec<FA::F>,
+        external_constants: ExternalLayerConstants<F, WIDTH>,
+        internal_constants: Vec<F>,
     ) -> Self {
-        assert!(SUPPORTED_WIDTHS.contains(&WIDTH));
+        // Compile-time structural checks from the Poseidon2 specification.
+        const {
+            let mut i = 0;
+            let mut found = false;
+            while i < SUPPORTED_WIDTHS.len() {
+                if SUPPORTED_WIDTHS[i] == WIDTH {
+                    found = true;
+                }
+                i += 1;
+            }
+            // Section 6: t ∈ {2, 3, 4, ..., 24}.
+            assert!(
+                found,
+                "WIDTH must be one of the supported widths (paper Section 6)"
+            );
+            // Section 6: S-box(x) = x^d where d ≥ 3.
+            assert!(D >= 3, "Poseidon2 requires D >= 3 (paper Section 6)");
+        }
+
+        // Section 7.1: RF ≥ 6 for statistical attack resistance (differential, linear).
+        let rounds_f = external_constants.get_initial_constants().len()
+            + external_constants.get_terminal_constants().len();
+        assert!(
+            rounds_f >= 6,
+            "Poseidon2 requires rounds_f >= 6 (paper Section 7.1: statistical attacks)"
+        );
+
         let external_layer = ExternalPerm::new_from_constants(external_constants);
         let internal_layer = InternalPerm::new_from_constants(internal_constants);
 
@@ -73,55 +91,64 @@ where
     /// Create a new Poseidon2 configuration with random parameters.
     pub fn new_from_rng<R: Rng>(rounds_f: usize, rounds_p: usize, rng: &mut R) -> Self
     where
-        Standard: Distribution<FA::F> + Distribution<[FA::F; WIDTH]>,
+        StandardUniform: Distribution<F> + Distribution<[F; WIDTH]>,
     {
+        // Section 7.1: RF ≥ 6 for statistical attack resistance.
+        assert!(
+            rounds_f >= 6,
+            "Poseidon2 requires rounds_f >= 6 (paper Section 7.1: statistical attacks)"
+        );
+
         let external_constants = ExternalLayerConstants::new_from_rng(rounds_f, rng);
-        let internal_constants = rng.sample_iter(Standard).take(rounds_p).collect();
+        let internal_constants = rng.sample_iter(StandardUniform).take(rounds_p).collect();
 
         Self::new(external_constants, internal_constants)
     }
 }
 
-impl<FA, ExternalPerm, InternalPerm, const WIDTH: usize, const D: u64>
-    Poseidon2<FA, ExternalPerm, InternalPerm, WIDTH, D>
+impl<F, ExternalPerm, InternalPerm, const WIDTH: usize, const D: u64>
+    Poseidon2<F, ExternalPerm, InternalPerm, WIDTH, D>
 where
-    FA: FieldAlgebra,
-    FA::F: PrimeField64,
-    ExternalPerm: ExternalLayerConstructor<FA, WIDTH>,
-    InternalPerm: InternalLayerConstructor<FA>,
+    F: PrimeField64,
+    ExternalPerm: ExternalLayerConstructor<F, WIDTH>,
+    InternalPerm: InternalLayerConstructor<F>,
 {
     /// Create a new Poseidon2 configuration with 128 bit security and random rounds constants.
+    ///
+    /// # Panics
+    /// This will panic if D and F::ORDER_U64 - 1 are not relatively prime.
+    /// This will panic if the optimal parameters for the given field and width have not been computed.
     pub fn new_from_rng_128<R: Rng>(rng: &mut R) -> Self
     where
-        Standard: Distribution<FA::F> + Distribution<[FA::F; WIDTH]>,
+        StandardUniform: Distribution<F> + Distribution<[F; WIDTH]>,
     {
-        let (rounds_f, rounds_p) = poseidon2_round_numbers_128::<FA::F>(WIDTH, D);
+        let round_numbers = poseidon2_round_numbers_128::<F>(WIDTH, D);
+        let (rounds_f, rounds_p) = round_numbers.unwrap_or_else(|e| panic!("{e}"));
         Self::new_from_rng(rounds_f, rounds_p, rng)
     }
 }
 
-impl<FA, ExternalPerm, InternalPerm, const WIDTH: usize, const D: u64> Permutation<[FA; WIDTH]>
-    for Poseidon2<<FA::F as Field>::Packing, ExternalPerm, InternalPerm, WIDTH, D>
+impl<F, A, ExternalPerm, InternalPerm, const WIDTH: usize, const D: u64> Permutation<[A; WIDTH]>
+    for Poseidon2<F, ExternalPerm, InternalPerm, WIDTH, D>
 where
-    FA: FieldAlgebra + Sync,
-    FA::F: PrimeField,
-    ExternalPerm: ExternalLayer<FA, WIDTH, D>,
-    InternalPerm: InternalLayer<FA, WIDTH, D>,
+    F: PrimeField + InjectiveMonomial<D>,
+    A: Algebra<F> + InjectiveMonomial<D>,
+    ExternalPerm: ExternalLayer<A, WIDTH, D>,
+    InternalPerm: InternalLayer<A, WIDTH, D>,
 {
-    fn permute_mut(&self, state: &mut [FA; WIDTH]) {
+    fn permute_mut(&self, state: &mut [A; WIDTH]) {
         self.external_layer.permute_state_initial(state);
         self.internal_layer.permute_state(state);
         self.external_layer.permute_state_terminal(state);
     }
 }
 
-impl<FA, ExternalPerm, InternalPerm, const WIDTH: usize, const D: u64>
-    CryptographicPermutation<[FA; WIDTH]>
-    for Poseidon2<<FA::F as Field>::Packing, ExternalPerm, InternalPerm, WIDTH, D>
+impl<F, A, ExternalPerm, InternalPerm, const WIDTH: usize, const D: u64>
+    CryptographicPermutation<[A; WIDTH]> for Poseidon2<F, ExternalPerm, InternalPerm, WIDTH, D>
 where
-    FA: FieldAlgebra + Sync,
-    FA::F: PrimeField,
-    ExternalPerm: ExternalLayer<FA, WIDTH, D>,
-    InternalPerm: InternalLayer<FA, WIDTH, D>,
+    F: PrimeField + InjectiveMonomial<D>,
+    A: Algebra<F> + InjectiveMonomial<D>,
+    ExternalPerm: ExternalLayer<A, WIDTH, D>,
+    InternalPerm: InternalLayer<A, WIDTH, D>,
 {
 }

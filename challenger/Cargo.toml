@@ -1,16 +1,38 @@
 [package]
 name = "p3-challenger"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "A Fiat–Shamir transcript and challenger framework used to derive random challenges in proof systems."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+parallel = ["p3-maybe-rayon/parallel"]
+# Shared transcript-seed checks, pulled in as a dev-dependency by consumers.
+test-utils = []
 
 [dependencies]
 p3-field.workspace = true
-p3-util.workspace = true
+p3-keccak.workspace = true
 p3-maybe-rayon.workspace = true
 p3-symmetric.workspace = true
+p3-util.workspace = true
+
+thiserror.workspace = true
 tracing.workspace = true
-serde.workspace = true
 
 [dev-dependencies]
-p3-goldilocks.workspace = true
+num-bigint.workspace = true
+p3-baby-bear = { path = "../baby-bear" }
+p3-blake3 = { path = "../blake3" }
+p3-bn254 = { path = "../bn254" }
+p3-goldilocks = { path = "../goldilocks" }
+p3-koala-bear = { path = "../koala-bear" }
+p3-sha256 = { path = "../sha256" }
+proptest.workspace = true
+
+[lints]
+workspace = true

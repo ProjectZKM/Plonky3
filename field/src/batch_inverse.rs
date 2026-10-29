@@ -4,61 +4,141 @@ use p3_maybe_rayon::prelude::*;
 use tracing::instrument;
 
 use crate::field::Field;
-use crate::{FieldAlgebra, FieldArray, PackedValue};
+use crate::{
+    ExtensionField, FieldArray, PackedFieldExtension, PackedValue, PrimeCharacteristicRing,
+};
 
-/// Batch multiplicative inverses with Montgomery's trick
-/// This is Montgomery's trick. At a high level, we invert the product of the given field
-/// elements, then derive the individual inverses from that via multiplication.
+/// Compute the multiplicative inverse of every element in a slice via Montgomery's trick.
 ///
-/// The usual Montgomery trick involves calculating an array of cumulative products,
-/// resulting in a long dependency chain. To increase instruction-level parallelism, we
-/// compute WIDTH separate cumulative product arrays that only meet at the end.
+/// Replaces `n` field inversions with one inversion plus `~3n` multiplications:
+/// - forward pass: build prefix products of the inputs,
+/// - one inversion of the full product,
+/// - reverse pass: derive each individual inverse from the prefix products.
+///
+/// The forward pass is a long dependency chain. It is parallelised on two axes:
+/// - 4-lane packed arrays — four independent chains run side by side,
+/// - 1024-element chunks — dispatched across Rayon workers.
+///
+/// Lengths not a multiple of 4 finish with a scalar pass on the trailing 1..=3 elements.
 ///
 /// # Panics
-/// This will panic if any of the inputs is zero.
+///
+/// Panics if any input is zero.
 #[instrument(level = "debug", skip_all)]
+#[must_use]
 pub fn batch_multiplicative_inverse<F: Field>(x: &[F]) -> Vec<F> {
-    // How many elements to invert in one thread.
-    const CHUNK_SIZE: usize = 1024;
-
-    let n = x.len();
-    let mut result = F::zero_vec(n);
-
-    x.par_chunks(CHUNK_SIZE)
-        .zip(result.par_chunks_mut(CHUNK_SIZE))
-        .for_each(|(x, result)| {
-            batch_multiplicative_inverse_helper(x, result);
-        });
-
+    let mut result = F::zero_vec(x.len());
+    batch_multiplicative_inverse_map(x, |&x| x, &mut result);
     result
 }
 
-/// Like `batch_multiplicative_inverse`, but writes the result to the given output buffer.
-fn batch_multiplicative_inverse_helper<F: Field>(x: &[F], result: &mut [F]) {
-    // Higher WIDTH increases instruction-level parallelism, but too high a value will cause us
-    // to run out of registers.
+/// Compute the multiplicative inverse of each mapped input into a caller-provided buffer.
+///
+/// Uses chunked, four-lane Montgomery inversion without materializing the mapped inputs.
+/// The mapper may be evaluated more than once per input, in any order and in parallel.
+/// It must return the same field value for a given input on every evaluation.
+/// Cheap mappings are recomputed during the reverse pass to avoid scratch storage.
+///
+/// # Panics
+///
+/// Panics if the input and output lengths differ or any mapped input is zero.
+pub fn batch_multiplicative_inverse_map<A, F, Map>(x: &[A], map: Map, result: &mut [F])
+where
+    A: Sync,
+    F: Field,
+    Map: Fn(&A) -> F + Sync,
+{
+    assert_eq!(x.len(), result.len(), "input and output lengths must match");
+
+    // 1024-element chunks per Rayon task.
+    //
+    // Why 1024:
+    //   - amortizes the one field inversion per chunk over many multiplies,
+    //   - leaves enough chunks for work-stealing on long slices.
+    const CHUNK_SIZE: usize = 1024;
+
+    // 4-lane packing.
+    //
+    // Why 4:
+    //   - smallest packed-field width on every backend,
+    //   - wider lanes risk register spills in the per-lane dependency chains.
     const WIDTH: usize = 4;
 
-    let n = x.len();
-    assert_eq!(result.len(), n);
-    if n % WIDTH != 0 {
-        // There isn't a very clean way to do this with FieldArray; for now just do it in serial.
-        // Another simple (though suboptimal) workaround would be to make two separate calls, one
-        // for the packed part and one for the remainder.
-        return batch_multiplicative_inverse_general(x, result, |x| x.inverse());
-    }
+    // One item is a whole chunk of Montgomery steps, not a chunk of reads.
+    //
+    // Per element the three multiplies and the amortized inversion dominate the move.
+    //
+    // So the chunk is priced by the time it takes, in multiples of what it would cost to read.
+    //
+    // A wider field is charged more because its multiply costs more, not because it moves more.
+    // Measured on Zen 5 with `-C target-cpu=native`, per element, as a multiple of one read:
+    //
+    //     BabyBear             4 B   2.3 ns   5.8 reads
+    //     BabyBear quartic    16 B   8.4 ns   5.2
+    //     BabyBear quintic    20 B  15.9 ns   7.9
+    //     Goldilocks           8 B   1.5 ns   1.8
+    //     Goldilocks quadratic 16 B   8.1 ns   5.1
+    //     Ghash128            16 B   6.7 ns   4.2
+    //
+    // Five reads slightly overcharges Goldilocks and can split it one size early.
+    // It stays within a factor of 1.6 of the other measured rows.
+    // A build without the wide carryless multiply puts the binary field at 44 reads instead,
+    // so the residual error is an undercharge, which only ever leaves a loop whole.
+    x.par_chunks(CHUNK_SIZE)
+        .zip(result.par_chunks_mut(CHUNK_SIZE))
+        .with_min_task_bytes(5 * CHUNK_SIZE * size_of::<F>())
+        .for_each(|(x_chunk, result_chunk)| {
+            // Phase 1 — split the chunk:
+            //   - packed: 4-aligned prefix viewed as 4-lane arrays,
+            //   - tail:   0..=3 trailing scalars (m = n - n%4).
+            //
+            //     x_chunk:  [ x_0 .. x_{m-1} | x_m .. x_{n-1} ]
+            //               └──── packed ────┘└──── tail ────┘
+            let (x_packed, x_tail) = x_chunk.as_chunks::<WIDTH>();
+            let (result_packed, result_tail) =
+                FieldArray::<F, WIDTH>::pack_slice_with_suffix_mut(result_chunk);
 
-    let x_packed = FieldArray::<F, 4>::pack_slice(x);
-    let result_packed = FieldArray::<F, 4>::pack_slice_mut(result);
+            // Phase 2 — packed pass: 4 independent Montgomery chains, one per lane.
+            //
+            // Final inversion lands on a 4-lane array → one scalar inversion per chunk.
+            batch_multiplicative_inverse_general_map(
+                x_packed,
+                |xs| FieldArray(core::array::from_fn(|i| map(&xs[i]))),
+                result_packed,
+                |y| y.inverse(),
+            );
 
-    batch_multiplicative_inverse_general(x_packed, result_packed, |x_packed| x_packed.inverse());
+            // Phase 3 — tail pass: 0..=3 leftover scalars.
+            //
+            // Empty when n % 4 == 0; this call then returns immediately.
+            batch_multiplicative_inverse_general_map(x_tail, &map, result_tail, |y| y.inverse());
+        });
 }
 
-/// A simple single-threaded implementation of Montgomery's trick. Since not all `FieldAlgebra`s
+/// A simple single-threaded implementation of Montgomery's trick. Since not all `PrimeCharacteristicRing`s
 /// support inversion, this takes a custom inversion function.
-pub(crate) fn batch_multiplicative_inverse_general<F, Inv>(x: &[F], result: &mut [F], inv: Inv)
+///
+/// Unlike [`batch_multiplicative_inverse`], this writes into a caller-provided buffer,
+/// avoiding heap allocation. This makes it suitable for small, fixed-size inputs
+/// such as packed field lanes.
+#[inline]
+pub fn batch_multiplicative_inverse_general<F, Inv>(x: &[F], result: &mut [F], inv: Inv)
 where
-    F: FieldAlgebra + Copy,
+    F: PrimeCharacteristicRing + Copy,
+    Inv: Fn(F) -> F,
+{
+    batch_multiplicative_inverse_general_map(x, |&x| x, result, inv);
+}
+
+#[inline]
+fn batch_multiplicative_inverse_general_map<A, F, Map, Inv>(
+    x: &[A],
+    map: Map,
+    result: &mut [F],
+    inv: Inv,
+) where
+    F: PrimeCharacteristicRing + Copy,
+    Map: Fn(&A) -> F,
     Inv: Fn(F) -> F,
 {
     let n = x.len();
@@ -69,14 +149,54 @@ where
 
     result[0] = F::ONE;
     for i in 1..n {
-        result[i] = result[i - 1] * x[i - 1];
+        result[i] = result[i - 1] * map(&x[i - 1]);
     }
 
-    let product = result[n - 1] * x[n - 1];
+    let product = result[n - 1] * map(&x[n - 1]);
     let mut inv = inv(product);
 
     for i in (0..n).rev() {
         result[i] *= inv;
-        inv *= x[i];
+        inv *= map(&x[i]);
     }
+}
+
+/// Per-lane inverse of a packed extension via Montgomery's trick. Allocation-free.
+///
+/// Dispatches on `F::Packing::WIDTH` to a const-generic body that materializes the `W`
+/// lanes via [`PackedFieldExtension::extract`], runs [`batch_multiplicative_inverse_general`]
+/// over a stack-sized `[EF; W]` buffer, and rebuilds the packed extension via
+/// [`PackedFieldExtension::from_ext_fn`]. After monomorphization the match folds to
+/// the single live arm.
+///
+/// All `PackedField` backends in this workspace use `WIDTH ∈ {1, 2, 4, 8, 16}`; the
+/// fallback arm panics if a future backend introduces a different width.
+#[inline]
+pub fn invert_packed_extension<F, EF>(packed: EF::ExtensionPacking) -> EF::ExtensionPacking
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    match F::Packing::WIDTH {
+        1 => invert_packed_extension_const::<F, EF, 1>(packed),
+        2 => invert_packed_extension_const::<F, EF, 2>(packed),
+        4 => invert_packed_extension_const::<F, EF, 4>(packed),
+        8 => invert_packed_extension_const::<F, EF, 8>(packed),
+        16 => invert_packed_extension_const::<F, EF, 16>(packed),
+        w => panic!("unsupported PackedField WIDTH = {w}"),
+    }
+}
+
+#[inline]
+fn invert_packed_extension_const<F, EF, const W: usize>(
+    packed: EF::ExtensionPacking,
+) -> EF::ExtensionPacking
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    let lanes: [EF; W] = core::array::from_fn(|i| packed.extract(i));
+    let mut invs = [EF::ZERO; W];
+    batch_multiplicative_inverse_general(&lanes, &mut invs, |x| x.inverse());
+    EF::ExtensionPacking::from_ext_fn(|i| invs[i])
 }

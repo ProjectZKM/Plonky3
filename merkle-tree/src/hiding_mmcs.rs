@@ -1,19 +1,22 @@
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 use itertools::Itertools;
-use p3_commit::Mmcs;
+use p3_commit::{BatchOpening, BatchOpeningRef, HidingMmcs, Mmcs};
 use p3_field::PackedValue;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::stack::HorizontalPair;
 use p3_matrix::{Dimensions, Matrix};
-use p3_symmetric::{CryptographicHasher, Hash, PseudoCompressionFunction};
-use rand::distributions::{Distribution, Standard};
-use rand::Rng;
+use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
+use p3_util::zip_eq::zip_eq;
+use rand::distr::{Distribution, StandardUniform};
+use rand::{CryptoRng, SeedableRng};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use spin::Mutex;
 
-use crate::{MerkleTree, MerkleTreeError, MerkleTreeMmcs};
+use crate::mmcs::check_widths;
+use crate::pruning::PrunedMerklePaths;
+use crate::{MerkleCap, MerkleTree, MerkleTreeError, MerkleTreeMmcs};
 
 /// A vector commitment scheme backed by a `MerkleTree`.
 ///
@@ -24,9 +27,10 @@ use crate::{MerkleTree, MerkleTreeError, MerkleTreeMmcs};
 /// `SALT_ELEMS` should be set such that the product of `SALT_ELEMS` with the size of the value
 /// (`P::Value`) is at least the target security parameter.
 ///
-/// `R` should be an appropriately seeded cryptographically secure pseudorandom number generator
-/// (CSPRNG). Something like `ThreadRng` may work, although it relies on the operating system to
-/// provide sufficient entropy.
+/// `R` is bounded by [`CryptoRng`], which rules out generators known to be unsuitable for
+/// cryptographic use. The bound does not replace proper seeding: the salts only hide the leaves
+/// if the generator is also seeded from unpredictable entropy, so production callers should seed
+/// from the operating system.
 ///
 /// Generics:
 /// - `P`: a leaf value
@@ -34,61 +38,146 @@ use crate::{MerkleTree, MerkleTreeError, MerkleTreeMmcs};
 /// - `H`: the leaf hasher
 /// - `C`: the digest compression function
 /// - `R`: a random number generator for blinding leaves
-#[derive(Clone, Debug)]
-pub struct MerkleTreeHidingMmcs<P, PW, H, C, R, const DIGEST_ELEMS: usize, const SALT_ELEMS: usize>
-{
-    inner: MerkleTreeMmcs<P, PW, H, C, DIGEST_ELEMS>,
-    rng: RefCell<R>,
+#[derive(Debug)]
+pub struct MerkleTreeHidingMmcs<
+    P,
+    PW,
+    H,
+    C,
+    R,
+    const N: usize,
+    const DIGEST_ELEMS: usize,
+    const SALT_ELEMS: usize,
+> {
+    inner: MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>,
+    rng: Mutex<R>,
 }
 
-impl<P, PW, H, C, R, const DIGEST_ELEMS: usize, const SALT_ELEMS: usize>
-    MerkleTreeHidingMmcs<P, PW, H, C, R, DIGEST_ELEMS, SALT_ELEMS>
+impl<P, PW, H, C, R, const N: usize, const DIGEST_ELEMS: usize, const SALT_ELEMS: usize>
+    MerkleTreeHidingMmcs<P, PW, H, C, R, N, DIGEST_ELEMS, SALT_ELEMS>
 {
-    pub fn new(hash: H, compress: C, rng: R) -> Self {
-        let inner = MerkleTreeMmcs::new(hash, compress);
+    /// Create a new `MerkleTreeHidingMmcs` with the given hash and compression functions.
+    ///
+    /// # Arguments
+    /// * `hash` - The hash function used to hash individual matrix rows (leaf level).
+    /// * `compress` - The compression function used to hash internal tree nodes.
+    /// * `cap_height` - The maximum number of layers below the root for the cap.
+    ///   A height of 0 uses only the root. Mixed-height batches may use a smaller
+    ///   height so the cap includes every matrix injection.
+    /// * `rng` - A random number generator for generating salts.
+    ///
+    /// An empty salt hides nothing, so it fails to compile.
+    ///
+    /// Hiding is only as strong as the salt entropy.
+    pub const fn new(hash: H, compress: C, cap_height: usize, rng: R) -> Self {
+        const {
+            assert!(
+                SALT_ELEMS > 0,
+                "a hiding MMCS needs at least one salt element per leaf"
+            );
+        }
+        let inner = MerkleTreeMmcs::new(hash, compress, cap_height);
         Self {
             inner,
-            rng: rng.into(),
+            rng: Mutex::new(rng),
+        }
+    }
+
+    pub const fn cap_height(&self) -> usize {
+        self.inner.cap_height()
+    }
+}
+
+/// Cloning forks the RNG stream by drawing a fresh seed from the source RNG, so the clone and the
+/// original never salt two commitments with the same sequence. This mirrors `HidingFriPcs`, and it
+/// is also what lets `R` be a generator that deliberately withholds `Clone`.
+impl<P, PW, H, C, R, const N: usize, const DIGEST_ELEMS: usize, const SALT_ELEMS: usize> Clone
+    for MerkleTreeHidingMmcs<P, PW, H, C, R, N, DIGEST_ELEMS, SALT_ELEMS>
+where
+    MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>: Clone,
+    R: CryptoRng + SeedableRng,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            rng: Mutex::new(R::from_rng(&mut *self.rng.lock())),
         }
     }
 }
 
-impl<P, PW, H, C, R, const DIGEST_ELEMS: usize, const SALT_ELEMS: usize> Mmcs<P::Value>
-    for MerkleTreeHidingMmcs<P, PW, H, C, R, DIGEST_ELEMS, SALT_ELEMS>
+impl<P, PW, H, C, R, const N: usize, const DIGEST_ELEMS: usize, const SALT_ELEMS: usize>
+    HidingMmcs<P::Value> for MerkleTreeHidingMmcs<P, PW, H, C, R, N, DIGEST_ELEMS, SALT_ELEMS>
 where
     P: PackedValue,
     P::Value: Serialize + DeserializeOwned,
     PW: PackedValue,
-    H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>,
-    H: CryptographicHasher<P, [PW; DIGEST_ELEMS]>,
-    H: Sync,
-    C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], 2>,
-    C: PseudoCompressionFunction<[PW; DIGEST_ELEMS], 2>,
-    C: Sync,
-    R: Rng + Clone,
-    PW::Value: Eq,
+    H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+        + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+        + Sync,
+    C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+        + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+        + Sync,
+    R: CryptoRng + SeedableRng + Send,
+    PW::Value: Eq + Clone,
     [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
-    Standard: Distribution<P::Value>,
+    StandardUniform: Distribution<P::Value>,
 {
-    type ProverData<M> =
-        MerkleTree<P::Value, PW::Value, HorizontalPair<M, RowMajorMatrix<P::Value>>, DIGEST_ELEMS>;
-    type Commitment = Hash<P::Value, PW::Value, DIGEST_ELEMS>;
+}
+
+impl<P, PW, H, C, R, const N: usize, const DIGEST_ELEMS: usize, const SALT_ELEMS: usize>
+    Mmcs<P::Value> for MerkleTreeHidingMmcs<P, PW, H, C, R, N, DIGEST_ELEMS, SALT_ELEMS>
+where
+    P: PackedValue,
+    P::Value: Serialize + DeserializeOwned,
+    PW: PackedValue,
+    H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+        + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+        + Sync,
+    C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+        + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+        + Sync,
+    R: CryptoRng + SeedableRng + Send,
+    PW::Value: Eq + Clone,
+    [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
+    StandardUniform: Distribution<P::Value>,
+{
+    type ProverData<M> = MerkleTree<
+        P::Value,
+        PW::Value,
+        HorizontalPair<M, RowMajorMatrix<P::Value>>,
+        N,
+        DIGEST_ELEMS,
+    >;
+    type Commitment = MerkleCap<P::Value, [PW::Value; DIGEST_ELEMS]>;
     /// The first item is salts; the second is the usual Merkle proof (sibling digests).
     type Proof = (Vec<Vec<P::Value>>, Vec<[PW::Value; DIGEST_ELEMS]>);
+    /// The first item is the per-query salts (`salts[q][m]`).
+    /// The second is the shared pruned multiproof.
+    type MultiProof = (
+        Vec<Vec<Vec<P::Value>>>,
+        PrunedMerklePaths<PW::Value, DIGEST_ELEMS>,
+    );
     type Error = MerkleTreeError;
 
     fn commit<M: Matrix<P::Value>>(
         &self,
         inputs: Vec<M>,
     ) -> (Self::Commitment, Self::ProverData<M>) {
-        let salted_inputs = inputs
-            .into_iter()
-            .map(|mat| {
-                let salts =
-                    RowMajorMatrix::rand(&mut *self.rng.borrow_mut(), mat.height(), SALT_ELEMS);
-                HorizontalPair::new(mat, salts)
-            })
-            .collect();
+        // Draw every salt under the lock, then release it before hashing.
+        //
+        // Why: tree building is parallel.
+        // A waiting rayon worker may run a queued commit on this same MMCS.
+        // That commit would spin forever on a lock its own thread still holds.
+        let salted_inputs = {
+            let mut rng = self.rng.lock();
+            inputs
+                .into_iter()
+                .map(|mat| {
+                    let salts = RowMajorMatrix::rand(&mut *rng, mat.height(), SALT_ELEMS);
+                    HorizontalPair::new(mat, salts)
+                })
+                .collect()
+        };
         self.inner.commit(salted_inputs)
     }
 
@@ -96,26 +185,23 @@ where
         &self,
         index: usize,
         prover_data: &Self::ProverData<M>,
-    ) -> (
-        Vec<Vec<P::Value>>,
-        (Vec<Vec<P::Value>>, Vec<[PW::Value; DIGEST_ELEMS]>),
-    ) {
-        let (salted_openings, siblings) = self.inner.open_batch(index, prover_data);
-        let (openings, salts): (Vec<_>, Vec<_>) = salted_openings
+    ) -> BatchOpening<P::Value, Self> {
+        let (salted_openings, siblings) = self.inner.open_batch(index, prover_data).unpack();
+        let (openings, salts) = salted_openings
             .into_iter()
             .map(|row| {
                 let (a, b) = row.split_at(row.len() - SALT_ELEMS);
                 (a.to_vec(), b.to_vec())
             })
             .unzip();
-        (openings, (salts, siblings))
+        BatchOpening::new(openings, (salts, siblings))
     }
 
     fn get_matrices<'a, M: Matrix<P::Value>>(
         &self,
         prover_data: &'a Self::ProverData<M>,
     ) -> Vec<&'a M> {
-        prover_data.leaves.iter().map(|mat| &mat.first).collect()
+        prover_data.leaves.iter().map(|mat| &mat.left).collect()
     }
 
     fn verify_batch(
@@ -123,34 +209,192 @@ where
         commit: &Self::Commitment,
         dimensions: &[Dimensions],
         index: usize,
-        opened_values: &[Vec<P::Value>],
-        proof: &Self::Proof,
+        batch_opening: BatchOpeningRef<'_, P::Value, Self>,
     ) -> Result<(), Self::Error> {
-        let (salts, siblings) = proof;
+        let (opened_values, (salts, siblings)) = batch_opening.unpack();
+        self.verify_batch_borrowed(commit, dimensions, index, opened_values, salts, siblings)
+    }
 
-        let opened_salted_values = opened_values
+    fn open_multi_batch<M: Matrix<P::Value>>(
+        &self,
+        indices: &[usize],
+        prover_data: &Self::ProverData<M>,
+    ) -> (Vec<Vec<Vec<P::Value>>>, Self::MultiProof) {
+        // The inner tree opens salted rows: each row is `real_row ++ salt`.
+        let (salted_values, pruned) = self.inner.open_multi_batch(indices, prover_data);
+
+        // Split every salted row back into its unsalted prefix and its salt suffix.
+        let (opened_values, salts): (Vec<_>, Vec<_>) = salted_values
+            .into_iter()
+            .map(|rows_at_index| {
+                rows_at_index
+                    .into_iter()
+                    .map(|row| {
+                        let (a, b) = row.split_at(row.len() - SALT_ELEMS);
+                        (a.to_vec(), b.to_vec())
+                    })
+                    .unzip()
+            })
+            .unzip();
+
+        (opened_values, (salts, pruned))
+    }
+
+    fn verify_multi_batch<Row: AsRef<[P::Value]> + PartialEq>(
+        &self,
+        commit: &Self::Commitment,
+        dimensions: &[Dimensions],
+        indices: &[usize],
+        opened_values: &[Vec<Row>],
+        proof: &Self::MultiProof,
+    ) -> Result<(), Self::Error> {
+        let (salts, pruned) = proof;
+
+        // Re-attach salts query by query, mirroring the single-opening path.
+        let mut salted_values = Vec::with_capacity(opened_values.len());
+        let expected_salt_batches = opened_values.len();
+        let got_salt_batches = salts.len();
+        for (rows, salts_at_index) in zip_eq(
+            opened_values,
+            salts,
+            MerkleTreeError::WrongBatchSize {
+                expected: expected_salt_batches,
+                got: got_salt_batches,
+            },
+        )? {
+            // Pin each unsalted row to its matrix width before salting.
+            // The inner tree only sees salted widths.
+            // An over-long row could otherwise hide behind an under-long salt.
+            check_widths(dimensions, rows)?;
+
+            let expected_salts = rows.len();
+            let got_salts = salts_at_index.len();
+            let salted_rows = zip_eq(
+                rows,
+                salts_at_index,
+                MerkleTreeError::WrongBatchSize {
+                    expected: expected_salts,
+                    got: got_salts,
+                },
+            )?
+            .map(|(opened, salt)| {
+                opened
+                    .as_ref()
+                    .iter()
+                    .chain(salt.iter())
+                    .copied()
+                    .collect_vec()
+            })
+            .collect_vec();
+            salted_values.push(salted_rows);
+        }
+
+        // The inner tree commits to salt-widened rows, so widen the dimensions to match.
+        let salted_dimensions = dimensions
             .iter()
-            .zip(salts.iter())
-            .map(|(opened, salt)| opened.iter().chain(salt.iter()).copied().collect_vec())
+            .map(|dims| Dimensions {
+                width: dims.width + SALT_ELEMS,
+                height: dims.height,
+            })
             .collect_vec();
 
         self.inner
-            .verify_batch(commit, dimensions, index, &opened_salted_values, siblings)
+            .verify_multi_batch(commit, &salted_dimensions, indices, &salted_values, pruned)
+    }
+}
+
+impl<P, PW, H, C, R, const N: usize, const DIGEST_ELEMS: usize, const SALT_ELEMS: usize>
+    MerkleTreeHidingMmcs<P, PW, H, C, R, N, DIGEST_ELEMS, SALT_ELEMS>
+where
+    P: PackedValue,
+    P::Value: Serialize + DeserializeOwned,
+    PW: PackedValue,
+    H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+        + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+        + Sync,
+    C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+        + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+        + Sync,
+    R: CryptoRng + SeedableRng + Send,
+    PW::Value: Eq + Clone,
+    [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
+    StandardUniform: Distribution<P::Value>,
+{
+    /// Verify rows, salts and an authentication path borrowed separately.
+    ///
+    /// Performs the same checks as the trait verification, without an owned `(salts, siblings)` proof tuple.
+    pub fn verify_batch_borrowed<S: AsRef<[P::Value]>>(
+        &self,
+        commit: &MerkleCap<P::Value, [PW::Value; DIGEST_ELEMS]>,
+        dimensions: &[Dimensions],
+        index: usize,
+        opened_values: &[Vec<P::Value>],
+        salts: &[S],
+        siblings: &[[PW::Value; DIGEST_ELEMS]],
+    ) -> Result<(), MerkleTreeError> {
+        // Pin each opened row to its matrix width before salting.
+        // The inner tree only sees salted widths.
+        // Without this, an over-long row could be masked by an under-long salt.
+        check_widths(dimensions, opened_values)?;
+
+        let expected_salts = opened_values.len();
+        let got_salts = salts.len();
+        let opened_salted_values = zip_eq(
+            opened_values,
+            salts,
+            MerkleTreeError::WrongBatchSize {
+                expected: expected_salts,
+                got: got_salts,
+            },
+        )?
+        .map(|(opened, salt)| {
+            opened
+                .iter()
+                .chain(salt.as_ref().iter())
+                .copied()
+                .collect_vec()
+        })
+        .collect_vec();
+
+        // The inner tree commits to rows widened by the salt columns,
+        // so the widths must be widened the same way.
+        let salted_dimensions = dimensions
+            .iter()
+            .map(|dims| Dimensions {
+                width: dims.width + SALT_ELEMS,
+                height: dims.height,
+            })
+            .collect_vec();
+
+        self.inner.verify_batch_borrowed(
+            commit,
+            &salted_dimensions,
+            index,
+            &opened_salted_values,
+            siblings,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+    use alloc::sync::Arc;
     use alloc::vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use itertools::Itertools;
     use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
     use p3_commit::Mmcs;
-    use p3_field::{Field, FieldAlgebra};
-    use p3_matrix::dense::RowMajorMatrix;
+    use p3_field::{Field, PrimeCharacteristicRing};
     use p3_matrix::Matrix;
-    use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-    use rand::prelude::*;
+    use p3_matrix::dense::RowMajorMatrix;
+    use p3_symmetric::{CryptographicHasher, PaddingFreeSponge, TruncatedPermutation};
+    use p3_util::assert_sync;
+    use rand::SeedableRng;
+    use rand::rngs::{SmallRng, StdRng};
+    use spin::Once;
 
     use super::MerkleTreeHidingMmcs;
     use crate::MerkleTreeError;
@@ -166,46 +410,359 @@ mod tests {
         <F as Field>::Packing,
         MyHash,
         MyCompress,
-        ThreadRng,
+        StdRng,
+        2,
         8,
         SALT_ELEMS,
     >;
 
+    /// The same MMCS with a leaf hasher that checks the salt RNG lock on every call.
+    type ProbedMmcs = MerkleTreeHidingMmcs<
+        <F as Field>::Packing,
+        <F as Field>::Packing,
+        ProbedHasher<MyHash>,
+        MyCompress,
+        StdRng,
+        2,
+        8,
+        SALT_ELEMS,
+    >;
+
+    /// A lock check run from inside the parallel work of the object that owns the lock.
+    ///
+    /// The probed hasher lives inside the MMCS it observes, so the check is armed after construction.
+    #[derive(Clone, Default)]
+    struct LockProbe {
+        /// Returns whether the observed lock is free; unset until armed.
+        is_free: Arc<Once<Box<dyn Fn() -> bool + Send + Sync>>>,
+        /// Number of checks run, so a test can prove the probe actually fired.
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl LockProbe {
+        /// Arm the probe on `target`, through a weak handle so the two do not keep each other alive.
+        fn arm<T: Send + Sync + 'static>(&self, target: &Arc<T>, is_free: fn(&T) -> bool) {
+            let target = Arc::downgrade(target);
+            self.is_free.call_once(|| {
+                Box::new(move || target.upgrade().is_none_or(|target| is_free(&target)))
+            });
+        }
+
+        /// Fail if the observed lock is held; a no-op until armed.
+        fn assert_lock_free(&self) {
+            if let Some(is_free) = self.is_free.get() {
+                assert!(
+                    is_free(),
+                    "parallel work must not run under the salt RNG lock"
+                );
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A leaf hasher that runs its probe before forwarding every call to `inner`.
+    #[derive(Clone)]
+    struct ProbedHasher<H> {
+        inner: H,
+        probe: LockProbe,
+    }
+
+    impl<H, Item, Out> CryptographicHasher<Item, Out> for ProbedHasher<H>
+    where
+        H: CryptographicHasher<Item, Out>,
+        Item: Clone,
+    {
+        const LANES: usize = H::LANES;
+
+        fn hash_iter<I>(&self, input: I) -> Out
+        where
+            I: IntoIterator<Item = Item>,
+        {
+            self.probe.assert_lock_free();
+            self.inner.hash_iter(input)
+        }
+
+        fn hash_iter_slices<'a, I>(&self, input: I) -> Out
+        where
+            I: IntoIterator<Item = &'a [Item]>,
+            Item: 'a,
+        {
+            self.probe.assert_lock_free();
+            self.inner.hash_iter_slices(input)
+        }
+
+        fn hash_slice(&self, input: &[Item]) -> Out {
+            self.probe.assert_lock_free();
+            self.inner.hash_slice(input)
+        }
+
+        fn hash_item(&self, input: Item) -> Out {
+            self.probe.assert_lock_free();
+            self.inner.hash_item(input)
+        }
+
+        fn hash_many(&self, input: &[Item], out: &mut [Out]) {
+            self.probe.assert_lock_free();
+            self.inner.hash_many(input, out);
+        }
+    }
+
+    #[test]
+    fn commit_hashes_without_holding_the_rng_lock() {
+        // A rayon worker that waits inside the tree build may run another commit on this MMCS.
+        //
+        // That commit would spin forever if the build ran under the salt lock.
+        //
+        // The leaf hasher runs inside the build, so it checks the lock directly.
+        let mut rng = SmallRng::seed_from_u64(1);
+        let perm = Perm::new_from_rng_128(&mut rng);
+        let probe = LockProbe::default();
+        let hash = ProbedHasher {
+            inner: MyHash::new(perm.clone()),
+            probe: probe.clone(),
+        };
+        let mmcs = Arc::new(ProbedMmcs::new(
+            hash,
+            MyCompress::new(perm),
+            0,
+            StdRng::seed_from_u64(0),
+        ));
+        probe.arm(&mmcs, |mmcs| !mmcs.rng.is_locked());
+
+        // Tall enough that the build hashes rows across several rayon tasks.
+        let mat = RowMajorMatrix::<F>::rand(&mut rng, 1 << 10, 8);
+        let _ = mmcs.commit(vec![mat]);
+
+        // The check must have run, or the test would pass without probing anything.
+        assert!(probe.hits.load(Ordering::Relaxed) > 0);
+    }
+
     #[test]
     #[should_panic]
     fn mismatched_heights() {
-        let mut rng = thread_rng();
+        let mut rng = SmallRng::seed_from_u64(1);
         let perm = Perm::new_from_rng_128(&mut rng);
         let hash = MyHash::new(perm.clone());
         let compress = MyCompress::new(perm);
-        let mmcs = MyMmcs::new(hash, compress, thread_rng());
+        let mmcs = MyMmcs::new(hash, compress, 0, StdRng::seed_from_u64(0));
 
         // attempt to commit to a mat with 8 rows and a mat with 7 rows. this should panic.
-        let large_mat = RowMajorMatrix::new(
-            [1, 2, 3, 4, 5, 6, 7, 8].map(F::from_canonical_u8).to_vec(),
-            1,
-        );
-        let small_mat =
-            RowMajorMatrix::new([1, 2, 3, 4, 5, 6, 7].map(F::from_canonical_u8).to_vec(), 1);
+        let large_mat = RowMajorMatrix::new([1, 2, 3, 4, 5, 6, 7, 8].map(F::from_u8).to_vec(), 1);
+        let small_mat = RowMajorMatrix::new([1, 2, 3, 4, 5, 6, 7].map(F::from_u8).to_vec(), 1);
         let _ = mmcs.commit(vec![large_mat, small_mat]);
+    }
+
+    /// Invariant: cloning forks the salt stream.
+    ///
+    /// The usual wiring hands a clone of the value MMCS to the extension MMCS, so a clone that
+    /// copied the generator would salt two commitments with the same sequence and undo the
+    /// hiding. Committing the same matrix through the original and through its clone must
+    /// therefore land on different commitments.
+    #[test]
+    fn clone_forks_the_salt_stream() {
+        let mut rng = SmallRng::seed_from_u64(1);
+        let mat = RowMajorMatrix::<F>::rand(&mut rng, 16, 3);
+        let perm = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm);
+
+        let mmcs = MyMmcs::new(hash, compress, 0, StdRng::seed_from_u64(0));
+        let forked = mmcs.clone();
+
+        let (commit, _) = mmcs.commit(vec![mat.clone()]);
+        let (forked_commit, _) = forked.commit(vec![mat]);
+
+        assert_ne!(
+            commit, forked_commit,
+            "a clone must not reuse the original's salt stream",
+        );
     }
 
     #[test]
     fn different_widths() -> Result<(), MerkleTreeError> {
-        let mut rng = thread_rng();
+        let mut rng = SmallRng::seed_from_u64(1);
+        // 10 mats with 32 rows where the ith mat has i + 1 cols
+        let mats = (0..10)
+            .map(|i| RowMajorMatrix::<F>::rand(&mut rng, 32, i + 1))
+            .collect_vec();
         let perm = Perm::new_from_rng_128(&mut rng);
         let hash = MyHash::new(perm.clone());
         let compress = MyCompress::new(perm);
-        let mmcs = MyMmcs::new(hash, compress, thread_rng());
+        let mmcs = MyMmcs::new(hash, compress, 0, StdRng::seed_from_u64(0));
 
-        // 10 mats with 32 rows where the ith mat has i + 1 cols
-        let mats = (0..10)
-            .map(|i| RowMajorMatrix::<F>::rand(&mut thread_rng(), 32, i + 1))
-            .collect_vec();
         let dims = mats.iter().map(|m| m.dimensions()).collect_vec();
 
         let (commit, prover_data) = mmcs.commit(mats);
-        let (opened_values, proof) = mmcs.open_batch(17, &prover_data);
-        mmcs.verify_batch(&commit, &dims, 17, &opened_values, &proof)
+        let batch_proof = mmcs.open_batch(17, &prover_data);
+        mmcs.verify_batch(&commit, &dims, 17, (&batch_proof).into())
+    }
+
+    #[test]
+    fn verify_rejects_wrong_row_width() {
+        let mut rng = SmallRng::seed_from_u64(2);
+        let perm = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm);
+
+        // Commit to one matrix of width 4 through the hiding wrapper.
+        let mat = RowMajorMatrix::<F>::rand(&mut rng, 8, 4);
+        let dims = vec![mat.dimensions()];
+        let mmcs = MyMmcs::new(hash, compress, 0, StdRng::seed_from_u64(0));
+        let (commit, prover_data) = mmcs.commit(vec![mat]);
+
+        // Mutation: append one extra element to the opened row.
+        //
+        //     opened row:  [a, b, c, d, EXTRA]   (5 values, width is 4)
+        let mut opening = mmcs.open_batch(3, &prover_data);
+        opening.opened_values[0].push(F::ONE);
+
+        // The width is checked on the unsalted row, before salt columns are appended.
+        //
+        //     expected: 4 (matrix width)
+        //     got:      5 (opened row length)
+        let err = mmcs
+            .verify_batch(&commit, &dims, 3, (&opening).into())
+            .expect_err("row longer than the matrix width must be rejected");
+        assert!(matches!(
+            err,
+            MerkleTreeError::WrongWidth {
+                matrix: 0,
+                expected: 4,
+                got: 5,
+            }
+        ));
+    }
+
+    #[test]
+    fn verify_reports_the_opening_and_salt_counts() {
+        let mut rng = SmallRng::seed_from_u64(5);
+        let perm = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm);
+        let mat = RowMajorMatrix::<F>::rand(&mut rng, 8, 4);
+        let dims = vec![mat.dimensions()];
+        let mmcs = MyMmcs::new(hash, compress, 0, StdRng::seed_from_u64(0));
+        let (commit, prover_data) = mmcs.commit(vec![mat]);
+        let mut opening = mmcs.open_batch(3, &prover_data);
+        opening.opening_proof.0.clear();
+
+        let error = mmcs
+            .verify_batch(&commit, &dims, 3, (&opening).into())
+            .expect_err("an opening without its salt row must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "batch size mismatch: expected 1 entries, got 0"
+        );
+    }
+
+    #[test]
+    fn hiding_mmcs_is_sync() {
+        assert_sync::<MyMmcs>();
+    }
+
+    #[test]
+    fn multi_opening_round_trip() {
+        let mut rng = SmallRng::seed_from_u64(3);
+        // Three matrices of equal height but widths 2, 3, 4.
+        let mats = (0..3)
+            .map(|i| RowMajorMatrix::<F>::rand(&mut rng, 16, i + 2))
+            .collect_vec();
+        let dims = mats.iter().map(|m| m.dimensions()).collect_vec();
+        let perm = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm);
+        let mmcs = MyMmcs::new(hash, compress, 0, StdRng::seed_from_u64(0));
+        let (commit, prover_data) = mmcs.commit(mats);
+
+        // Open four leaves at once.
+        // Indices must be ascending and distinct.
+        let indices = vec![1usize, 4, 9, 15];
+        let (opened, proof) = mmcs.open_multi_batch(&indices, &prover_data);
+
+        // One opened row set per query, one row per committed matrix.
+        assert_eq!(opened.len(), indices.len());
+        assert!(opened.iter().all(|rows| rows.len() == dims.len()));
+
+        // The salt suffix is stripped: each returned row matches its matrix width.
+        for rows in &opened {
+            for (row, dim) in rows.iter().zip(&dims) {
+                assert_eq!(row.len(), dim.width);
+            }
+        }
+
+        // The single shared multiproof authenticates every opened row.
+        mmcs.verify_multi_batch(&commit, &dims, &indices, &opened, &proof)
+            .expect("round-trip multi-opening must verify");
+    }
+
+    #[test]
+    fn verify_multi_rejects_wrong_row_width() {
+        let mut rng = SmallRng::seed_from_u64(4);
+        // Commit to one matrix of width 4 through the hiding wrapper.
+        let mat = RowMajorMatrix::<F>::rand(&mut rng, 8, 4);
+        let dims = vec![mat.dimensions()];
+        let perm = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm);
+        let mmcs = MyMmcs::new(hash, compress, 0, StdRng::seed_from_u64(0));
+        let (commit, prover_data) = mmcs.commit(vec![mat]);
+
+        let indices = vec![2usize, 5];
+        let (mut opened, proof) = mmcs.open_multi_batch(&indices, &prover_data);
+
+        // Mutation: append one extra element to the first query's only row.
+        //
+        //     query 0 row:  [a, b, c, d, EXTRA]   (5 values, width is 4)
+        opened[0][0].push(F::ONE);
+
+        // The unsalted width is checked before salt columns are re-appended.
+        // An over-long row cannot hide behind an under-long salt.
+        //
+        //     expected: 4 (matrix width)
+        //     got:      5 (opened row length)
+        let err = mmcs
+            .verify_multi_batch(&commit, &dims, &indices, &opened, &proof)
+            .expect_err("row longer than the matrix width must be rejected");
+        assert!(matches!(
+            err,
+            MerkleTreeError::WrongWidth {
+                matrix: 0,
+                expected: 4,
+                got: 5,
+            }
+        ));
+    }
+
+    #[test]
+    fn verify_multi_reports_the_query_and_salt_counts() {
+        let mut rng = SmallRng::seed_from_u64(6);
+        let perm = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm);
+        let mat = RowMajorMatrix::<F>::rand(&mut rng, 8, 4);
+        let dims = vec![mat.dimensions()];
+        let mmcs = MyMmcs::new(hash, compress, 0, StdRng::seed_from_u64(0));
+        let (commit, prover_data) = mmcs.commit(vec![mat]);
+        let indices = vec![2usize, 5];
+        let (opened, mut proof) = mmcs.open_multi_batch(&indices, &prover_data);
+
+        proof.0.pop();
+        let error = mmcs
+            .verify_multi_batch(&commit, &dims, &indices, &opened, &proof)
+            .expect_err("each query must carry one salt batch");
+        assert_eq!(
+            error.to_string(),
+            "batch size mismatch: expected 2 entries, got 1"
+        );
+
+        let (_, mut proof) = mmcs.open_multi_batch(&indices, &prover_data);
+        proof.0[0].clear();
+        let error = mmcs
+            .verify_multi_batch(&commit, &dims, &indices, &opened, &proof)
+            .expect_err("each opened matrix row must carry one salt row");
+        assert_eq!(
+            error.to_string(),
+            "batch size mismatch: expected 1 entries, got 0"
+        );
     }
 }

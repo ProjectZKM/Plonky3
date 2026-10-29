@@ -1,0 +1,369 @@
+//! Symbolic builder that records constraints, bus interactions and indexed declarations.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::iter;
+
+use p3_air::symbolic::{
+    AirLayout, ConstraintLayout, SymbolicAirBuilder, SymbolicConstraints, SymbolicExpression,
+    SymbolicExpressionExt, SymbolicVariable, SymbolicVariableExt,
+};
+use p3_air::{Air, AirBuilder, ExtensionBuilder, PermutationAirBuilder};
+use p3_field::{Algebra, ExtensionField, Field};
+use p3_matrix::dense::RowMajorMatrix;
+
+use crate::builder::{
+    IndexedLookupBuilder, InteractionBuilder, SymbolicExclusiveBranch,
+    SymbolicExclusiveInteraction, SymbolicInteraction, SymbolicLocalInteraction,
+};
+use crate::count::Count;
+use crate::indexed::{IndexedRead, IndexedTable, TraceWindow};
+
+/// Symbolic builder that captures constraints, bus interactions and indexed declarations.
+#[derive(Debug)]
+pub struct InteractionSymbolicBuilder<F: Field, EF: ExtensionField<F> = F> {
+    /// Wrapped constraint-only builder. All non-interaction methods forward here.
+    inner: SymbolicAirBuilder<F, EF>,
+    /// Cross-AIR messages pushed so far, in emission order.
+    global_interactions: Vec<SymbolicInteraction<F>>,
+    /// Intra-AIR lookups pushed so far, in emission order.
+    local_interactions: Vec<SymbolicLocalInteraction<F>>,
+    /// Mutually-exclusive groups pushed so far, in emission order.
+    exclusive_interactions: Vec<SymbolicExclusiveInteraction<F>>,
+    /// Indexed reads pushed so far, in emission order.
+    indexed_reads: Vec<IndexedRead>,
+    /// Indexed tables pushed so far, in emission order.
+    indexed_tables: Vec<IndexedTable>,
+}
+
+impl<F: Field, EF: ExtensionField<F>> InteractionSymbolicBuilder<F, EF> {
+    /// Create an empty builder from a column / challenge layout.
+    pub fn new(layout: AirLayout) -> Self {
+        Self {
+            inner: SymbolicAirBuilder::new(layout),
+            global_interactions: Vec::new(),
+            local_interactions: Vec::new(),
+            exclusive_interactions: Vec::new(),
+            indexed_reads: Vec::new(),
+            indexed_tables: Vec::new(),
+        }
+    }
+
+    /// Run one symbolic pass over an AIR and keep everything it emitted.
+    ///
+    /// Constraints and interactions come out of the same pass.
+    /// A caller that needs both therefore evaluates the AIR only once.
+    ///
+    /// # Arguments
+    ///
+    /// - `air`: the AIR to evaluate symbolically.
+    /// - `layout`: column widths and challenge counts sizing the symbolic trace.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a layout width that the AIR itself determines disagrees with the AIR.
+    pub fn from_air<A>(air: &A, layout: AirLayout) -> Self
+    where
+        A: Air<Self>,
+    {
+        // A mismatched width would silently point the AIR at the wrong variables.
+        layout.validate_against_air(air);
+        let mut builder = Self::new(layout);
+        air.eval(&mut builder);
+        builder
+    }
+
+    /// Cross-AIR interactions recorded so far, in the order they were pushed.
+    pub fn global_interactions(&self) -> &[SymbolicInteraction<F>] {
+        &self.global_interactions
+    }
+
+    /// Intra-AIR interactions recorded so far, in the order they were pushed.
+    pub fn local_interactions(&self) -> &[SymbolicLocalInteraction<F>] {
+        &self.local_interactions
+    }
+
+    /// Mutually-exclusive interactions recorded so far, in the order they were pushed.
+    pub fn exclusive_interactions(&self) -> &[SymbolicExclusiveInteraction<F>] {
+        &self.exclusive_interactions
+    }
+
+    /// Indexed reads recorded so far, in the order they were pushed.
+    pub fn indexed_reads(&self) -> &[IndexedRead] {
+        &self.indexed_reads
+    }
+
+    /// Indexed tables recorded so far, in the order they were pushed.
+    pub fn indexed_tables(&self) -> &[IndexedTable] {
+        &self.indexed_tables
+    }
+
+    /// The largest degree among the lookup payloads and counts recorded so far.
+    ///
+    /// Each trace column counts as a variable of degree one.
+    ///
+    /// Returns nothing when no lookup tuple was emitted.
+    ///
+    /// A local interaction with no tuple is inert, so it does not count.
+    ///
+    /// Exclusive interactions are not counted.
+    ///
+    /// A returned degree of zero means every tuple is constant:
+    ///
+    /// ```text
+    ///     payload [1], count 1   ->   Some(0)
+    ///     payload [x], count 1   ->   Some(1)
+    ///     no tuple at all        ->   None
+    /// ```
+    pub fn interaction_degree(&self) -> Option<usize> {
+        // A two-row trace gives each column degree one, so the degree is the total degree.
+        let degree = |expression: &SymbolicExpression<F>| expression.poly_degree(2, &[]);
+
+        // A global interaction is one tuple: its payload and its count.
+        let global = self.global_interactions.iter().map(|interaction| {
+            interaction
+                .fields
+                .iter()
+                .chain(iter::once(&interaction.count))
+                .map(degree)
+                .max()
+                .unwrap_or(0)
+        });
+
+        // A local interaction holds several tuples, each with its own count.
+        let local = self
+            .local_interactions
+            .iter()
+            .flat_map(|interaction| &interaction.tuples)
+            .map(|(fields, count)| {
+                let (count, _) = count.clone().into_parts();
+                fields
+                    .iter()
+                    .map(degree)
+                    .max()
+                    .unwrap_or(0)
+                    .max(degree(&count))
+            });
+
+        // One entry per tuple, so an empty iterator means no tuple was emitted.
+        global.chain(local).max()
+    }
+
+    /// Symbolic base-field constraints captured by the inner builder.
+    pub fn base_constraints(&self) -> Vec<SymbolicExpression<F>> {
+        self.inner.base_constraints()
+    }
+
+    /// Symbolic extension-field constraints captured by the inner builder.
+    pub fn extension_constraints(&self) -> Vec<SymbolicExpressionExt<F, EF>> {
+        self.inner.extension_constraints()
+    }
+
+    /// Mapping from global constraint indices into separated base / extension streams.
+    pub fn constraint_layout(&self) -> ConstraintLayout {
+        self.inner.constraint_layout()
+    }
+
+    /// Consume the builder, returning its constraints and their global ordering.
+    ///
+    /// The interactions and indexed declarations are dropped.
+    #[must_use]
+    pub fn finish(self) -> SymbolicConstraints<F, EF> {
+        self.inner.finish()
+    }
+}
+
+impl<F: Field, EF: ExtensionField<F>> AirBuilder for InteractionSymbolicBuilder<F, EF> {
+    type F = F;
+    type Expr = SymbolicExpression<F>;
+    type Var = SymbolicVariable<F>;
+    type PreprocessedWindow = RowMajorMatrix<Self::Var>;
+    type MainWindow = RowMajorMatrix<Self::Var>;
+    type PublicVar = SymbolicVariable<F>;
+    type PeriodicVar = SymbolicVariable<F>;
+
+    fn main(&self) -> Self::MainWindow {
+        self.inner.main()
+    }
+
+    fn preprocessed(&self) -> &Self::PreprocessedWindow {
+        self.inner.preprocessed()
+    }
+
+    fn is_first_row(&self) -> Self::Expr {
+        self.inner.is_first_row()
+    }
+
+    fn is_last_row(&self) -> Self::Expr {
+        self.inner.is_last_row()
+    }
+
+    fn is_transition(&self) -> Self::Expr {
+        self.inner.is_transition()
+    }
+
+    fn assert_zero<I: Into<Self::Expr>>(&mut self, x: I) {
+        self.inner.assert_zero(x);
+    }
+
+    fn public_values(&self) -> &[Self::PublicVar] {
+        self.inner.public_values()
+    }
+
+    fn periodic_values(&self) -> &[Self::PeriodicVar] {
+        self.inner.periodic_values()
+    }
+}
+
+impl<F: Field, EF: ExtensionField<F>> ExtensionBuilder for InteractionSymbolicBuilder<F, EF>
+where
+    SymbolicExpressionExt<F, EF>: Algebra<EF>,
+{
+    type EF = EF;
+    type ExprEF = SymbolicExpressionExt<F, EF>;
+    type VarEF = SymbolicVariableExt<F, EF>;
+
+    fn assert_zero_ext<I>(&mut self, x: I)
+    where
+        I: Into<Self::ExprEF>,
+    {
+        self.inner.assert_zero_ext(x);
+    }
+}
+
+impl<F: Field, EF: ExtensionField<F>> PermutationAirBuilder for InteractionSymbolicBuilder<F, EF>
+where
+    SymbolicExpressionExt<F, EF>: Algebra<EF>,
+{
+    type MP = RowMajorMatrix<Self::VarEF>;
+    type RandomVar = SymbolicVariableExt<F, EF>;
+    type PermutationVar = SymbolicVariableExt<F, EF>;
+
+    fn permutation(&self) -> Self::MP {
+        self.inner.permutation()
+    }
+
+    fn permutation_randomness(&self) -> &[Self::RandomVar] {
+        self.inner.permutation_randomness()
+    }
+
+    fn permutation_values(&self) -> &[Self::PermutationVar] {
+        self.inner.permutation_values()
+    }
+}
+
+impl<F: Field, EF: ExtensionField<F>> InteractionBuilder for InteractionSymbolicBuilder<F, EF> {
+    fn push_interaction<E: Into<Self::Expr>>(
+        &mut self,
+        bus_name: &str,
+        fields: impl IntoIterator<Item = E>,
+        count: impl Into<Count<Self::Expr>>,
+    ) {
+        // Split the count into its signed expression and per-row magnitude bound.
+        let (count, count_weight) = count.into().into_parts();
+
+        // Materialize lazy inputs into owned expressions and append one record.
+        //
+        // - Collected eagerly so the record outlives the caller's iterator.
+        // - Push order is preserved: it drives auxiliary-column assignment.
+        self.global_interactions.push(SymbolicInteraction {
+            bus_name: String::from(bus_name),
+            fields: fields.into_iter().map(Into::into).collect(),
+            count,
+            count_weight,
+        });
+    }
+
+    fn push_local_interaction(
+        &mut self,
+        tuples: impl IntoIterator<Item = (Vec<Self::Expr>, Count<Self::Expr>)>,
+    ) {
+        // One call → one grouped record, not N separate ones.
+        //
+        // - A local lookup folds into a single running sum.
+        // - All `(fields, count)` pairs must stay paired for the folder.
+        self.local_interactions.push(SymbolicLocalInteraction {
+            tuples: tuples.into_iter().collect(),
+        });
+    }
+
+    fn push_exclusive_interaction(
+        &mut self,
+        bus_name: &str,
+        branches: impl IntoIterator<Item = (Self::Expr, Count<Self::Expr>, Vec<Self::Expr>)>,
+    ) {
+        // Split each branch's count into its signed expression and magnitude bound.
+        //
+        // - The flag and fields are stored verbatim.
+        // - Push order is preserved.
+        // - That order drives auxiliary-column assignment.
+        let branches = branches
+            .into_iter()
+            .map(|(flag, count, fields)| {
+                let (count, count_weight) = count.into_parts();
+                SymbolicExclusiveBranch {
+                    flag,
+                    count,
+                    fields,
+                    count_weight,
+                }
+            })
+            .collect();
+
+        self.exclusive_interactions
+            .push(SymbolicExclusiveInteraction {
+                bus_name: String::from(bus_name),
+                branches,
+            });
+    }
+
+    fn num_global_interactions(&self) -> usize {
+        self.global_interactions.len()
+    }
+
+    fn num_local_interactions(&self) -> usize {
+        self.local_interactions.len()
+    }
+
+    fn num_exclusive_interactions(&self) -> usize {
+        self.exclusive_interactions.len()
+    }
+}
+
+impl<F: Field, EF: ExtensionField<F>> IndexedLookupBuilder for InteractionSymbolicBuilder<F, EF> {
+    fn push_indexed_read(
+        &mut self,
+        table: &str,
+        position: usize,
+        payload: impl IntoIterator<Item = usize>,
+    ) {
+        // Push order is preserved, since it fixes the reader order both sides walk.
+        self.indexed_reads.push(IndexedRead {
+            table: String::from(table),
+            position,
+            payload: payload.into_iter().collect(),
+        });
+    }
+
+    fn push_indexed_table(
+        &mut self,
+        name: &str,
+        window: TraceWindow,
+        columns: impl IntoIterator<Item = usize>,
+    ) {
+        // Column order is the order readers pull, so it is stored verbatim.
+        self.indexed_tables.push(IndexedTable {
+            name: String::from(name),
+            window,
+            columns: columns.into_iter().collect(),
+        });
+    }
+
+    fn num_indexed_reads(&self) -> usize {
+        self.indexed_reads.len()
+    }
+
+    fn num_indexed_tables(&self) -> usize {
+        self.indexed_tables.len()
+    }
+}

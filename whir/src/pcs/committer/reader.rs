@@ -1,0 +1,89 @@
+use core::fmt::Debug;
+
+use p3_challenger::fs::TranscriptField;
+use p3_challenger::{CanObserve, CanSample, CanSampleUniformBits, GrindingChallenger};
+use p3_commit::Mmcs;
+use p3_field::{ExtensionField, Field};
+use p3_multilinear_util::point::Point;
+use p3_sumcheck::constraints::statement::EqStatement;
+
+use crate::pcs::proof::WhirProof;
+use crate::pcs::verifier::errors::VerifierError;
+use crate::transcript::WhirVerifierTranscript;
+
+/// Parsed commitment extracted from the verifier's transcript.
+///
+/// Contains the Merkle root and the OOD equality constraints
+/// needed for verification.
+#[derive(Debug, Clone)]
+pub struct ParsedCommitment<F, D> {
+    /// Merkle root of the committed evaluation table.
+    pub root: D,
+    /// OOD challenge points and their claimed evaluations.
+    pub ood_statement: EqStatement<F>,
+}
+
+impl<F, D> ParsedCommitment<F, D>
+where
+    F: Field,
+{
+    /// Parse a commitment for a specific round.
+    ///
+    /// # Errors
+    ///
+    /// - Round index is past the last round carried by the proof.
+    /// - Round entry is present but its Merkle-root slot is empty.
+    pub fn parse_with_round<EF, MT: Mmcs<F>, Challenger>(
+        proof: &WhirProof<F, EF, MT>,
+        transcript: &mut WhirVerifierTranscript<'_, Challenger, F, EF>,
+        num_variables: usize,
+        ood_samples: usize,
+        round_index: usize,
+    ) -> Result<ParsedCommitment<EF, MT::Commitment>, VerifierError>
+    where
+        F: Field + TranscriptField,
+        EF: ExtensionField<F>,
+        Challenger: CanObserve<F>
+            + CanSample<F>
+            + CanSampleUniformBits<F>
+            + GrindingChallenger<Witness = F>
+            + CanObserve<MT::Commitment>,
+    {
+        let round_proof = proof
+            .rounds
+            .get(round_index)
+            .ok_or(VerifierError::InvalidRoundIndex { index: round_index })?;
+        let root = round_proof
+            .commitment
+            .clone()
+            .ok_or(VerifierError::MissingRoundCommitment { round: round_index })?;
+        let ood_answers = &round_proof.ood_answers;
+        if ood_answers.len() != ood_samples {
+            return Err(VerifierError::RoundOodAnswerCountMismatch {
+                round: round_index,
+                expected: ood_samples,
+                actual: ood_answers.len(),
+            });
+        }
+
+        // Observe the Merkle root in the transcript.
+        transcript.commitment(root.clone());
+
+        // Reconstruct equality constraints from OOD challenge points and answers.
+        //
+        // The count was pinned against the configuration above.
+        // Every index below is therefore in bounds, and every draw is described.
+        let mut ood_statement = EqStatement::initialize(num_variables);
+        (0..ood_samples).for_each(|i| {
+            let point = Point::expand_from_univariate(transcript.ood_point(), num_variables);
+            let eval = ood_answers[i];
+            transcript.ood_answer(eval);
+            ood_statement.add_evaluated_constraint(point, eval);
+        });
+
+        Ok(ParsedCommitment {
+            root,
+            ood_statement,
+        })
+    }
+}

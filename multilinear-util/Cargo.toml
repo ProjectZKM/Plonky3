@@ -1,0 +1,51 @@
+[package]
+name = "p3-multilinear-util"
+description = "A collection of utility functions and tools for multilinear operations."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+parallel = ["p3-maybe-rayon/parallel"]
+
+[dependencies]
+itertools.workspace = true
+p3-field.workspace = true
+p3-matrix.workspace = true
+p3-maybe-rayon.workspace = true
+p3-util.workspace = true
+serde = { workspace = true, features = ["derive", "alloc"] }
+
+rand.workspace = true
+
+[dev-dependencies]
+p3-baby-bear = { path = "../baby-bear" }
+p3-binary-field = { path = "../binary-field" }
+p3-goldilocks = { path = "../goldilocks" }
+p3-mersenne-31 = { path = "../mersenne-31" }
+
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "evaleq_batched"
+harness = false
+
+[[bench]]
+name = "compress_kernels"
+harness = false
+
+[[bench]]
+name = "poly"
+harness = false
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[lints]
+workspace = true

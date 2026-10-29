@@ -1,11 +1,33 @@
 use p3_field::extension::{
-    BinomiallyExtendable, Complex, HasComplexBinomialExtension, HasTwoAdicComplexBinomialExtension,
+    Binomial, BinomiallyExtendable, Complex, ExtensionAlgebra, HasComplexBinomialExtension,
+    HasTwoAdicComplexBinomialExtension, binomial_mul, binomial_square,
 };
-use p3_field::{field_to_array, FieldAlgebra, TwoAdicField};
+use p3_field::{PrimeCharacteristicRing, TwoAdicField, field_to_array};
 
 use crate::Mersenne31;
 
+impl ExtensionAlgebra<Self, 3, Binomial<Self>> for Mersenne31 {
+    #[inline]
+    fn ext_mul(a: &[Self; 3], b: &[Self; 3], res: &mut [Self; 3]) {
+        binomial_mul::<Self, Self, Self, 3>(a, b, res, <Self as BinomiallyExtendable<3>>::W);
+    }
+
+    #[inline]
+    fn ext_square(a: &[Self; 3], res: &mut [Self; 3]) {
+        binomial_square::<Self, Self, 3>(a, res, <Self as BinomiallyExtendable<3>>::W);
+    }
+}
+
 impl BinomiallyExtendable<3> for Mersenne31 {
+    fn binomial_algebra_id() -> alloc::vec::Vec<u8> {
+        use p3_field::PrimeField32;
+        alloc::format!(
+            "p3-power-basis-v1:X^3-{}",
+            <Self as BinomiallyExtendable<3>>::W.as_canonical_u32()
+        )
+        .into_bytes()
+    }
+
     // ```sage
     // p = 2^31 - 1
     // F = GF(p)
@@ -22,10 +44,21 @@ impl BinomiallyExtendable<3> for Mersenne31 {
     // ```sage
     // F.extension(x^3 - 5, 'u').multiplicative_generator()
     // ```
-    const EXT_GENERATOR: [Self; 3] = [Self::new(10), Self::new(1), Self::ZERO];
+    const EXT_GENERATOR: [Self; 3] = [Self::new(10), Self::ONE, Self::ZERO];
 }
 
 impl HasComplexBinomialExtension<2> for Mersenne31 {
+    fn complex_binomial_algebra_id() -> alloc::vec::Vec<u8> {
+        use p3_field::PrimeField32;
+        let w = <Self as HasComplexBinomialExtension<2>>::W;
+        alloc::format!(
+            "p3-complex-power-basis-v1:X^2-({}+{}i)",
+            w.real().as_canonical_u32(),
+            w.imag().as_canonical_u32()
+        )
+        .into_bytes()
+    }
+
     // Verifiable in Sage with
     // ```sage
     // p = 2**31 - 1  # Mersenne31
@@ -36,10 +69,10 @@ impl HasComplexBinomialExtension<2> for Mersenne31 {
     // f2 = y^2 - i - 2
     // assert f2.is_irreducible()
     // ```
-    const W: Complex<Self> = Complex::new(Mersenne31::new(2), Mersenne31::ONE);
+    const W: Complex<Self> = Complex::new_complex(Self::TWO, Self::ONE);
 
     // DTH_ROOT = W^((p^2 - 1)/2).
-    const DTH_ROOT: Complex<Self> = Complex::new_real(Mersenne31::new(2147483646));
+    const DTH_ROOT: Complex<Self> = Complex::new_real(Self::new(2147483646));
 
     // Verifiable in Sage with
     // ```sage
@@ -48,7 +81,16 @@ impl HasComplexBinomialExtension<2> for Mersenne31 {
     // for f in factor(p^4 - 1):
     //   assert g^((p^4-1) // f) != 1
     // ```
-    const EXT_GENERATOR: [Complex<Self>; 2] = [Complex::new_real(Mersenne31::new(6)), Complex::ONE];
+    const EXT_GENERATOR: [Complex<Self>; 2] = [Complex::new_real(Self::new(6)), Complex::ONE];
+
+    /// Multiply a `Complex<Mersenne31>` element by `W = 2 + i` using only additions:
+    /// `(a + bi)(2 + i) = (2a - b) + (a + 2b)i`.
+    #[inline(always)]
+    fn mul_by_w(z: Complex<Self>) -> Complex<Self> {
+        let re = z.real();
+        let im = z.imag();
+        Complex::new_complex(re + re - im, re + im + im)
+    }
 }
 
 impl HasTwoAdicComplexBinomialExtension<2> for Mersenne31 {
@@ -59,7 +101,7 @@ impl HasTwoAdicComplexBinomialExtension<2> for Mersenne31 {
         if bits == 33 {
             [
                 Complex::ZERO,
-                Complex::new(Mersenne31::new(1437746044), Mersenne31::new(946469285)),
+                Complex::new_complex(Self::new_reduced(1437746044), Self::new_reduced(946469285)),
             ]
         } else {
             [Complex::two_adic_generator(bits), Complex::ZERO]
@@ -68,6 +110,17 @@ impl HasTwoAdicComplexBinomialExtension<2> for Mersenne31 {
 }
 
 impl HasComplexBinomialExtension<3> for Mersenne31 {
+    fn complex_binomial_algebra_id() -> alloc::vec::Vec<u8> {
+        use p3_field::PrimeField32;
+        let w = <Self as HasComplexBinomialExtension<3>>::W;
+        alloc::format!(
+            "p3-complex-power-basis-v1:X^3-({}+{}i)",
+            w.real().as_canonical_u32(),
+            w.imag().as_canonical_u32()
+        )
+        .into_bytes()
+    }
+
     // Verifiable in Sage with
     // ```sage
     // p = 2**31 - 1  # Mersenne31
@@ -78,10 +131,10 @@ impl HasComplexBinomialExtension<3> for Mersenne31 {
     // f2 = y^3 - 5*i
     // assert f2.is_irreducible()
     // ```
-    const W: Complex<Self> = Complex::new_imag(Mersenne31::new(5));
+    const W: Complex<Self> = Complex::new_imag(Self::new(5));
 
-    // DTH_ROOT = W^((p^2 - 1)/2).
-    const DTH_ROOT: Complex<Self> = Complex::new_real(Mersenne31::new(634005911));
+    // DTH_ROOT = W^((p^2 - 1)/3).
+    const DTH_ROOT: Complex<Self> = Complex::new_real(Self::new(634005911));
 
     // Verifiable in Sage with
     // ```sage
@@ -91,8 +144,8 @@ impl HasComplexBinomialExtension<3> for Mersenne31 {
     //   assert g^((p^6-1) // f) != 1
     // ```
     const EXT_GENERATOR: [Complex<Self>; 3] = [
-        Complex::new_real(Mersenne31::new(5)),
-        Complex::new_real(Mersenne31::ONE),
+        Complex::new_real(Self::new(5)),
+        Complex::new_real(Self::ONE),
         Complex::ZERO,
     ];
 }
@@ -101,37 +154,218 @@ impl HasTwoAdicComplexBinomialExtension<3> for Mersenne31 {
     const COMPLEX_EXT_TWO_ADICITY: usize = 32;
 
     fn complex_ext_two_adic_generator(bits: usize) -> [Complex<Self>; 3] {
-        field_to_array::<Complex<Self>, 3>(Complex::two_adic_generator(bits))
+        field_to_array(Complex::two_adic_generator(bits))
     }
 }
 
 #[cfg(test)]
 mod test_cubic_extension {
+    use num_bigint::BigUint;
+    use p3_field::extension::BinomialExtensionField;
+    use p3_field::{ExtensionField, PrimeCharacteristicRing};
+    use p3_field_testing::{test_extension_field, test_field, test_packed_extension_field};
+
+    use crate::Mersenne31;
+
+    type F = Mersenne31;
+    type EF = BinomialExtensionField<F, 3>;
+
+    // There is a redundant representation of zero but we already tested it
+    // when testing the base field.
+    const ZEROS: [EF; 1] = [EF::ZERO];
+    const ONES: [EF; 1] = [EF::ONE];
+
+    // Get the prime factorization of the order of the multiplicative group.
+    // i.e. the prime factorization of P^3 - 1.
+    fn multiplicative_group_prime_factorization() -> [(BigUint, u32); 9] {
+        [
+            (BigUint::from(2u8), 1),
+            (BigUint::from(3u8), 3),
+            (BigUint::from(7u8), 1),
+            (BigUint::from(11u8), 1),
+            (BigUint::from(31u8), 1),
+            (BigUint::from(151u8), 1),
+            (BigUint::from(331u16), 1),
+            (BigUint::from(529510939u32), 1),
+            (BigUint::from(2903110321u32), 1),
+        ]
+    }
+
+    test_extension_field!(super::F, super::EF);
+
+    test_field!(
+        super::EF,
+        &super::ZEROS,
+        &super::ONES,
+        &super::multiplicative_group_prime_factorization()
+    );
+
+    type Pef = <EF as ExtensionField<F>>::ExtensionPacking;
+    const PACKED_ZEROS: [Pef; 1] = [Pef::ZERO];
+    const PACKED_ONES: [Pef; 1] = [Pef::ONE];
+    test_packed_extension_field!(
+        super::F,
+        super::EF,
+        super::Pef,
+        &super::PACKED_ZEROS,
+        &super::PACKED_ONES
+    );
+    p3_field_testing::test_packed_binomial_extension_division!(F, 3);
+}
+
+#[cfg(test)]
+mod test_cubic_complex_extension {
+    use num_bigint::BigUint;
     use p3_field::extension::{BinomialExtensionField, Complex};
-    use p3_field_testing::{test_field, test_two_adic_extension_field};
+    use p3_field::{ExtensionField, PrimeCharacteristicRing};
+    use p3_field_testing::{
+        test_extension_field, test_field, test_packed_extension_field,
+        test_two_adic_extension_field,
+    };
 
     use crate::Mersenne31;
 
     type F = Complex<Mersenne31>;
     type EF = BinomialExtensionField<F, 3>;
 
-    test_field!(super::EF);
+    // There is a redundant representation of zero but we already tested it
+    // when testing the base field.
+    const ZEROS: [EF; 1] = [EF::ZERO];
+    const ONES: [EF; 1] = [EF::ONE];
+
+    // Get the prime factorization of the order of the multiplicative group.
+    // i.e. the prime factorization of P^6 - 1.
+    fn multiplicative_group_prime_factorization() -> [(BigUint, u32); 14] {
+        [
+            (BigUint::from(2u8), 32),
+            (BigUint::from(3u8), 3),
+            (BigUint::from(7u8), 1),
+            (BigUint::from(11u8), 1),
+            (BigUint::from(13u8), 1),
+            (BigUint::from(31u8), 1),
+            (BigUint::from(43u8), 2),
+            (BigUint::from(79u8), 1),
+            (BigUint::from(151u8), 1),
+            (BigUint::from(331u16), 1),
+            (BigUint::from(1381u16), 1),
+            (BigUint::from(529510939u32), 1),
+            (BigUint::from(1758566101u32), 1),
+            (BigUint::from(2903110321u32), 1),
+        ]
+    }
+
+    test_field!(
+        super::EF,
+        &super::ZEROS,
+        &super::ONES,
+        &super::multiplicative_group_prime_factorization()
+    );
+
+    test_extension_field!(super::F, super::EF);
 
     test_two_adic_extension_field!(super::F, super::EF);
+
+    type Pef = <EF as ExtensionField<F>>::ExtensionPacking;
+    const PACKED_ZEROS: [Pef; 1] = [Pef::ZERO];
+    const PACKED_ONES: [Pef; 1] = [Pef::ONE];
+    test_packed_extension_field!(
+        super::F,
+        super::EF,
+        super::Pef,
+        &super::PACKED_ZEROS,
+        &super::PACKED_ONES
+    );
+    p3_field_testing::test_packed_binomial_extension_division!(F, 3);
 }
 
 #[cfg(test)]
-mod test_quadratic_extension {
+mod test_quadratic_complex_extension {
 
+    use num_bigint::BigUint;
     use p3_field::extension::{BinomialExtensionField, Complex};
-    use p3_field_testing::{test_field, test_two_adic_extension_field};
+    use p3_field::{ExtensionField, PrimeCharacteristicRing};
+    use p3_field_testing::{
+        test_extension_field, test_field, test_packed_extension_field,
+        test_two_adic_extension_field,
+    };
 
     use crate::Mersenne31;
 
     type F = Complex<Mersenne31>;
     type EF = BinomialExtensionField<F, 2>;
 
-    test_field!(super::EF);
+    // There is a redundant representation of zero but we already tested it
+    // when testing the base field.
+    const ZEROS: [EF; 1] = [EF::ZERO];
+    const ONES: [EF; 1] = [EF::ONE];
+
+    // Get the prime factorization of the order of the multiplicative group.
+    // i.e. the prime factorization of P^4 - 1.
+    fn multiplicative_group_prime_factorization() -> [(BigUint, u32); 11] {
+        [
+            (BigUint::from(2u8), 33),
+            (BigUint::from(3u8), 2),
+            (BigUint::from(5u8), 1),
+            (BigUint::from(7u8), 1),
+            (BigUint::from(11u8), 1),
+            (BigUint::from(31u8), 1),
+            (BigUint::from(151u8), 1),
+            (BigUint::from(331u16), 1),
+            (BigUint::from(733u16), 1),
+            (BigUint::from(1709u16), 1),
+            (BigUint::from(368140581013u64), 1),
+        ]
+    }
+
+    test_field!(
+        super::EF,
+        &super::ZEROS,
+        &super::ONES,
+        &super::multiplicative_group_prime_factorization()
+    );
+
+    test_extension_field!(super::F, super::EF);
 
     test_two_adic_extension_field!(super::F, super::EF);
+
+    type Pef = <EF as ExtensionField<F>>::ExtensionPacking;
+    const PACKED_ZEROS: [Pef; 1] = [Pef::ZERO];
+    const PACKED_ONES: [Pef; 1] = [Pef::ONE];
+    test_packed_extension_field!(
+        super::F,
+        super::EF,
+        super::Pef,
+        &super::PACKED_ZEROS,
+        &super::PACKED_ONES
+    );
+    p3_field_testing::test_packed_binomial_extension_division!(F, 2);
+}
+
+#[cfg(test)]
+mod tests {
+    use p3_field::PrimeCharacteristicRing;
+    use p3_field::extension::{Complex, HasComplexBinomialExtension};
+
+    use crate::Mersenne31;
+
+    #[test]
+    fn complex_binomial_dth_roots() {
+        // DTH_ROOT = W^((p^2 - 1)/D) for the degree-D extension of the complex field.
+        //
+        // Here p^2 - 1 is the order of the complex field's multiplicative group.
+        let p = (1u64 << 31) - 1;
+        let order = p * p - 1;
+
+        let w2 = <Mersenne31 as HasComplexBinomialExtension<2>>::W;
+        let dth2 = <Mersenne31 as HasComplexBinomialExtension<2>>::DTH_ROOT;
+        assert_eq!(w2.exp_u64(order / 2), dth2);
+
+        let w3 = <Mersenne31 as HasComplexBinomialExtension<3>>::W;
+        let dth3 = <Mersenne31 as HasComplexBinomialExtension<3>>::DTH_ROOT;
+        assert_eq!(w3.exp_u64(order / 3), dth3);
+
+        // The cubic root is a primitive cube root of unity.
+        assert_ne!(dth3, Complex::ONE);
+        assert_eq!(dth3.cube(), Complex::ONE);
+    }
 }

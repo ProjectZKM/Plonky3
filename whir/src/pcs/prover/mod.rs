@@ -1,0 +1,604 @@
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::mem;
+use core::ops::Deref;
+
+use p3_challenger::fs::TranscriptField;
+use p3_challenger::{CanObserve, CanSampleUniformBits, FieldChallenger, GrindingChallenger};
+use p3_commit::{ExtensionMmcs, Mmcs};
+use p3_field::{ExtensionField, Field};
+use p3_matrix::dense::DenseMatrix;
+use p3_matrix::extension::FlatMatrixView;
+use p3_multilinear_util::point::Point;
+use p3_multilinear_util::poly::Poly;
+use p3_sumcheck::TableShape;
+use p3_sumcheck::constraints::statement::{EqStatement, SelectStatement};
+use p3_sumcheck::constraints::{Constraint, Statements};
+use p3_sumcheck::layout::{InitialWeight, Layout, SuffixProver, Verifier as LayoutVerifier};
+use p3_sumcheck::strategy::{SumcheckProver, VariableOrder};
+use tracing::instrument;
+
+use crate::WhirConfigError;
+use crate::domain::{WhirDomain, WhirQueryPoint};
+use crate::parameters::WhirConfig;
+use crate::pcs::WhirProverData;
+use crate::pcs::committer::writer::commit_extension;
+use crate::pcs::proof::{
+    QueryOpenings, SharedProofOpening, SumcheckData, WhirProof, WhirRoundProof,
+};
+use crate::pcs::verifier::errors::VerifierError;
+use crate::pcs::verifier::{InitialWeightCheck, WhirVerifier};
+use crate::transcript::{WhirProverTranscript, WhirShape};
+
+/// Per-round prover state with the Merkle authentication shapes
+/// baked in for the WHIR commitment scheme.
+///
+/// - The first round commits to evaluations laid out as a base-field
+///   row-major matrix.
+/// - Subsequent rounds commit to folded extension-field evaluations,
+///   reinterpreted as wider base-field rows so a single Merkle backend
+///   handles both shapes.
+type WhirRoundState<EF, F, MT> = RoundState<
+    EF,
+    F,
+    Arc<<MT as Mmcs<F>>::ProverData<DenseMatrix<F>>>,
+    <MT as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, DenseMatrix<EF>>>,
+>;
+
+/// Active Merkle prover data for the polynomial currently being queried.
+#[derive(Debug)]
+enum RoundData<BaseData, ExtData> {
+    /// Base-field commitment produced by the initial round.
+    Base(BaseData),
+    /// Extension-field commitment produced by every subsequent folded round.
+    Ext(ExtData),
+}
+
+/// Per-round state during WHIR proof generation.
+///
+/// Tracks the sumcheck prover, folding randomness, and Merkle
+/// commitments across base and extension field rounds.
+#[derive(Debug)]
+struct RoundState<EF, F, BaseData, ExtData>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    /// Sumcheck prover managing constraint batching and polynomial folding.
+    sumcheck_prover: SumcheckProver<F, EF>,
+    /// Folding challenges (alpha_1, ..., alpha_k) for the current round.
+    folding_randomness: Point<EF>,
+    /// Active Merkle prover data for the polynomial currently being queried.
+    round_data: RoundData<BaseData, ExtData>,
+}
+
+/// WHIR prover bundling the protocol config with its FFT and commitment backends.
+#[derive(Debug)]
+pub struct WhirProver<EF, F, Dft, MT, Challenger, Layout>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    /// Derived per-protocol parameters and per-round configuration.
+    pub(crate) config: WhirConfig<EF, F, Challenger>,
+    /// FFT engine used to encode polynomials before each commitment.
+    pub(crate) dft: Dft,
+    /// Base-field Merkle commitment scheme used in the initial round.
+    pub(crate) mmcs: MT,
+    /// Extension-field commitment scheme used in every folded round.
+    pub(crate) extension_mmcs: ExtensionMmcs<F, EF, MT>,
+    /// Marker tying the prover to a specific stacked-layout binding mode.
+    _marker: PhantomData<Layout>,
+}
+
+impl<EF, F, Dft, MT, Challenger, L> WhirProver<EF, F, Dft, MT, Challenger, L>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    /// Commitment backend used by the initial and folded codewords.
+    #[must_use]
+    pub const fn mmcs(&self) -> &MT {
+        &self.mmcs
+    }
+}
+
+impl<EF, F, Dft, MT, Challenger, Layout> Deref for WhirProver<EF, F, Dft, MT, Challenger, Layout>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    type Target = WhirConfig<EF, F, Challenger>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+impl<EF, F, Dft, MT, Challenger, L> WhirProver<EF, F, Dft, MT, Challenger, L>
+where
+    F: Field + TranscriptField + Ord,
+    EF: ExtensionField<F>,
+    Dft: WhirDomain<F, EF>,
+    Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F> + CanSampleUniformBits<F>,
+    MT: Mmcs<F>,
+    L: Layout<F, EF>,
+{
+    /// Builds a prover from a derived config, an FFT engine, and a base-field MMCS.
+    ///
+    /// The extension-field MMCS is constructed by wrapping the base-field one,
+    /// so callers never have to thread it through manually.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `config` was derived for a different domain.
+    pub fn new(config: WhirConfig<EF, F, Challenger>, dft: Dft, mmcs: MT) -> Self {
+        assert_eq!(
+            config.max_log_domain_size,
+            dft.max_log_domain_size(),
+            "WHIR configuration and domain have different capacities"
+        );
+        assert_eq!(
+            config.domain_id,
+            dft.protocol_id(),
+            "WHIR configuration and domain have different protocol identities"
+        );
+        assert_eq!(
+            config.stratified_queries,
+            dft.stratified_queries(),
+            "WHIR configuration and domain disagree on query stratification"
+        );
+        assert!(
+            dft.supports_security_assumption(config.soundness_type),
+            "WHIR configuration uses a soundness regime the domain rejects"
+        );
+        let extension_mmcs = ExtensionMmcs::new(mmcs.clone());
+        Self {
+            config,
+            dft,
+            mmcs,
+            extension_mmcs,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Execute the full WHIR proving protocol.
+    ///
+    /// Performs multi-round sumcheck-based polynomial folding,
+    /// producing Merkle authentication paths and constraint evaluations.
+    ///
+    /// # Arguments
+    ///
+    /// - `initial_ood_answers`: answers at the commitment phase's out-of-domain points.
+    /// - `challenger`: the sponge the whole proof shares, borrowed for this run.
+    /// - `layout`: the committed stacked layout, holding the claims to batch.
+    /// - `prover_data`: Merkle prover data behind the initial commitment.
+    /// - `num_opening_claims`: opening claims the caller bound before this run.
+    pub fn prove(
+        &self,
+        initial_ood_answers: Vec<EF>,
+        challenger: &mut Challenger,
+        layout: L,
+        prover_data: MT::ProverData<DenseMatrix<F>>,
+        num_opening_claims: usize,
+    ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        self.prove_shared(
+            initial_ood_answers,
+            challenger,
+            layout,
+            Arc::new(prover_data),
+            num_opening_claims,
+        )
+    }
+
+    /// [`Self::prove`] over Merkle prover data that other owners may share.
+    ///
+    /// Clones share the data; the run drops its reference once a later round replaces the initial
+    /// commitment, or when the run ends.
+    #[instrument(name = "prove", skip_all)]
+    pub(crate) fn prove_shared(
+        &self,
+        initial_ood_answers: Vec<EF>,
+        challenger: &mut Challenger,
+        layout: L,
+        prover_data: Arc<MT::ProverData<DenseMatrix<F>>>,
+        num_opening_claims: usize,
+    ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        assert_eq!(self.round_folding_factor(0), layout.folding());
+        let num_claims = layout.num_claims();
+        let starting_folding_pow_bits = self.starting_folding_pow_bits;
+        self.prove_from(
+            initial_ood_answers,
+            challenger,
+            num_claims,
+            prover_data,
+            num_opening_claims,
+            |initial_sumcheck, challenger| {
+                layout.into_sumcheck(initial_sumcheck, starting_folding_pow_bits, challenger)
+            },
+        )
+    }
+
+    /// Run every round of the opening after an initial fold the caller plays.
+    ///
+    /// # Arguments
+    ///
+    /// - `initial_ood_answers`: answers at the commitment phase's out-of-domain points.
+    /// - `challenger`: the sponge the whole proof shares, borrowed for this run.
+    /// - `num_claims`: claims the initial fold batches, out-of-domain ones excluded.
+    /// - `prover_data`: Merkle prover data behind the initial commitment.
+    /// - `num_opening_claims`: opening claims the caller bound before this run.
+    /// - `initial_fold`: plays the initial fold inside its delegation bracket.
+    fn prove_from(
+        &self,
+        initial_ood_answers: Vec<EF>,
+        challenger: &mut Challenger,
+        num_claims: usize,
+        prover_data: Arc<MT::ProverData<DenseMatrix<F>>>,
+        num_opening_claims: usize,
+        initial_fold: impl FnOnce(
+            &mut SumcheckData<F, EF>,
+            &mut Challenger,
+        ) -> (SumcheckProver<F, EF>, Point<EF>),
+    ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        self.config.validate_initial_claims(
+            num_claims
+                .checked_add(initial_ood_answers.len())
+                .ok_or(WhirConfigError::InitialClaimCountOverflow)?,
+        )?;
+        let variable_order = L::variable_order();
+
+        // One driver spans the whole run, so the description is walked exactly once.
+        let shape = WhirShape::new(&self.config, num_opening_claims);
+        let mut transcript = WhirProverTranscript::<Challenger, F, EF>::new(challenger, shape);
+
+        // The delegate draws the claim-batching challenge, then plays its own rounds.
+        let mut initial_sumcheck = SumcheckData::default();
+        let (sumcheck_prover, folding_randomness) = transcript
+            .delegate_initial_fold(|challenger| initial_fold(&mut initial_sumcheck, challenger));
+
+        let mut round_state = RoundState {
+            sumcheck_prover,
+            folding_randomness,
+            round_data: RoundData::Base(prover_data),
+        };
+
+        // Build one round proof per intermediate folding round.
+        let mut rounds = Vec::with_capacity(self.n_rounds());
+        for round_index in 0..self.n_rounds() {
+            rounds.push(self.round(
+                round_index,
+                &mut transcript,
+                &mut round_state,
+                variable_order,
+            ));
+        }
+
+        // Final round: send the polynomial in the clear, open the last queries.
+        let (final_poly, final_pow_witness, final_openings, final_sumcheck) =
+            self.final_round(self.n_rounds(), &mut transcript, &mut round_state);
+
+        // Require that every described step was played.
+        transcript.finish();
+
+        Ok(WhirProof {
+            initial_ood_answers,
+            initial_sumcheck,
+            rounds,
+            final_poly,
+            final_pow_witness,
+            final_openings,
+            final_sumcheck,
+        })
+    }
+
+    #[instrument(skip_all, level = "debug", fields(round_number = round_index, log_size = self.num_variables - self.total_folded_through(round_index)))]
+    #[allow(clippy::too_many_lines)]
+    fn round(
+        &self,
+        round_index: usize,
+        transcript: &mut WhirProverTranscript<'_, Challenger, F, EF>,
+        round_state: &mut WhirRoundState<EF, F, MT>,
+        variable_order: VariableOrder,
+    ) -> WhirRoundProof<F, EF, MT>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        let num_variables = self.num_variables - self.total_folded_through(round_index);
+        assert_eq!(num_variables, round_state.sumcheck_prover.num_variables());
+
+        let round_params = &self.round_parameters[round_index];
+        let folding_factor_next = self.round_folding_factor(round_index + 1);
+        let log_inv_rate = round_params.log_inv_rate;
+
+        // Commit straight from the live sumcheck buffer; no scalar copy is materialized.
+        let (root, prover_data) = commit_extension(
+            variable_order,
+            &self.dft,
+            &self.extension_mmcs,
+            round_state.sumcheck_prover.evals_view(),
+            folding_factor_next,
+            log_inv_rate,
+        );
+
+        // Observe the round commitment.
+        transcript.commitment(root.clone());
+        let commitment = Some(root);
+
+        // OOD sampling.
+        let mut ood_statement = EqStatement::initialize(num_variables);
+        let mut ood_answers = Vec::with_capacity(round_params.ood_samples);
+        (0..round_params.ood_samples).for_each(|_| {
+            let point = Point::expand_from_univariate(transcript.ood_point(), num_variables);
+            let eval = round_state.sumcheck_prover.eval(&point);
+            transcript.ood_answer(eval);
+
+            ood_answers.push(eval);
+            ood_statement.add_evaluated_constraint(point, eval);
+        });
+
+        // PoW grinding: prevents query manipulation by forcing work after committing.
+        let pow_witness = transcript.query_pow(round_index);
+
+        // STIR query sampling.
+        let stir_challenges_indexes = transcript.query_indices(round_index);
+
+        let mut stir_statement = SelectStatement::initialize(num_variables);
+        let query_randomness = match variable_order {
+            VariableOrder::Prefix => round_state.folding_randomness.clone(),
+            VariableOrder::Suffix => round_state.folding_randomness.reversed(),
+        };
+
+        // Open all queried positions in one multiproof.
+        // Each row folds in place; the same allocation then travels into the proof.
+        let openings = match &round_state.round_data {
+            RoundData::Base(data) => {
+                let mut opening =
+                    SharedProofOpening::open(&self.mmcs, &stir_challenges_indexes, data);
+                for (row, &challenge) in opening.rows.iter_mut().zip(&stir_challenges_indexes) {
+                    let poly = Poly::new(mem::take(row));
+                    let eval = poly.eval_base(&query_randomness);
+                    match self.dft.query_point(
+                        round_params.log_folded_domain_size,
+                        round_params.num_variables,
+                        challenge,
+                    ) {
+                        WhirQueryPoint::Univariate(var) => {
+                            stir_statement.add_constraint(var, eval);
+                        }
+                        WhirQueryPoint::Multilinear(point) => {
+                            stir_statement.add_point_constraint(point, eval);
+                        }
+                    }
+                    *row = poly.into_evals();
+                }
+                QueryOpenings::Base(opening)
+            }
+            RoundData::Ext(data) => {
+                let mut opening =
+                    SharedProofOpening::open(&self.extension_mmcs, &stir_challenges_indexes, data);
+                for (row, &challenge) in opening.rows.iter_mut().zip(&stir_challenges_indexes) {
+                    let poly = Poly::new(mem::take(row));
+                    let eval = poly.eval_ext::<F>(&query_randomness);
+                    match self.dft.query_point(
+                        round_params.log_folded_domain_size,
+                        round_params.num_variables,
+                        challenge,
+                    ) {
+                        WhirQueryPoint::Univariate(var) => {
+                            stir_statement.add_constraint(var, eval);
+                        }
+                        WhirQueryPoint::Multilinear(point) => {
+                            stir_statement.add_point_constraint(point, eval);
+                        }
+                    }
+                    *row = poly.into_evals();
+                }
+                QueryOpenings::Extension(opening)
+            }
+        };
+
+        // Batch the two statement groups into one constraint over the same cube.
+        // The out-of-domain claims form the equality group.
+        // The query openings form the selection group.
+        // A freshly sampled challenge weights the groups by its successive powers,
+        // and the verifier samples the same challenge to rebuild the identical batch.
+        let num_variables = ood_statement.num_variables();
+        let constraint = Constraint::new_with_existing_claim(
+            transcript.round_batching(),
+            num_variables,
+            vec![
+                Statements::Eq(ood_statement),
+                Statements::Select(stir_statement),
+            ],
+        );
+
+        // Run sumcheck and fold the polynomial, under this round's delegation bracket.
+        let mut sumcheck_data: SumcheckData<F, EF> = SumcheckData::default();
+        let folding_randomness = transcript.delegate_round_fold(|challenger| {
+            round_state.sumcheck_prover.compute_sumcheck_polynomials(
+                &mut sumcheck_data,
+                challenger,
+                folding_factor_next,
+                round_params.folding_pow_bits,
+                Some(constraint),
+            )
+        });
+
+        // Update round state for next iteration.
+        round_state.folding_randomness = folding_randomness;
+        round_state.round_data = RoundData::Ext(prover_data);
+
+        WhirRoundProof {
+            commitment,
+            ood_answers,
+            pow_witness,
+            openings,
+            sumcheck: sumcheck_data,
+        }
+    }
+
+    #[instrument(skip_all)]
+    #[allow(clippy::type_complexity)]
+    fn final_round(
+        &self,
+        round_index: usize,
+        transcript: &mut WhirProverTranscript<'_, Challenger, F, EF>,
+        round_state: &mut WhirRoundState<EF, F, MT>,
+    ) -> (
+        Option<Poly<EF>>,
+        F,
+        QueryOpenings<F, EF, MT::MultiProof>,
+        Option<SumcheckData<F, EF>>,
+    ) {
+        let num_variables = self.num_variables - self.total_folded_through(round_index);
+        assert_eq!(
+            num_variables,
+            round_state.sumcheck_prover.evals().num_variables()
+        );
+
+        // Send final polynomial coefficients in the clear.
+        // Unpack once; the transcript and the returned proof share the same copy.
+        let final_poly = round_state.sumcheck_prover.evals();
+        transcript.final_poly(final_poly.as_slice());
+        let final_poly = Some(final_poly);
+
+        // PoW grinding for the final round.
+        let final_pow_witness = transcript.query_pow(round_index);
+
+        // Final STIR queries.
+        let final_challenge_indexes = transcript.query_indices(round_index);
+
+        // Open all queried positions in one multiproof.
+        let final_openings = match &round_state.round_data {
+            RoundData::Base(data) => QueryOpenings::Base(SharedProofOpening::open(
+                &self.mmcs,
+                &final_challenge_indexes,
+                data,
+            )),
+            RoundData::Ext(data) => QueryOpenings::Extension(SharedProofOpening::open(
+                &self.extension_mmcs,
+                &final_challenge_indexes,
+                data,
+            )),
+        };
+
+        // Optional final sumcheck, under its own delegation bracket.
+        //
+        // A run with no closing rounds delegates nothing, so no bracket is played.
+        let final_sumcheck = transcript.delegate_final_fold(|challenger| {
+            let mut sumcheck_data: SumcheckData<F, EF> = SumcheckData::default();
+            // The prover holds the folded state, so the returned point is redundant here.
+            let _ = round_state.sumcheck_prover.compute_sumcheck_polynomials(
+                &mut sumcheck_data,
+                challenger,
+                self.final_sumcheck_rounds,
+                self.final_folding_pow_bits,
+                None,
+            );
+            sumcheck_data
+        });
+
+        (
+            final_poly,
+            final_pow_witness,
+            final_openings,
+            final_sumcheck,
+        )
+    }
+}
+
+impl<EF, F, Dft, MT, Challenger> WhirProver<EF, F, Dft, MT, Challenger, SuffixProver<F, EF>>
+where
+    F: Field + TranscriptField + Ord,
+    EF: ExtensionField<F>,
+    Dft: WhirDomain<F, EF>,
+    Challenger: FieldChallenger<F>
+        + GrindingChallenger<Witness = F>
+        + CanSampleUniformBits<F>
+        + CanObserve<MT::Commitment>,
+    MT: Mmcs<F>,
+{
+    /// Open the commitment against one extra weight, which its initial fold proves.
+    ///
+    /// The commitment's own out-of-domain samples are drawn first, as for any opening.
+    ///
+    /// The caller binds the weight's claimed sum before this call.
+    ///
+    /// # Errors
+    ///
+    /// The schedule refuses the claim count.
+    pub fn open_with_initial_weight<W: InitialWeight<EF>>(
+        &self,
+        mut prover_data: WhirProverData<F, EF, MT, SuffixProver<F, EF>>,
+        weight: W,
+        challenger: &mut Challenger,
+    ) -> Result<WhirProof<F, EF, MT>, WhirConfigError> {
+        let initial_ood_answers = tracing::info_span!("ood claims").in_scope(|| {
+            (0..self.commitment_ood_samples)
+                .map(|_| prover_data.layout.add_virtual_eval(challenger))
+                .collect::<Vec<_>>()
+        });
+        let layout = prover_data.layout;
+        assert_eq!(self.round_folding_factor(0), layout.folding());
+        // The extra weight is one more claim the initial fold batches.
+        let num_claims = layout.num_claims() + 1;
+        let pow_bits = self.starting_folding_pow_bits;
+        self.prove_from(
+            initial_ood_answers,
+            challenger,
+            num_claims,
+            prover_data.merkle_data,
+            0,
+            |initial_sumcheck, challenger| {
+                layout.into_sumcheck_with_weight(weight, initial_sumcheck, pow_bits, challenger)
+            },
+        )
+    }
+
+    /// Check an opening against one extra weight, given its claimed sum and its extension.
+    ///
+    /// The commitment is not bound here, the caller binds it before drawing anything.
+    ///
+    /// # Errors
+    ///
+    /// A wrong out-of-domain count, a refused claim count, or any rejection of the run.
+    pub fn verify_with_initial_weight(
+        &self,
+        commitment: &MT::Commitment,
+        proof: &WhirProof<F, EF, MT>,
+        table_shapes: &[TableShape],
+        weight: InitialWeightCheck<'_, EF>,
+        challenger: &mut Challenger,
+    ) -> Result<(), VerifierError> {
+        let strategy = <SuffixProver<F, EF> as Layout<F, EF>>::strategy();
+        let mut layout = LayoutVerifier::<F, EF>::new(table_shapes, strategy);
+        if proof.initial_ood_answers.len() != self.commitment_ood_samples {
+            return Err(VerifierError::InitialOodAnswerCountMismatch {
+                expected: self.commitment_ood_samples,
+                actual: proof.initial_ood_answers.len(),
+            });
+        }
+        for &eval in &proof.initial_ood_answers {
+            layout.add_virtual_eval(eval, challenger);
+        }
+        self.config
+            .validate_initial_claims(self.commitment_ood_samples.saturating_add(1))?;
+        let verifier =
+            WhirVerifier::new(&self.config, &self.dft, &self.mmcs, strategy.variable_order);
+        verifier
+            .verify_with_initial_weight(proof, challenger, commitment, &layout, weight)
+            .map(|_| ())
+    }
+}

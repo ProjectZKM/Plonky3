@@ -75,7 +75,7 @@ jobs:
       run: cargo +stable clippy --all-targets -- -D warnings
 
     - name: Format
-      run: cargo +nightly fmt --all -- --check 
+      run: cargo +nightly fmt --all -- --check
 
   check_crates:
     name: Check Crates
@@ -97,7 +97,7 @@ jobs:
           ~/.cargo/git/db/
           target/
         key: rust-${{ steps.rs-stable.outputs.rustc_hash }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
-  
+
     - name: Cargo Check Crates
       run: |
         cargo check --verbose --package p3-air
@@ -110,7 +110,6 @@ jobs:
         cargo check --verbose --package p3-field-testing
         cargo check --verbose --package p3-fri
         cargo check --verbose --package p3-goldilocks
-        cargo check --verbose --package p3-interpolation
         cargo check --verbose --package p3-keccak
         cargo check --verbose --package p3-keccak-air
         cargo check --verbose --package p3-matrix
@@ -119,7 +118,7 @@ jobs:
         cargo check --verbose --package p3-merkle-tree
         cargo check --verbose --package p3-mersenne-31
         cargo check --verbose --package p3-monolith
-        cargo check --verbose --package p3-poseidon
+        cargo check --verbose --package p3-poseidon1
         cargo check --verbose --package p3-poseidon2
         cargo check --verbose --package p3-rescue
         cargo check --verbose --package p3-symmetric

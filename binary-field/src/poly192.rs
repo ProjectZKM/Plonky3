@@ -1,0 +1,1398 @@
+//! `GF(2^192)` as the cubic extension `y^3 + y + 1` of the 64-bit polynomial-basis field.
+//!
+//! A cubic over a finite field is irreducible exactly when it has no root there.
+//!
+//! A root of this one would generate `GF(2^3)` inside `GF(2^64)`, and `3` does not divide `64`.
+//!
+//! The pairing matters for soundness budgeting.
+//!
+//! A 64-bit column field halves committed volume, and 192 bits of challenge leave headroom.
+
+use alloc::vec::Vec;
+use core::fmt::{self, Debug, Display, Formatter};
+use core::iter::{Product, Sum};
+use core::mem::ManuallyDrop;
+use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use core::ptr;
+
+use num_bigint::BigUint;
+#[cfg(any(
+    all(
+        target_arch = "x86_64",
+        target_feature = "vpclmulqdq",
+        any(target_feature = "avx2", target_feature = "avx512f")
+    ),
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "aes"
+    )
+))]
+use p3_field::PackedValue;
+use p3_field::extension::HasFrobenius;
+use p3_field::op_assign_macros::{
+    impl_add_assign, impl_add_base_field, impl_div_methods, impl_mul_methods, impl_sub_assign,
+    impl_sub_base_field, ring_sum,
+};
+use p3_field::{
+    Algebra, AlgebraIdentity, BasedVectorSpace, ExtensionField, Field, Packable,
+    PrimeCharacteristicRing, RawDataSerializable,
+};
+#[cfg(not(any(
+    all(
+        target_arch = "x86_64",
+        target_feature = "vpclmulqdq",
+        any(target_feature = "avx2", target_feature = "avx512f")
+    ),
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "aes"
+    )
+)))]
+use p3_field::{PackedFieldExtension, Powers};
+use rand::Rng;
+use rand::distr::{Distribution, StandardUniform};
+use serde::{Deserialize, Serialize};
+
+#[cfg(not(any(
+    all(
+        target_arch = "x86_64",
+        target_feature = "vpclmulqdq",
+        any(target_feature = "avx2", target_feature = "avx512f")
+    ),
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "aes"
+    )
+)))]
+use crate::clmul::raw_product_64;
+use crate::clmul::reduce_64;
+use crate::gf2::characteristic_two_methods;
+use crate::{Gf2, Poly64, clmul};
+
+/// The number of coordinates over the coefficient field.
+const DEGREE: usize = 3;
+
+/// `GF(2^192)`, as three coordinates over `GF(2^64)` in the basis `1, y, y^2`.
+///
+/// The defining relation is `y^3 = y + 1`, which also gives `y^4 = y^2 + y`.
+///
+/// Everything below reduces with those two rewrites and nothing else.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+#[must_use]
+pub struct Poly192([Poly64; DEGREE]);
+
+/// A weighted extension-field sum whose three coordinate reductions are delayed until completion.
+///
+/// Chunks and partial sums can be combined without reducing each intermediate result.
+/// Binary-field reduction preserves XOR, so the final value equals reducing every product first.
+#[derive(Clone, Copy, Debug, Default)]
+#[must_use]
+pub struct Poly192MixedAccumulator {
+    /// Raw polynomial sums in the selected vector registers.
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            target_feature = "vpclmulqdq",
+            any(target_feature = "avx2", target_feature = "avx512f")
+        ),
+        all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            target_feature = "aes"
+        )
+    ))]
+    coordinates: crate::packed::poly192::PackedMixedAccumulator,
+    /// Scalar polynomial sums on targets without a polynomial packing.
+    #[cfg(not(any(
+        all(
+            target_arch = "x86_64",
+            target_feature = "vpclmulqdq",
+            any(target_feature = "avx2", target_feature = "avx512f")
+        ),
+        all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            target_feature = "aes"
+        )
+    )))]
+    coordinates: [u128; DEGREE],
+}
+
+impl Poly192MixedAccumulator {
+    /// An empty weighted sum.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add `sum_i values[i] * weights[i]`, leaving each coordinate unreduced.
+    #[inline]
+    pub fn add_dot_product<const N: usize>(
+        &mut self,
+        values: &[Poly192; N],
+        weights: &[Poly64; N],
+    ) {
+        #[cfg(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "vpclmulqdq",
+                any(target_feature = "avx2", target_feature = "avx512f")
+            ),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                target_feature = "aes"
+            )
+        ))]
+        self.coordinates.add_dot(values, weights);
+        #[cfg(not(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "vpclmulqdq",
+                any(target_feature = "avx2", target_feature = "avx512f")
+            ),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                target_feature = "aes"
+            )
+        )))]
+        for (value, weight) in values.iter().zip(weights) {
+            for (sum, coordinate) in self.coordinates.iter_mut().zip(value.limbs()) {
+                *sum ^= raw_product_64(*coordinate, weight.to_bits());
+            }
+        }
+    }
+
+    /// Add one complete packing without unpacking its values first.
+    #[inline]
+    pub fn add_packed_dot_product(
+        &mut self,
+        values: <Poly192 as ExtensionField<Poly64>>::ExtensionPacking,
+        weights: <Poly64 as Field>::Packing,
+    ) {
+        #[cfg(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "vpclmulqdq",
+                any(target_feature = "avx2", target_feature = "avx512f")
+            ),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                target_feature = "aes"
+            )
+        ))]
+        self.coordinates.add_packed(values, weights);
+        #[cfg(not(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "vpclmulqdq",
+                any(target_feature = "avx2", target_feature = "avx512f")
+            ),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                target_feature = "aes"
+            )
+        )))]
+        self.add_dot_product(&[values], &[weights]);
+    }
+
+    /// Add another partial weighted sum without reducing either one.
+    #[inline]
+    pub fn merge(&mut self, other: Self) {
+        #[cfg(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "vpclmulqdq",
+                any(target_feature = "avx2", target_feature = "avx512f")
+            ),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                target_feature = "aes"
+            )
+        ))]
+        self.coordinates.merge(other.coordinates);
+        #[cfg(not(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "vpclmulqdq",
+                any(target_feature = "avx2", target_feature = "avx512f")
+            ),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                target_feature = "aes"
+            )
+        )))]
+        for (sum, term) in self.coordinates.iter_mut().zip(other.coordinates) {
+            *sum ^= term;
+        }
+    }
+
+    /// Complete the sum with one base-field reduction per coordinate.
+    #[inline]
+    pub fn finish(self) -> Poly192 {
+        #[cfg(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "vpclmulqdq",
+                any(target_feature = "avx2", target_feature = "avx512f")
+            ),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                target_feature = "aes"
+            )
+        ))]
+        let coordinates = self.coordinates.coordinates();
+        #[cfg(not(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "vpclmulqdq",
+                any(target_feature = "avx2", target_feature = "avx512f")
+            ),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                target_feature = "aes"
+            )
+        )))]
+        let coordinates = self.coordinates;
+        Poly192::from_limbs(coordinates.map(reduce_64))
+    }
+}
+
+impl Poly192 {
+    /// Multiply four independent pairs, preserving their input order.
+    ///
+    /// Uses four 256-bit coefficient lanes on AVX2 with VPCLMULQDQ.
+    ///
+    /// With AVX-512F, each pair instead occupies a 128-bit lane of a 512-bit register.
+    ///
+    /// That halves the number of carryless multiplies.
+    #[inline]
+    pub fn mul4(a: [Self; 4], b: [Self; 4]) -> [Self; 4] {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "vpclmulqdq",
+            target_feature = "avx2"
+        ))]
+        {
+            crate::packed::poly192::mul4(a, b)
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "vpclmulqdq",
+            target_feature = "avx2"
+        )))]
+        {
+            core::array::from_fn(|i| a[i] * b[i])
+        }
+    }
+
+    /// The number of bits of an element.
+    pub(crate) const BITS: usize = DEGREE * 64;
+
+    /// The element with the given coordinates in the basis `1, y, y^2`.
+    #[inline]
+    pub const fn new(coefficients: [Poly64; DEGREE]) -> Self {
+        Self(coefficients)
+    }
+
+    /// The coordinates of this element in the basis `1, y, y^2`.
+    #[inline]
+    pub const fn coefficients(self) -> [Poly64; DEGREE] {
+        self.0
+    }
+
+    /// The element with all its weight on one coordinate.
+    #[inline]
+    const fn embed(value: Poly64) -> Self {
+        Self([value, Poly64::ZERO, Poly64::ZERO])
+    }
+
+    /// The product assembled from the coefficient field's own reduced products.
+    ///
+    /// Compiled everywhere, so its tests and its benchmark run even where a backend wins.
+    #[doc(hidden)]
+    #[inline]
+    pub fn composed_mul(self, rhs: Self) -> Self {
+        let ([a0, a1, a2], [b0, b1, b2]) = (self.0, rhs.0);
+
+        // The three diagonal products.
+        let c0 = a0 * b0;
+        let c1 = a1 * b1;
+        let c2 = a2 * b2;
+
+        // One product per off-diagonal pair, each carrying both of that pair's cross terms.
+        let d01 = (a0 + a1) * (b0 + b1);
+        let d02 = (a0 + a2) * (b0 + b2);
+        let d12 = (a1 + a2) * (b1 + b2);
+
+        // The three middle coefficients of the unreduced product.
+        let p1 = d01 + c0 + c1;
+        let p2 = d02 + c0 + c1 + c2;
+        let p3 = d12 + c1 + c2;
+
+        Self([c0 + p3, p1 + p3 + c2, p2 + c2])
+    }
+
+    /// The coordinates as raw bit patterns, borrowed in place.
+    #[inline]
+    pub(crate) const fn limbs(&self) -> &[u64; DEGREE] {
+        // SAFETY: `Poly64` is `repr(transparent)` over `u64`, so the arrays share one layout.
+        unsafe { &*ptr::from_ref(&self.0).cast() }
+    }
+
+    /// The element with the given raw coordinates.
+    #[inline]
+    pub(crate) const fn from_limbs([a0, a1, a2]: [u64; DEGREE]) -> Self {
+        // Every bit pattern is an element, so the coordinates wrap as they are.
+        Self([Poly64::new(a0), Poly64::new(a1), Poly64::new(a2)])
+    }
+
+    /// The inverse of this element, with zero sent to zero.
+    ///
+    /// Every step runs whatever the operand is, so the cost says nothing about the value.
+    #[inline]
+    pub fn invert_or_zero(self) -> Self {
+        self.try_inverse().unwrap_or(Self::ZERO)
+    }
+}
+
+impl Packable for Poly192 {}
+
+impl Display for Poly192 {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{} + {}*y + {}*y^2", self.0[0], self.0[1], self.0[2])
+    }
+}
+
+impl Debug for Poly192 {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Debug::fmt(&self.0, f)
+    }
+}
+
+impl Distribution<Poly192> for StandardUniform {
+    #[inline]
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Poly192 {
+        Poly192(core::array::from_fn(|_| self.sample(rng)))
+    }
+}
+
+impl Add for Poly192 {
+    type Output = Self;
+
+    #[inline]
+    #[allow(clippy::suspicious_arithmetic_impl)]
+    fn add(self, rhs: Self) -> Self {
+        // Addition in characteristic 2 is `XOR`, coordinate by coordinate.
+        Self(core::array::from_fn(|i| self.0[i] + rhs.0[i]))
+    }
+}
+
+impl Sub for Poly192 {
+    type Output = Self;
+
+    #[inline]
+    #[allow(clippy::suspicious_arithmetic_impl)]
+    fn sub(self, rhs: Self) -> Self {
+        // Subtraction coincides with addition in characteristic 2.
+        self + rhs
+    }
+}
+
+impl Neg for Poly192 {
+    type Output = Self;
+
+    #[inline]
+    fn neg(self) -> Self {
+        // `-x = x` in characteristic 2.
+        self
+    }
+}
+
+impl Mul for Poly192 {
+    type Output = Self;
+
+    /// # Algorithm
+    ///
+    /// Karatsuba over three limbs: six products instead of the schoolbook nine.
+    ///
+    /// ```text
+    ///     c_i    = a_i b_i
+    ///     d_ij   = (a_i + a_j) (b_i + b_j)
+    ///     p_1    = d_01 + c_0 + c_1
+    ///     p_2    = d_02 + c_0 + c_1 + c_2
+    ///     p_3    = d_12 + c_1 + c_2
+    /// ```
+    ///
+    /// The unreduced product spans degrees 0 to 4, and the modulus folds the top two down:
+    ///
+    /// ```text
+    ///     y^3    = y + 1
+    ///     y^4    = y^2 + y
+    /// ```
+    ///
+    /// The base-field reduction waits until after that fold, so only three coordinates reduce.
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        // Six carryless products, the fold of y, and one reduction per coordinate.
+        Self::from_limbs(clmul::poly_mul_192(self.limbs(), rhs.limbs()))
+    }
+}
+
+impl Mul<Poly64> for Poly192 {
+    type Output = Self;
+
+    /// Scaling stays inside each coordinate, so it costs three products rather than six.
+    #[inline]
+    fn mul(self, rhs: Poly64) -> Self {
+        // One carryless product and one reduction per coordinate.
+        Self::from_limbs(clmul::poly_mul_192_by_64(self.limbs(), rhs.as_bits()))
+    }
+}
+
+impl Mul<Poly192> for Poly64 {
+    type Output = Poly192;
+
+    #[inline]
+    fn mul(self, rhs: Poly192) -> Poly192 {
+        rhs * self
+    }
+}
+
+impl PrimeCharacteristicRing for Poly192 {
+    #[inline]
+    fn zero_vec(len: usize) -> Vec<Self> {
+        let mut values = ManuallyDrop::new(alloc::vec![[0u64; DEGREE]; len]);
+        // SAFETY: the transparent wrapper has exactly the integer's layout, and zero is
+        // canonical. The allocation retains its original size and alignment.
+        unsafe { Vec::from_raw_parts(values.as_mut_ptr().cast(), values.len(), values.capacity()) }
+    }
+
+    type PrimeSubfield = Gf2;
+
+    const ZERO: Self = Self::embed(Poly64::ZERO);
+    const ONE: Self = Self::embed(Poly64::ONE);
+    // The characteristic is 2, so `TWO = ONE + ONE = ZERO`.
+    const TWO: Self = Self::embed(Poly64::ZERO);
+    // The characteristic is 2, so `NEG_ONE = ONE`.
+    const NEG_ONE: Self = Self::embed(Poly64::ONE);
+
+    #[inline]
+    fn from_prime_subfield(f: Self::PrimeSubfield) -> Self {
+        Self::embed(Poly64::from_prime_subfield(f))
+    }
+
+    /// Squaring is `F_2`-linear, so the cross terms vanish and only the fold survives.
+    ///
+    /// ```text
+    ///     (a_0 + a_1 y + a_2 y^2)^2  = a_0^2 + a_1^2 y^2 + a_2^2 y^4
+    ///                                = a_0^2 + a_2^2 y + (a_1^2 + a_2^2) y^2
+    /// ```
+    #[inline]
+    fn square(&self) -> Self {
+        // Three coordinate squares, the fold of y^4, then three reductions.
+        Self::from_limbs(clmul::poly_square_192(self.limbs()))
+    }
+
+    /// `x (x - 1) = x^2 + x` in characteristic 2, and squaring is the cheaper product.
+    #[inline]
+    fn bool_check(&self) -> Self {
+        // Zero exactly on the two roots of x^2 + x, which are zero and one.
+        self.square() + *self
+    }
+
+    /// Reduction is linear, so the whole sum reduces its three coordinates once.
+    #[inline]
+    fn dot_product<const N: usize>(u: &[Self; N], v: &[Self; N]) -> Self {
+        // Six carryless products per term, three reductions for the whole sum.
+        Self::from_limbs(clmul::poly_dot_192(
+            u.iter().zip(v).map(|(a, b)| (a.limbs(), b.limbs())),
+        ))
+    }
+
+    characteristic_two_methods!();
+}
+
+impl Field for Poly192 {
+    type Packing = Self;
+
+    // An element of the multiplicative group whose order is the whole group.
+    const GENERATOR: Self = Self([Poly64::new(5), Poly64::new(3), Poly64::new(1)]);
+
+    /// # Algorithm
+    ///
+    /// Multiplication by a fixed element is a `3 x 3` matrix over the coefficient field.
+    ///
+    /// Its columns are where that multiplication sends the three basis elements:
+    ///
+    /// ```text
+    ///     a * 1   = ( a_0,        a_1,        a_2       )
+    ///     a * y   = ( a_2,        a_0 + a_2,  a_1       )
+    ///     a * y^2 = ( a_1,        a_1 + a_2,  a_0 + a_2 )
+    /// ```
+    ///
+    /// The inverse is the first column of that matrix inverted.
+    ///
+    /// The adjugate gives it as the top row of cofactors over the determinant.
+    ///
+    /// The determinant is the norm down to the coefficient field, and it vanishes only at zero.
+    #[inline]
+    fn try_inverse(&self) -> Option<Self> {
+        let [a0, a1, a2] = self.0;
+
+        // The entry the modulus makes appear three times in the matrix.
+        let diagonal = a0 + a2;
+
+        // The cofactors along the top row.
+        let c0 = diagonal.square() + a1.square() + a1 * a2;
+        let c1 = Poly64::dot_product::<2>(&[a1, a1 + a2], &[diagonal, a2]);
+        let c2 = a1.square() + diagonal * a2;
+
+        // Expanding along that row gives the determinant.
+        let norm = Poly64::dot_product::<3>(&[a0, a2, a1], &[c0, c1, c2]);
+
+        // Every step runs whatever the operand is, so the cost says nothing about the value.
+        let candidate = Self([c0, c1, c2]) * norm.invert_or_zero();
+        (!norm.is_zero()).then_some(candidate)
+    }
+
+    /// Squaring is a triangular map on the coordinates, so its inverse is one too.
+    ///
+    /// ```text
+    ///     b_0 = a_0^2,  b_1 = a_2^2,  b_2 = a_1^2 + a_2^2
+    /// ```
+    ///
+    /// Reading that backwards costs three coefficient-field square roots and one addition.
+    #[inline]
+    fn try_sqrt(&self) -> Option<Self> {
+        let [b0, b1, b2] = self.0;
+        let root = |x: Poly64| {
+            x.try_sqrt()
+                .expect("every element of a binary field is a square")
+        };
+        Some(Self([root(b0), root(b1 + b2), root(b1)]))
+    }
+
+    #[inline]
+    fn order() -> BigUint {
+        BigUint::from(1u8) << Self::BITS
+    }
+
+    /// An element of `GF(2^n)` is exactly `n` bits wide.
+    #[inline]
+    fn bits() -> usize {
+        Self::BITS
+    }
+
+    /// The enumeration by bit pattern.
+    ///
+    /// The coordinates over `GF(2)` run through the coefficient fields in order.
+    ///
+    /// An index narrower than 64 bits therefore lands entirely in the first of them.
+    #[inline]
+    fn interpolation_node(i: usize) -> Self {
+        Self::embed(Poly64::interpolation_node(i))
+    }
+}
+
+impl RawDataSerializable for Poly192 {
+    const NUM_BYTES: usize = DEGREE * Poly64::NUM_BYTES;
+
+    #[inline]
+    fn into_bytes(self) -> impl IntoIterator<Item = u8> {
+        self.0.into_iter().flat_map(RawDataSerializable::into_bytes)
+    }
+}
+
+impl From<Poly64> for Poly192 {
+    /// The coefficient field sits at the constant coordinate.
+    #[inline]
+    fn from(x: Poly64) -> Self {
+        Self::embed(x)
+    }
+}
+
+impl From<Gf2> for Poly192 {
+    /// `GF(2)` is the prime subfield, embedded as `{ZERO, ONE}`.
+    #[inline]
+    fn from(x: Gf2) -> Self {
+        Self::from_prime_subfield(x)
+    }
+}
+
+impl Mul<Gf2> for Poly192 {
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: Gf2) -> Self {
+        // The prime subfield has two elements, so this keeps the element or clears it.
+        if rhs.is_one() { self } else { Self::ZERO }
+    }
+}
+
+impl Mul<Poly192> for Gf2 {
+    type Output = Poly192;
+
+    #[inline]
+    fn mul(self, rhs: Poly192) -> Poly192 {
+        rhs * self
+    }
+}
+
+impl_add_assign!(Poly192);
+impl_sub_assign!(Poly192);
+impl_mul_methods!(Poly192);
+impl_div_methods!(Poly192, Poly192);
+impl_div_methods!(Poly192, Poly64);
+ring_sum!(Poly192);
+
+impl_add_base_field!(Poly192, Poly64);
+impl_sub_base_field!(Poly192, Poly64);
+impl_add_base_field!(Poly192, Gf2);
+impl_sub_base_field!(Poly192, Gf2);
+
+impl Algebra<Poly64> for Poly192 {
+    /// Three products per term and one reduction per coordinate for the whole sum.
+    #[inline]
+    fn mixed_dot_product<const N: usize>(a: &[Self; N], f: &[Poly64; N]) -> Self {
+        #[cfg(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "vpclmulqdq",
+                any(target_feature = "avx2", target_feature = "avx512f")
+            ),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                target_feature = "aes"
+            )
+        ))]
+        {
+            // Short arrays keep the scalar schedule; full groups fill the packed multiplier.
+            if N >= <Poly64 as Field>::Packing::WIDTH {
+                return crate::PackedPoly192::mixed_dot_scalar(a, f);
+            }
+        }
+        // Scalar arrays and the portable backend defer reduction through the existing dot kernel.
+        Self::from_limbs(clmul::poly_dot_192_by_64(
+            a.iter().zip(f).map(|(x, k)| (x.limbs(), k.as_bits())),
+        ))
+    }
+}
+
+impl Algebra<Gf2> for Poly192 {}
+
+impl AlgebraIdentity<Poly64> for Poly192 {
+    fn algebra_id() -> Vec<u8> {
+        b"p3-binary-cubic-v1:y^3+y+1:64:192".to_vec()
+    }
+}
+
+impl BasedVectorSpace<Poly64> for Poly192 {
+    const DIMENSION: usize = DEGREE;
+
+    #[inline]
+    fn as_basis_coefficients_slice(&self) -> &[Poly64] {
+        &self.0
+    }
+
+    #[inline]
+    fn from_basis_coefficients_fn<F: FnMut(usize) -> Poly64>(f: F) -> Self {
+        Self(core::array::from_fn(f))
+    }
+
+    #[inline]
+    fn from_basis_coefficients_iter<I: ExactSizeIterator<Item = Poly64>>(iter: I) -> Option<Self> {
+        (iter.len() == DEGREE).then(|| {
+            // The reported length is not a guarantee, so zipping bounds the fill either way.
+            let mut coefficients = [Poly64::ZERO; DEGREE];
+            for (slot, value) in coefficients.iter_mut().zip(iter) {
+                *slot = value;
+            }
+            Self(coefficients)
+        })
+    }
+
+    #[inline]
+    fn flatten_slice_to_base(values: &[Self]) -> Option<&[Poly64]> {
+        // SAFETY: `Self` is transparent over `[Poly64; DEGREE]`, with the same alignment
+        // and contiguous coefficients in exactly the order used by this basis.
+        Some(unsafe { p3_util::as_base_slice(values) })
+    }
+
+    /// A whole vector of elements is one contiguous run of coordinates, so the allocation is
+    /// reused as it is.
+    #[inline]
+    fn flatten_to_base(vec: Vec<Self>) -> Vec<Poly64> {
+        // SAFETY: `Poly192` is `repr(transparent)` over `[Poly64; DEGREE]`, so it has the
+        // alignment of `Poly64` and the layout of `DEGREE` coordinates in basis order.
+        unsafe { p3_util::flatten_to_base::<Poly64, Self>(vec) }
+    }
+
+    /// The allocation is reused whenever its capacity is a whole number of elements, and copied
+    /// otherwise.
+    #[inline]
+    fn reconstitute_from_base(vec: Vec<Poly64>) -> Vec<Self> {
+        // SAFETY: `Poly192` is `repr(transparent)` over `[Poly64; DEGREE]`, so it has the
+        // alignment of `Poly64` and the layout of `DEGREE` coordinates in basis order. Every
+        // coordinate triple is a valid element, since every `Poly64` is a valid coordinate.
+        unsafe { p3_util::reconstitute_from_base::<Poly64, Self>(vec) }
+    }
+}
+
+impl ExtensionField<Poly64> for Poly192 {
+    // One register of coefficient-field lanes per coordinate, where the base field packs.
+    //
+    // Without a packing the alias resolves to this type itself, which is why the lint is off.
+    #[allow(clippy::use_self)]
+    type ExtensionPacking = crate::packed::Poly192Packing;
+
+    #[inline]
+    fn is_in_basefield(&self) -> bool {
+        // The coefficient field is exactly the elements with no weight above the constant.
+        self.0[1].is_zero() && self.0[2].is_zero()
+    }
+
+    #[inline]
+    fn as_base(&self) -> Option<Poly64> {
+        <Self as ExtensionField<Poly64>>::is_in_basefield(self).then_some(self.0[0])
+    }
+}
+
+/// One element per vector, so every lane index is zero.
+// Only where no register widens the coefficient field's multiply.
+#[cfg(not(any(
+    all(
+        target_arch = "x86_64",
+        target_feature = "vpclmulqdq",
+        any(target_feature = "avx2", target_feature = "avx512f")
+    ),
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        target_feature = "aes"
+    )
+)))]
+impl PackedFieldExtension<Poly64, Self> for Poly192 {
+    #[inline]
+    fn from_ext_fn(f: impl Fn(usize) -> Self) -> Self {
+        f(0)
+    }
+
+    #[inline]
+    fn from_ext_slice(slice: &[Self]) -> Self {
+        assert_eq!(slice.len(), 1);
+        slice[0]
+    }
+
+    #[inline]
+    fn extract(&self, lane: usize) -> Self {
+        assert_eq!(lane, 0, "lane index out of range");
+        *self
+    }
+
+    #[inline]
+    fn add_assign_lane(&mut self, lane: usize, value: Self) {
+        assert_eq!(lane, 0, "lane index out of range");
+        *self += value;
+    }
+
+    #[inline]
+    fn packed_ext_powers(base: Self) -> Powers<Self> {
+        base.powers()
+    }
+}
+
+impl HasFrobenius<Poly64> for Poly192 {
+    /// The map raising to the size of the coefficient field.
+    ///
+    /// It fixes every coefficient and permutes the basis.
+    ///
+    /// The three roots of the modulus are `y`, `y^2` and `y^2 + y`, so:
+    ///
+    /// ```text
+    ///     y^(2^64)                 =  y^2
+    ///     a_0 + a_1 y + a_2 y^2    ->  a_0 + a_2 y + (a_1 + a_2) y^2
+    /// ```
+    ///
+    /// So one application is one addition and a permutation, with no products at all.
+    #[inline]
+    fn frobenius(&self) -> Self {
+        let [a0, a1, a2] = self.0;
+        Self([a0, a2, a1 + a2])
+    }
+
+    #[inline]
+    fn repeated_frobenius(&self, count: usize) -> Self {
+        // The Galois group is cyclic of order three, so the count reduces modulo it.
+        match count % DEGREE {
+            0 => *self,
+            1 => self.frobenius(),
+            _ => self.frobenius().frobenius(),
+        }
+    }
+
+    #[inline]
+    fn pseudo_inv(&self) -> Self {
+        // Inversion through the adjugate beats the exponentiation the contract is phrased in.
+        self.invert_or_zero()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use num_bigint::BigUint;
+    use p3_field::extension::HasFrobenius;
+    use p3_field::{
+        Algebra, BasedVectorSpace, ExtensionField, Field, FixedBase, PackedFieldExtension,
+        PackedValue, PrimeCharacteristicRing,
+    };
+    use p3_field_testing::test_fixed_base;
+    use proptest::array;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    use super::{DEGREE, Poly192, Poly192MixedAccumulator};
+    use crate::Poly64;
+
+    /// A coordinate or weight, often an extreme one that saturates the carryless products.
+    fn word() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            Just(0),
+            Just(1),
+            Just(u64::MAX),
+            Just(1 << 63),
+            any::<u64>()
+        ]
+    }
+
+    /// Seven elements whose twenty-one coordinates are all distinct, so any reordering shows.
+    fn distinct_elements() -> Vec<Poly192> {
+        (0..7u64)
+            .map(|i| element([3 * i + 1, 3 * i + 2, 3 * i + 3]))
+            .collect()
+    }
+
+    /// Every element's coordinates in turn, which is what flattening is defined to produce.
+    fn concatenated_coordinates(elements: &[Poly192]) -> Vec<Poly64> {
+        elements
+            .iter()
+            .flat_map(<Poly192 as BasedVectorSpace<Poly64>>::as_basis_coefficients_slice)
+            .copied()
+            .collect()
+    }
+
+    /// Vectors cross between elements and coordinates inside the allocation they arrive in.
+    ///
+    /// The coordinates must still read in basis order, and reassembly must invert flattening.
+    #[test]
+    fn whole_vectors_flatten_and_reconstitute_in_basis_order() {
+        let elements = distinct_elements();
+        let expected = concatenated_coordinates(&elements);
+
+        let input = elements.clone();
+        let (address, capacity) = (input.as_ptr().cast::<u8>(), input.capacity());
+
+        let flat = <Poly192 as BasedVectorSpace<Poly64>>::flatten_to_base(input);
+        assert_eq!(flat, expected);
+        assert_eq!(flat.as_ptr().cast::<u8>(), address);
+        assert_eq!(flat.capacity(), capacity * DEGREE);
+
+        let back = <Poly192 as BasedVectorSpace<Poly64>>::reconstitute_from_base(flat);
+        assert_eq!(back, elements);
+        assert_eq!(back.as_ptr().cast::<u8>(), address);
+        assert_eq!(back.capacity(), capacity);
+
+        // The empty vector has no allocation to hand over, and must still round-trip.
+        let flat = <Poly192 as BasedVectorSpace<Poly64>>::flatten_to_base(Vec::new());
+        assert!(flat.is_empty());
+        assert!(<Poly192 as BasedVectorSpace<Poly64>>::reconstitute_from_base(flat).is_empty());
+    }
+
+    /// An allocation whose capacity is not a whole number of elements cannot be freed as
+    /// elements, so reassembly must copy out of it rather than adopt it.
+    #[test]
+    fn a_ragged_capacity_is_reassembled_into_a_fresh_allocation() {
+        let elements = distinct_elements();
+        let expected = concatenated_coordinates(&elements);
+
+        let mut ragged = Vec::with_capacity(expected.len() + 1);
+        ragged.extend_from_slice(&expected);
+        assert_ne!(ragged.capacity() % DEGREE, 0);
+        let address = ragged.as_ptr().cast::<u8>();
+
+        let back = <Poly192 as BasedVectorSpace<Poly64>>::reconstitute_from_base(ragged);
+        assert_eq!(back, elements);
+        assert_ne!(back.as_ptr().cast::<u8>(), address);
+    }
+
+    #[test]
+    #[should_panic]
+    fn reconstitute_rejects_an_incomplete_element() {
+        let _ = <Poly192 as BasedVectorSpace<Poly64>>::reconstitute_from_base(alloc::vec![
+            Poly64::ONE;
+            4
+        ]);
+    }
+
+    /// An element from three raw bit patterns.
+    fn element(a: [u64; 3]) -> Poly192 {
+        Poly192::new(a.map(Poly64::new))
+    }
+
+    /// One packed batch agrees with individual terms, merged batches and cancellation.
+    fn check_mixed_accumulator<const N: usize>(a: &[[u64; 3]; 17], f: &[u64; 17]) {
+        let values: [Poly192; N] = core::array::from_fn(|i| element(a[i]));
+        let weights: [Poly64; N] = core::array::from_fn(|i| Poly64::new(f[i]));
+        let expected = values
+            .iter()
+            .zip(weights)
+            .map(|(&value, weight)| value * weight)
+            .sum();
+        let mut batch = Poly192MixedAccumulator::new();
+        batch.add_dot_product(&values, &weights);
+        assert_eq!(batch.finish(), expected);
+
+        // Prepacked groups preserve the same sum, including a final scalar tail.
+        type BasePacking = <Poly64 as Field>::Packing;
+        type Packing = <Poly192 as ExtensionField<Poly64>>::ExtensionPacking;
+        let width = BasePacking::WIDTH;
+        let done = N / width * width;
+        let mut packed = Poly192MixedAccumulator::new();
+        for start in (0..done).step_by(width) {
+            let values = <Packing as PackedFieldExtension<Poly64, Poly192>>::from_ext_slice(
+                &values[start..start + width],
+            );
+            let weights = BasePacking::from_fn(|lane| weights[start + lane]);
+            packed.add_packed_dot_product(values, weights);
+        }
+        for (&value, &weight) in values[done..].iter().zip(&weights[done..]) {
+            packed.add_dot_product(&[value], &[weight]);
+        }
+        assert_eq!(packed.finish(), expected);
+
+        // Individual terms form two independently accumulated halves.
+        let mut left = Poly192MixedAccumulator::default();
+        let mut right = Poly192MixedAccumulator::new();
+        for (i, (&value, &weight)) in values.iter().zip(&weights).enumerate() {
+            let sum = if i < N / 2 { &mut left } else { &mut right };
+            sum.add_dot_product(&[value], &[weight]);
+        }
+        left.merge(right);
+        assert_eq!(left.finish(), expected);
+
+        // A sum merged with itself cancels before its final reduction.
+        let copy = batch;
+        batch.merge(copy);
+        assert_eq!(batch.finish(), Poly192::ZERO);
+    }
+
+    /// The `j`-th vector of the basis over the coefficient field.
+    fn basis_element(j: usize) -> Poly192 {
+        <Poly192 as BasedVectorSpace<Poly64>>::ith_basis_element(j).unwrap()
+    }
+
+    /// Schoolbook multiplication, nine products and the modulus applied term by term.
+    ///
+    /// The routine under test recombines a Karatsuba schedule and folds the top two.
+    ///
+    /// This shares neither of those steps.
+    fn schoolbook(a: Poly192, b: Poly192) -> Poly192 {
+        let (x, y) = (a.coefficients(), b.coefficients());
+
+        // The nine term products, placed by total degree.
+        let mut raw = [Poly64::ZERO; 5];
+        for (i, &xi) in x.iter().enumerate() {
+            for (j, &yj) in y.iter().enumerate() {
+                raw[i + j] += xi * yj;
+            }
+        }
+
+        // Reduce from the top down, rewriting each overflowing power once.
+        //
+        //     y^4  =  y^3 * y  =  (y + 1) * y  =  y^2 + y
+        //     y^3  =  y + 1
+        raw[2] += raw[4];
+        raw[1] += raw[4];
+        raw[1] += raw[3];
+        raw[0] += raw[3];
+
+        Poly192::new([raw[0], raw[1], raw[2]])
+    }
+
+    /// The mixed dot product of the first `N` pairs, against the plain sum of products.
+    fn check_mixed_dot_product<const N: usize>(a: &[[u64; 3]], f: &[u64]) {
+        let a: [Poly192; N] = core::array::from_fn(|i| element(a[i]));
+        let f: [Poly64; N] = core::array::from_fn(|i| Poly64::new(f[i]));
+
+        // One product per term, each reduced on its own.
+        let expected: Poly192 = a.iter().zip(&f).map(|(&x, &k)| x * k).sum();
+
+        assert_eq!(
+            <Poly192 as Algebra<Poly64>>::mixed_dot_product(&a, &f),
+            expected,
+            "N = {N}"
+        );
+    }
+
+    /// The inverse by Gaussian elimination on the multiplication matrix.
+    ///
+    /// The routine under test uses closed-form cofactors instead, so the two share no algebra.
+    fn inverse_by_elimination(a: Poly192) -> Option<Poly192> {
+        // Column `j` is where multiplication by the element sends basis vector `j`.
+        let columns: [Poly192; DEGREE] = core::array::from_fn(|j| a * basis_element(j));
+
+        // The augmented system, solving for the coordinates that multiply back to one.
+        let mut rows: [[Poly64; DEGREE + 1]; DEGREE] = core::array::from_fn(|i| {
+            core::array::from_fn(|j| {
+                if j < DEGREE {
+                    columns[j].coefficients()[i]
+                } else {
+                    Poly64::from_bool(i == 0)
+                }
+            })
+        });
+
+        for pivot in 0..DEGREE {
+            // Bring a row with a nonzero pivot entry into place, or report singularity.
+            let found = (pivot..DEGREE).find(|&r| !rows[r][pivot].is_zero())?;
+            rows.swap(pivot, found);
+
+            // Normalize the pivot row, then clear the column everywhere else.
+            let scale = rows[pivot][pivot].inverse();
+            for entry in &mut rows[pivot][pivot..] {
+                *entry *= scale;
+            }
+            let pivot_row = rows[pivot];
+            for (r, row) in rows.iter_mut().enumerate() {
+                if r == pivot || row[pivot].is_zero() {
+                    continue;
+                }
+                let factor = row[pivot];
+                for (entry, &above) in row[pivot..].iter_mut().zip(&pivot_row[pivot..]) {
+                    *entry += above * factor;
+                }
+            }
+        }
+
+        Some(Poly192::new(core::array::from_fn(|i| rows[i][DEGREE])))
+    }
+
+    #[test]
+    fn the_modulus_reduces_the_way_the_relation_says() {
+        let y = element([0, 1, 0]);
+
+        // y^2 is still a basis element.
+        assert_eq!(y * y, element([0, 0, 1]));
+
+        // y^3 = y + 1, which is the defining relation.
+        assert_eq!(y * y * y, element([1, 1, 0]));
+
+        // y^4 = y^2 + y, one more step of the same rewrite.
+        assert_eq!(y * y * y * y, element([0, 1, 1]));
+    }
+
+    #[test]
+    fn the_modulus_has_no_root_in_the_coefficient_field() {
+        // Invariant: a cubic over a finite field factors only if it has a root there.
+        //
+        // A root would generate GF(2^3), and 3 does not divide 64, so none exists.
+        //
+        // The argument is checked where a search can reach it.
+        //
+        // That is the 256 elements whose coordinates fit in a byte.
+        for c in 0..=u8::MAX {
+            let x = Poly64::new(u64::from(c));
+            assert_ne!(x * x * x + x + Poly64::ONE, Poly64::ZERO, "{c}");
+        }
+    }
+
+    #[test]
+    fn the_frobenius_fixes_the_coefficient_field_and_has_order_three() {
+        // Fixture state: the coefficient field embedded at the constant coordinate.
+        for bits in [0u64, 1, 0x1b, u64::MAX] {
+            let embedded = Poly192::from(Poly64::new(bits));
+            assert_eq!(embedded.frobenius(), embedded, "{bits:#x}");
+        }
+
+        // It moves everything outside that field, and cycles after three steps.
+        let y = element([0, 1, 0]);
+        assert_ne!(y.frobenius(), y);
+        assert_eq!(y.frobenius(), element([0, 0, 1]));
+        assert_eq!(y.frobenius().frobenius().frobenius(), y);
+    }
+
+    #[test]
+    fn zero_vectors_preserve_layout_and_support_growth() {
+        for len in [0, 1, 33, 1024] {
+            let mut values = Poly192::zero_vec(len);
+            assert_eq!(values.len(), len);
+            assert!(values.iter().all(|x| *x == Poly192::ZERO));
+            values.push(Poly192::ONE);
+            values.reserve(100);
+            assert_eq!(values.pop(), Some(Poly192::ONE));
+        }
+    }
+
+    #[test]
+    fn four_products_preserve_corner_lanes() {
+        let corners = [0, 1, u64::MAX, 1 << 63, 0xf << 60];
+        for shift in 0..corners.len() {
+            let a = core::array::from_fn(|lane| {
+                Poly192::from_limbs(core::array::from_fn(|c| {
+                    corners[(shift + lane + c) % corners.len()]
+                }))
+            });
+            let b = core::array::from_fn(|lane| a[3 - lane]);
+            assert_eq!(Poly192::mul4(a, b), core::array::from_fn(|i| a[i] * b[i]));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+        #[test]
+        fn four_products_match_scalar_pairs(
+            a in any::<[[u64; 3]; 4]>(), b in any::<[[u64; 3]; 4]>()
+        ) {
+            let a = a.map(Poly192::from_limbs);
+            let b = b.map(Poly192::from_limbs);
+            prop_assert_eq!(Poly192::mul4(a,b), core::array::from_fn(|i| a[i] * b[i]));
+        }
+
+
+        #[test]
+        fn the_karatsuba_product_matches_the_schoolbook_one(a: [u64; 3], b: [u64; 3]) {
+            let (x, y) = (element(a), element(b));
+            prop_assert_eq!(x * y, schoolbook(x, y));
+        }
+
+        #[test]
+        fn the_square_matches_the_product_with_itself(a: [u64; 3]) {
+            let x = element(a);
+            prop_assert_eq!(x.square(), schoolbook(x, x));
+        }
+
+        #[test]
+        fn bool_check_agrees_with_the_vanishing_polynomial(a: [u64; 3]) {
+            let x = element(a);
+            prop_assert_eq!(x.bool_check(), schoolbook(x, x - Poly192::ONE));
+        }
+
+        #[test]
+        fn the_cofactor_inverse_matches_the_eliminated_one(a: [u64; 3]) {
+            let x = element(a);
+            prop_assert_eq!(x.try_inverse(), inverse_by_elimination(x));
+        }
+
+        #[test]
+        fn a_nonzero_element_times_its_inverse_is_one(a: [u64; 3]) {
+            let x = element(a);
+            match x.try_inverse() {
+                Some(inverse) => prop_assert_eq!(x * inverse, Poly192::ONE),
+                None => prop_assert_eq!(x, Poly192::ZERO),
+            }
+        }
+
+        #[test]
+        fn the_square_root_squares_back(a: [u64; 3]) {
+            let x = element(a);
+            let root = x.try_sqrt().expect("every element of a binary field is a square");
+            prop_assert_eq!(root.square(), x);
+        }
+
+        /// The Frobenius must be a ring homomorphism, not merely an additive one.
+        #[test]
+        fn the_frobenius_is_a_ring_homomorphism(a: [u64; 3], b: [u64; 3]) {
+            let (x, y) = (element(a), element(b));
+            prop_assert_eq!((x + y).frobenius(), x.frobenius() + y.frobenius());
+            prop_assert_eq!((x * y).frobenius(), x.frobenius() * y.frobenius());
+        }
+
+        /// Raising to the coefficient field's size must be what the coordinate shuffle does.
+        #[test]
+        fn the_frobenius_is_the_power_map_it_claims_to_be(a: [u64; 3]) {
+            let x = element(a);
+            prop_assert_eq!(x.frobenius(), x.exp_power_of_2(64));
+        }
+
+        #[test]
+        fn mixed_accumulators_preserve_batching_and_merging(a: [[u64; 3]; 17], f: [u64; 17]) {
+            // Boundaries cover scalar, two-, four- and eight-lane groups and their tails.
+            check_mixed_accumulator::<0>(&a, &f);
+            check_mixed_accumulator::<1>(&a, &f);
+            check_mixed_accumulator::<2>(&a, &f);
+            check_mixed_accumulator::<3>(&a, &f);
+            check_mixed_accumulator::<4>(&a, &f);
+            check_mixed_accumulator::<5>(&a, &f);
+            check_mixed_accumulator::<7>(&a, &f);
+            check_mixed_accumulator::<8>(&a, &f);
+            check_mixed_accumulator::<9>(&a, &f);
+            check_mixed_accumulator::<16>(&a, &f);
+            check_mixed_accumulator::<17>(&a, &f);
+        }
+
+        #[test]
+        fn the_mixed_dot_product_matches_the_sum_of_products(
+            a in vec(array::uniform3(word()), 40),
+            f in vec(word(), 40),
+        ) {
+            // The empty sum, a single term, and sums long enough to defer the reduction.
+            //
+            // Past eight terms, every length either side of a whole block of eight.
+            check_mixed_dot_product::<0>(&a, &f);
+            check_mixed_dot_product::<1>(&a, &f);
+            check_mixed_dot_product::<2>(&a, &f);
+            check_mixed_dot_product::<3>(&a, &f);
+            check_mixed_dot_product::<4>(&a, &f);
+            check_mixed_dot_product::<5>(&a, &f);
+            check_mixed_dot_product::<7>(&a, &f);
+            check_mixed_dot_product::<8>(&a, &f);
+            check_mixed_dot_product::<9>(&a, &f);
+            check_mixed_dot_product::<15>(&a, &f);
+            check_mixed_dot_product::<16>(&a, &f);
+            check_mixed_dot_product::<17>(&a, &f);
+            check_mixed_dot_product::<23>(&a, &f);
+            check_mixed_dot_product::<24>(&a, &f);
+            check_mixed_dot_product::<25>(&a, &f);
+            check_mixed_dot_product::<33>(&a, &f);
+            check_mixed_dot_product::<40>(&a, &f);
+        }
+
+        /// Scaling by a coefficient must agree with embedding the scalar first.
+        #[test]
+        fn scaling_by_a_coefficient_agrees_with_the_full_product(a: [u64; 3], s: u64) {
+            let (x, scalar) = (element(a), Poly64::new(s));
+            prop_assert_eq!(x * scalar, x * Poly192::from(scalar));
+        }
+
+        #[test]
+        fn the_coefficients_round_trip(a: [u64; 3]) {
+            let x = element(a);
+            let coefficients = BasedVectorSpace::<Poly64>::as_basis_coefficients_slice(&x);
+            prop_assert_eq!(
+                <Poly192 as BasedVectorSpace<Poly64>>::from_basis_coefficients_slice(coefficients),
+                Some(x)
+            );
+            prop_assert_eq!(
+                ExtensionField::<Poly64>::is_in_basefield(&x),
+                a[1] == 0 && a[2] == 0
+            );
+        }
+    }
+
+    /// The distinct primes of 2^192 - 1 = 3^2·5·7·13·17·97·193·241·257·641·673·65537·6700417·22253377·(2^64 - 2^32 + 1).
+    const GROUP_ORDER_PRIMES: [u64; 15] = [
+        3,
+        5,
+        7,
+        13,
+        17,
+        97,
+        193,
+        241,
+        257,
+        641,
+        673,
+        65537,
+        6_700_417,
+        22_253_377,
+        18_446_744_069_414_584_321,
+    ];
+
+    /// Miller-Rabin on the first twelve prime bases, which is deterministic below 2^64.
+    fn is_prime(n: u64) -> bool {
+        const BASES: [u64; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+        if n < 2 {
+            return false;
+        }
+        if let Some(&p) = BASES.iter().find(|&&p| n.is_multiple_of(p)) {
+            return n == p;
+        }
+        let mul = |a: u64, b: u64| ((u128::from(a) * u128::from(b)) % u128::from(n)) as u64;
+        let pow = |mut a: u64, mut e: u64| {
+            let mut r = 1;
+            while e > 0 {
+                if e & 1 == 1 {
+                    r = mul(r, a);
+                }
+                a = mul(a, a);
+                e >>= 1;
+            }
+            r
+        };
+        let s = (n - 1).trailing_zeros();
+        let d = (n - 1) >> s;
+        BASES.iter().all(|&a| {
+            let mut x = pow(a, d);
+            if x == 1 || x == n - 1 {
+                return true;
+            }
+            (1..s).any(|_| {
+                x = mul(x, x);
+                x == n - 1
+            })
+        })
+    }
+
+    #[test]
+    fn the_order_factors_are_prime() {
+        for p in GROUP_ORDER_PRIMES {
+            assert!(is_prime(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn the_generator_has_the_full_order() {
+        // 3 is the only repeated factor.
+        let factors: Vec<(BigUint, u32)> = GROUP_ORDER_PRIMES
+            .iter()
+            .map(|&p| (BigUint::from(p), if p == 3 { 2 } else { 1 }))
+            .collect();
+        p3_field_testing::test_generator::<Poly192>(&factors);
+    }
+
+    #[test]
+    fn fixed_base_powers_certify_the_generator_order() {
+        let order = Poly192::order() - 1u32;
+        let limbs = |n: &BigUint| -> [u64; 3] {
+            let digits = n.to_u64_digits();
+            core::array::from_fn(|i| digits.get(i).copied().unwrap_or(0))
+        };
+        let g = FixedBase::new(Poly192::GENERATOR, 192);
+        assert_eq!(g.pow(&limbs(&order)), Poly192::ONE);
+        for p in GROUP_ORDER_PRIMES {
+            assert_ne!(
+                g.pow(&limbs(&(&order / p))),
+                Poly192::ONE,
+                "g^(n/{p}) is one"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn fixed_base_powers_match_square_and_multiply(
+            base: [u64; 3],
+            exponents in prop::collection::vec(any::<[u64; 3]>(), 0..40),
+        ) {
+            // Packed over the coefficient field, then one element at a time.
+            test_fixed_base::<Poly64, Poly192, 3>(element(base), &exponents);
+            test_fixed_base::<Poly192, Poly192, 3>(element(base), &exponents);
+        }
+    }
+}

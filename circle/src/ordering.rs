@@ -1,12 +1,12 @@
 use alloc::vec::Vec;
 
+use p3_matrix::Matrix;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::row_index_mapped::{RowIndexMap, RowIndexMappedView};
-use p3_matrix::Matrix;
 use p3_util::{log2_strict_usize, reverse_bits_len};
 
 #[inline]
-pub(crate) fn cfft_permute_index(index: usize, log_n: usize) -> usize {
+pub(crate) const fn cfft_permute_index(index: usize, log_n: usize) -> usize {
     let (index, lsb) = (index >> 1, index & 1);
     reverse_bits_len(
         if lsb == 0 {
@@ -32,19 +32,9 @@ pub(crate) fn cfft_permute_slice_chunked_in_place<T>(xs: &mut [T], chunk_size: u
     for i in 0..n_chunks {
         let j = cfft_permute_index(i, log_n);
         if i < j {
-            // somehow this is slightly faster than the unsafe block below
             for k in 0..chunk_size {
                 xs.swap(i * chunk_size + k, j * chunk_size + k);
             }
-            /*
-            unsafe {
-                core::ptr::swap_nonoverlapping(
-                    xs.as_mut_ptr().add(i * chunk_size),
-                    xs.as_mut_ptr().add(j * chunk_size),
-                    chunk_size,
-                );
-            }
-            */
         }
     }
 }
@@ -73,11 +63,11 @@ impl RowIndexMap for CfftPerm {
     }
 }
 
-pub(crate) trait CfftPermutable<T: Send + Sync>: Matrix<T> + Sized {
+pub(crate) trait CfftPermutable<T: Send + Sync + Clone>: Matrix<T> + Sized {
     fn cfft_perm_rows(self) -> CfftView<Self>;
 }
 
-impl<T: Send + Sync, M: Matrix<T>> CfftPermutable<T> for M {
+impl<T: Send + Sync + Clone, M: Matrix<T>> CfftPermutable<T> for M {
     fn cfft_perm_rows(self) -> CfftView<M> {
         RowIndexMappedView {
             index_map: CfftPerm {
@@ -93,6 +83,14 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "Mapped row index out of bounds")]
+    fn conversion_rejects_shortened_inner() {
+        let mut view = RowMajorMatrix::new((0u32..4).collect(), 1).cfft_perm_rows();
+        view.inner.values.truncate(1);
+        let _ = view.to_row_major_matrix();
+    }
 
     #[test]
     fn ordering() {

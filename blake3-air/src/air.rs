@@ -1,20 +1,41 @@
+use alloc::vec;
+use alloc::vec::Vec;
 use core::borrow::Borrow;
 
 use itertools::izip;
-use p3_air::utils::{add2, add3, pack_bits_le, xor, xor_32_shift};
-use p3_air::{Air, AirBuilder, BaseAir};
-use p3_field::FieldAlgebra;
-use p3_matrix::Matrix;
+use p3_air::utils::{add2, add3, pack_bits_le, xor_32_shift};
+use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
+use p3_field::{PrimeCharacteristicRing, PrimeField64};
+use p3_matrix::dense::RowMajorMatrix;
+use rand::rngs::SmallRng;
+use rand::{RngExt, SeedableRng};
 
 use crate::columns::{Blake3Cols, NUM_BLAKE3_COLS};
-use crate::constants::{permute, BITS_PER_LIMB, IV};
-use crate::{Blake3State, FullRound, QuarterRound};
+use crate::constants::{BITS_PER_LIMB, IV, permute};
+use crate::{Blake3State, FullRound, QuarterRound, generate_trace_rows};
 
-/// Assumes the field size is at least 16 bits.
+/// Assumes the field characteristic is greater than `3 * 2^16`.
+///
+/// The evaluation panics over any smaller prime field.
 #[derive(Debug)]
 pub struct Blake3Air {}
 
 impl Blake3Air {
+    /// Generate a trace over `num_hashes` fixed-seed random permutation inputs.
+    ///
+    /// This is for benches/examples only — it does not let callers supply the actual
+    /// inputs being compressed. Use [`crate::generate_trace_rows_with_inputs`] to supply
+    /// specific inputs and compression metadata.
+    pub fn generate_random_trace_rows<F: PrimeField64>(
+        &self,
+        num_hashes: usize,
+        extra_capacity_bits: usize,
+    ) -> RowMajorMatrix<F> {
+        let mut rng = SmallRng::seed_from_u64(1);
+        let inputs = (0..num_hashes).map(|_| rng.random()).collect::<Vec<_>>();
+        generate_trace_rows(inputs, extra_capacity_bits)
+    }
+
     /// Verify that the quarter round function has been correctly computed.
     ///
     /// We assume that the values in a, b, c, d have all been range checked to be
@@ -22,8 +43,9 @@ impl Blake3Air {
     /// and auxiliary variables as well as checking the relevant constraints between
     /// them to conclude that the outputs are correct given the inputs.
     fn quarter_round_function<AB: AirBuilder>(
+        &self,
         builder: &mut AB,
-        trace: &QuarterRound<<AB as AirBuilder>::Var, <AB as AirBuilder>::Expr>,
+        trace: &QuarterRound<'_, <AB as AirBuilder>::Var, <AB as AirBuilder>::Expr>,
     ) {
         // We need to pack some bits together to verify the additions.
         // First we verify a' = a + b + m_{2i} mod 2^32
@@ -92,7 +114,8 @@ impl Blake3Air {
 
     /// Given data for a full round, produce the data corresponding to a
     /// single application of the quarter round function on a column.
-    fn full_round_to_column_quarter_round<'a, T: Copy, U>(
+    const fn full_round_to_column_quarter_round<'a, T: Copy, U>(
+        &self,
         input: &'a Blake3State<T>,
         round_data: &'a FullRound<T>,
         m_vector: &'a [[U; 2]; 16],
@@ -122,7 +145,8 @@ impl Blake3Air {
 
     /// Given data for a full round, produce the data corresponding to a
     /// single application of the quarter round function on a diagonal.
-    fn full_round_to_diagonal_quarter_round<'a, T: Copy, U>(
+    const fn full_round_to_diagonal_quarter_round<'a, T: Copy, U>(
+        &self,
         round_data: &'a FullRound<T>,
         m_vector: &'a [[U; 2]; 16],
         index: usize,
@@ -151,6 +175,7 @@ impl Blake3Air {
 
     /// Verify a full round of the Blake-3 permutation.
     fn verify_round<AB: AirBuilder>(
+        &self,
         builder: &mut AB,
         input: &Blake3State<AB::Var>,
         round_data: &FullRound<AB::Var>,
@@ -161,48 +186,48 @@ impl Blake3Air {
         // The first column quarter round function involves the states in position: 0, 4, 8, 12
         // Along with the two m_vector elements in the 0 and 1 positions.
         let trace_column_0 =
-            Self::full_round_to_column_quarter_round(input, round_data, m_vector, 0);
-        Self::quarter_round_function(builder, &trace_column_0);
+            self.full_round_to_column_quarter_round(input, round_data, m_vector, 0);
+        self.quarter_round_function(builder, &trace_column_0);
 
         // The next column quarter round function involves the states in position: 1, 5, 9, 13
         // Along with the two m_vector elements in the 2 and 3 positions.
         let trace_column_1 =
-            Self::full_round_to_column_quarter_round(input, round_data, m_vector, 1);
-        Self::quarter_round_function(builder, &trace_column_1);
+            self.full_round_to_column_quarter_round(input, round_data, m_vector, 1);
+        self.quarter_round_function(builder, &trace_column_1);
 
         // The next column quarter round function involves the states in position: 2, 6, 10, 14
         // Along with the two m_vector elements in the 4 and 5 positions.
         let trace_column_2 =
-            Self::full_round_to_column_quarter_round(input, round_data, m_vector, 2);
-        Self::quarter_round_function(builder, &trace_column_2);
+            self.full_round_to_column_quarter_round(input, round_data, m_vector, 2);
+        self.quarter_round_function(builder, &trace_column_2);
 
         // The final column quarter round function involves the states in position: 3, 7, 11, 15
         // Along with the two m_vector elements in the 6 and 7 positions.
         let trace_column_3 =
-            Self::full_round_to_column_quarter_round(input, round_data, m_vector, 3);
-        Self::quarter_round_function(builder, &trace_column_3);
+            self.full_round_to_column_quarter_round(input, round_data, m_vector, 3);
+        self.quarter_round_function(builder, &trace_column_3);
 
         // Second we mix the diagonals.
 
         // The first diagonal quarter round function involves the states in position: 0, 5, 10, 15
         // Along with the two m_vector elements in the 8 and 9 positions.
-        let trace_diagonal_0 = Self::full_round_to_diagonal_quarter_round(round_data, m_vector, 0);
-        Self::quarter_round_function(builder, &trace_diagonal_0);
+        let trace_diagonal_0 = self.full_round_to_diagonal_quarter_round(round_data, m_vector, 0);
+        self.quarter_round_function(builder, &trace_diagonal_0);
 
         // The next diagonal quarter round function involves the states in position: 1, 6, 11, 12
         // Along with the two m_vector elements in the 10 and 11 positions.
-        let trace_diagonal_1 = Self::full_round_to_diagonal_quarter_round(round_data, m_vector, 1);
-        Self::quarter_round_function(builder, &trace_diagonal_1);
+        let trace_diagonal_1 = self.full_round_to_diagonal_quarter_round(round_data, m_vector, 1);
+        self.quarter_round_function(builder, &trace_diagonal_1);
 
         // The next diagonal quarter round function involves the states in position: 2, 7, 8, 13
         // Along with the two m_vector elements in the 12 and 13 positions.
-        let trace_diagonal_2 = Self::full_round_to_diagonal_quarter_round(round_data, m_vector, 2);
-        Self::quarter_round_function(builder, &trace_diagonal_2);
+        let trace_diagonal_2 = self.full_round_to_diagonal_quarter_round(round_data, m_vector, 2);
+        self.quarter_round_function(builder, &trace_diagonal_2);
 
         // The final diagonal quarter round function involves the states in position: 3, 4, 9, 14
         // Along with the two m_vector elements in the 14 and 15 positions.
-        let trace_diagonal_3 = Self::full_round_to_diagonal_quarter_round(round_data, m_vector, 3);
-        Self::quarter_round_function(builder, &trace_diagonal_3);
+        let trace_diagonal_3 = self.full_round_to_diagonal_quarter_round(round_data, m_vector, 3);
+        self.quarter_round_function(builder, &trace_diagonal_3);
     }
 }
 
@@ -210,14 +235,21 @@ impl<F> BaseAir<F> for Blake3Air {
     fn width(&self) -> usize {
         NUM_BLAKE3_COLS
     }
+
+    fn main_next_row_columns(&self) -> Vec<usize> {
+        vec![]
+    }
+
+    fn max_constraint_degree(&self) -> Option<usize> {
+        Some(3)
+    }
 }
 
 impl<AB: AirBuilder> Air<AB> for Blake3Air {
     #[inline]
     fn eval(&self, builder: &mut AB) {
         let main = builder.main();
-        let local = main.row_slice(0);
-        let local: &Blake3Cols<AB::Var> = (*local).borrow();
+        let local: &Blake3Cols<AB::Var> = main.current_slice().borrow();
 
         let initial_row_3 = [
             local.counter_low,
@@ -233,7 +265,9 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
             .chain(local.chaining_values[0].iter())
             .chain(local.chaining_values[1].iter())
             .chain(initial_row_3.iter())
-            .for_each(|elem| elem.iter().for_each(|&bool| builder.assert_bool(bool)));
+            .for_each(|elem| {
+                elem.iter().for_each(|&bool| builder.assert_bool(bool));
+            });
 
         // Next we ensure that the row0 and row2 for our initial state have been initialized correctly.
 
@@ -254,8 +288,8 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
             .iter()
             .zip(IV)
             .for_each(|(row_elem, constant)| {
-                builder.assert_eq(row_elem[0], AB::Expr::from_canonical_u32(constant[0]));
-                builder.assert_eq(row_elem[1], AB::Expr::from_canonical_u32(constant[1]));
+                builder.assert_eq(row_elem[0], AB::Expr::from_u16(constant[0]));
+                builder.assert_eq(row_elem[1], AB::Expr::from_u16(constant[1]));
             });
 
         let mut m_values: [[AB::Expr; 2]; 16] = local.inputs.map(|bits| {
@@ -275,13 +309,13 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
         // Now we can move to verifying that each of the seven rounds have been computed correctly.
 
         // Round 1:
-        Self::verify_round(builder, &initial_state, &local.full_rounds[0], &m_values);
+        self.verify_round(builder, &initial_state, &local.full_rounds[0], &m_values);
 
         // Permute the vector of m_values.
         permute(&mut m_values);
 
         // Round 2:
-        Self::verify_round(
+        self.verify_round(
             builder,
             &local.full_rounds[0].state_output,
             &local.full_rounds[1],
@@ -292,7 +326,7 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
         permute(&mut m_values);
 
         // Round 3:
-        Self::verify_round(
+        self.verify_round(
             builder,
             &local.full_rounds[1].state_output,
             &local.full_rounds[2],
@@ -303,7 +337,7 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
         permute(&mut m_values);
 
         // Round 4:
-        Self::verify_round(
+        self.verify_round(
             builder,
             &local.full_rounds[2].state_output,
             &local.full_rounds[3],
@@ -314,7 +348,7 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
         permute(&mut m_values);
 
         // Round 5:
-        Self::verify_round(
+        self.verify_round(
             builder,
             &local.full_rounds[3].state_output,
             &local.full_rounds[4],
@@ -325,7 +359,7 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
         permute(&mut m_values);
 
         // Round 6:
-        Self::verify_round(
+        self.verify_round(
             builder,
             &local.full_rounds[4].state_output,
             &local.full_rounds[5],
@@ -336,7 +370,7 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
         permute(&mut m_values);
 
         // Round 7:
-        Self::verify_round(
+        self.verify_round(
             builder,
             &local.full_rounds[5].state_output,
             &local.full_rounds[6],
@@ -361,10 +395,9 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
             });
         // Additionally, we need to ensure that both local.final_round_helpers and local.outputs[0] are boolean.
 
-        local
-            .final_round_helpers
+        // `final_round_helpers` values are already boolean asserted within `xor_32_shift()`
+        local.outputs[0]
             .iter()
-            .chain(local.outputs[0].iter())
             .for_each(|bits| bits.iter().for_each(|&bit| builder.assert_bool(bit)));
 
         // Finally we check the xor by xor'ing the output with final_round_helpers, packing the bits
@@ -378,7 +411,7 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
             // We can reuse xor_32_shift with a shift of 0.
             // As a = b ^ c if and only if b = a ^ c we can perform our xor on the
             // elements which we have the bits of and then check against a.
-            xor_32_shift(builder, &left_words, &out_bits, &right_bits, 0)
+            xor_32_shift(builder, &left_words, &out_bits, &right_bits, 0);
         }
 
         // When i = 4, 5, 6, 7 we already have the bits of state[i] and state[i + 8] making this easy.
@@ -390,7 +423,7 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
             local.full_rounds[6].state_output.row3
         ) {
             for (out_bit, left_bit, right_bit) in izip!(out_bits, left_bits, right_bits) {
-                builder.assert_eq(out_bit, xor(left_bit.into(), right_bit.into()));
+                builder.assert_eq(out_bit, left_bit.into().xor(&right_bit.into()));
             }
         }
 
@@ -406,7 +439,7 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
             local.final_round_helpers
         ) {
             for (out_bit, left_bit, right_bit) in izip!(out_bits, left_bits, right_bits) {
-                builder.assert_eq(out_bit, xor(left_bit.into(), right_bit.into()));
+                builder.assert_eq(out_bit, left_bit.into().xor(&right_bit.into()));
             }
         }
 
@@ -419,7 +452,7 @@ impl<AB: AirBuilder> Air<AB> for Blake3Air {
             local.full_rounds[6].state_output.row3
         ) {
             for (out_bit, left_bit, right_bit) in izip!(out_bits, left_bits, right_bits) {
-                builder.assert_eq(out_bit, xor(left_bit.into(), right_bit.into()));
+                builder.assert_eq(out_bit, left_bit.into().xor(&right_bit.into()));
             }
         }
     }

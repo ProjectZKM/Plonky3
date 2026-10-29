@@ -1,25 +1,37 @@
 [package]
 name = "p3-monty-31"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "An implementation of a generic prime field F_p, where 2^30 < p < 2^31 using Montgomery arithmetic."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
-nightly-features = []
+parallel = ["p3-maybe-rayon/parallel"]
 
 [dependencies]
-itertools.workspace = true
 p3-dft.workspace = true
 p3-field.workspace = true
 p3-matrix.workspace = true
 p3-maybe-rayon.workspace = true
 p3-mds.workspace = true
+p3-poseidon1.workspace = true
 p3-poseidon2.workspace = true
 p3-symmetric.workspace = true
 p3-util.workspace = true
+
+itertools.workspace = true
 num-bigint.workspace = true
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+spin.workspace = true
 tracing.workspace = true
-transpose.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

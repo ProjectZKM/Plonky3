@@ -1,4 +1,6 @@
-use core::iter::FlatMap;
+use core::iter::{FlatMap, IntoIterator, Iterator};
+use core::marker::{Send, Sized, Sync};
+use core::ops::{Fn, FnOnce};
 use core::slice::{
     Chunks, ChunksExact, ChunksExactMut, ChunksMut, RChunks, RChunksExact, RChunksExactMut,
     RChunksMut, Split, SplitMut, Windows,
@@ -137,23 +139,75 @@ impl<T: Send> ParallelSliceMut<T> for [T] {
 }
 
 pub trait ParIterExt: Iterator {
+    /// Serially, this returns the first matching item, unlike rayon's `find_any`, which may
+    /// return any matching item found by any thread.
     fn find_any<P>(self, predicate: P) -> Option<Self::Item>
     where
         P: Fn(&Self::Item) -> bool + Sync + Send;
+
+    fn find_map_any<P, R>(self, predicate: P) -> Option<R>
+    where
+        P: Fn(Self::Item) -> Option<R> + Sync + Send;
 
     fn flat_map_iter<U, F>(self, map_op: F) -> FlatMap<Self, U, F>
     where
         Self: Sized,
         U: IntoIterator,
         F: Fn(Self::Item) -> U;
+
+    /// Initialize one serial state and reuse it for every mapped item.
+    fn map_init<INIT, OP, T, R>(self, init: INIT, op: OP) -> impl Iterator<Item = R>
+    where
+        Self: Sized,
+        INIT: Fn() -> T + Sync + Send,
+        OP: Fn(&mut T, Self::Item) -> R + Sync + Send,
+    {
+        let mut state = init();
+        self.map(move |item| op(&mut state, item))
+    }
+
+    /// Serially, `init` is called once and the single state is reused across every item,
+    /// unlike rayon's `for_each_init`, which calls `init` once per split.
+    fn for_each_init<OP, INIT, T>(self, init: INIT, op: OP)
+    where
+        Self: Sized,
+        OP: Fn(&mut T, Self::Item) + Sync + Send,
+        INIT: Fn() -> T + Sync + Send;
+
+    /// No-op: there is only one split in a serial build, so a minimum split length has
+    /// nothing to constrain.
+    fn with_min_len(self, min_len: usize) -> Self
+    where
+        Self: Sized,
+    {
+        let _ = min_len;
+        self
+    }
+
+    /// No-op: there is only one split in a serial build, so a maximum split length has
+    /// nothing to constrain.
+    fn with_max_len(self, max_len: usize) -> Self
+    where
+        Self: Sized,
+    {
+        let _ = max_len;
+        self
+    }
 }
 
-impl<T: Iterator> ParIterExt for T {
+impl<I: Iterator> ParIterExt for I {
     fn find_any<P>(mut self, predicate: P) -> Option<Self::Item>
     where
         P: Fn(&Self::Item) -> bool + Sync + Send,
     {
         self.find(predicate)
+    }
+
+    fn find_map_any<P, R>(mut self, predicate: P) -> Option<R>
+    where
+        P: Fn(Self::Item) -> Option<R> + Sync + Send,
+    {
+        self.find_map(predicate)
     }
 
     fn flat_map_iter<U, F>(self, map_op: F) -> FlatMap<Self, U, F>
@@ -164,8 +218,20 @@ impl<T: Iterator> ParIterExt for T {
     {
         self.flat_map(map_op)
     }
+
+    fn for_each_init<OP, INIT, T>(self, init: INIT, op: OP)
+    where
+        Self: Sized,
+        OP: Fn(&mut T, Self::Item) + Sync + Send,
+        INIT: Fn() -> T + Sync + Send,
+    {
+        let mut state = init();
+        self.for_each(|item| op(&mut state, item));
+    }
 }
 
+/// Runs `oper_a` then `oper_b` in sequence, unlike rayon's `join`, which may run them
+/// concurrently on separate threads.
 pub fn join<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
 where
     A: FnOnce() -> RA,
@@ -176,6 +242,46 @@ where
     (result_a, result_b)
 }
 
-pub fn current_num_threads() -> usize {
+/// Always 1: there is only one thread of execution in a serial build.
+pub const fn current_num_threads() -> usize {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::ParIterExt;
+
+    #[test]
+    fn map_init_reuses_state_in_order_and_accepts_empty_input() {
+        let initialized = AtomicUsize::new(0);
+        let mut values = (1..4).map_init(
+            || {
+                initialized.fetch_add(1, Ordering::Relaxed);
+                0
+            },
+            |state, item| {
+                *state += item;
+                *state
+            },
+        );
+        assert_eq!(values.next(), Some(1));
+        assert_eq!(values.next(), Some(3));
+        assert_eq!(values.next(), Some(6));
+        assert_eq!(values.next(), None);
+        assert_eq!(initialized.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            (0..0)
+                .map_init(
+                    || 0,
+                    |state, item| {
+                        *state += item;
+                        *state
+                    }
+                )
+                .next(),
+            None
+        );
+    }
 }

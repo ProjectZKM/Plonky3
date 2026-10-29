@@ -2,39 +2,60 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
-use core::iter::{Product, Sum};
-use core::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
-use core::slice;
+use core::iter::{Product, Sum, zip};
+use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use core::{array, slice};
 
-use itertools::Itertools;
 use num_bigint::BigUint;
-use num_traits::One;
-use nums::{Factorizer, FactorizerFromSplitter, MillerRabin, PollardRho};
-use serde::de::DeserializeOwned;
+use p3_maybe_rayon::prelude::*;
+use p3_util::{flatten_to_base, iter_array_chunks_padded};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
-use crate::exponentiation::exp_u64_by_squaring;
-use crate::packed::{PackedField, PackedValue};
-use crate::Packable;
+use crate::exponentiation::bits_u64;
+use crate::integers::{QuotientMap, from_integer_types};
+use crate::packed::PackedField;
+use crate::{Dup, Packable, PackedFieldExtension, PackedValue};
 
-/// A commutative algebra over a finite field.
+/// A commutative ring, `R`, with prime characteristic, `p`.
 ///
 /// This permits elements like:
-/// - an actual field element
-/// - a symbolic expression which would evaluate to a field element
-/// - an array of field elements
+/// - A single finite field element.
+/// - A symbolic expression which would evaluate to a field element.
+/// - An array of finite field elements.
+/// - A polynomial with coefficients in a finite field.
 ///
-/// Mathematically speaking, this is an algebraic structure with addition,
-/// multiplication and scalar multiplication. The addition and multiplication
-/// maps must be both commutative and associative, and there must
-/// exist identity elements for both (named `ZERO` and `ONE`
-/// respectively). Furthermore, multiplication must distribute over
-/// addition. Finally, the scalar multiplication must be realized by
-/// a ring homomorphism from the field to the algebra.
-pub trait FieldAlgebra:
+/// ### Mathematical Description
+///
+/// Mathematically, a commutative ring is a set of objects which supports an addition-like
+/// like operation, `+`, and a multiplication-like operation `*`.
+///
+/// Let `x, y, z` denote arbitrary elements of the set.
+///
+/// Then, an operation is addition-like if it satisfies the following properties:
+/// - Commutativity => `x + y = y + x`
+/// - Associativity => `x + (y + z) = (x + y) + z`
+/// - Unit => There exists an identity element `ZERO` satisfying `x + ZERO = x`.
+/// - Inverses => For every `x` there exists a unique inverse `(-x)` satisfying `x + (-x) = ZERO`
+///
+/// Similarly, an operation is multiplication-like if it satisfies the following properties:
+/// - Commutativity => `x * y = y * x`
+/// - Associativity => `x * (y * z) = (x * y) * z`
+/// - Unit => There exists an identity element `ONE` satisfying `x * ONE = x`.
+/// - Distributivity => The two operations `+` and `*` must together satisfy `x * (y + z) = (x * y) + (x * z)`
+///
+/// Unlike in the addition case, we do not require inverses to exist with respect to `*`.
+///
+/// The simplest examples of commutative rings are the integers (`ℤ`), and the integers mod `N` (`ℤ/N`).
+///
+/// The characteristic of a ring is the smallest positive integer `r` such that `0 = r . 1 = 1 + 1 + ... + 1 (r times)`.
+/// For example, the characteristic of the modulo ring `ℤ/N` is `N`.
+///
+/// Rings with prime characteristic are particularly special due to their close relationship with finite fields.
+pub trait PrimeCharacteristicRing:
     Sized
     + Default
-    + Clone
+    + Dup
     + Add<Output = Self>
     + AddAssign
     + Sub<Output = Self>
@@ -46,25 +67,26 @@ pub trait FieldAlgebra:
     + Product
     + Debug
 {
-    type F: Field;
+    /// The field `ℤ/p` where the characteristic of this ring is p.
+    type PrimeSubfield: PrimeField;
 
-    /// The additive identity of the algebra.
+    /// The additive identity of the ring.
     ///
-    /// For every element `a` in the algebra we require the following properties:
+    /// For every element `a` in the ring we require the following properties:
     ///
     /// `a + ZERO = ZERO + a = a,`
     ///
     /// `a + (-a) = (-a) + a = ZERO.`
     const ZERO: Self;
 
-    /// The multiplicative identity of the Algebra
+    /// The multiplicative identity of the ring.
     ///
-    /// For every element `a` in the algebra we require the following property:
+    /// For every element `a` in the ring we require the following property:
     ///
     /// `a*ONE = ONE*a = a.`
     const ONE: Self;
 
-    /// The element in the algebra given by `ONE + ONE`.
+    /// The element in the ring given by `ONE + ONE`.
     ///
     /// This is provided as a convenience as `TWO` occurs regularly in
     /// the proving system. This also is slightly faster than computing
@@ -74,7 +96,7 @@ pub trait FieldAlgebra:
     /// If the field has characteristic 2 this is equal to ZERO.
     const TWO: Self;
 
-    /// The element in the algebra given by `-ONE`.
+    /// The element in the ring given by `-ONE`.
     ///
     /// This is provided as a convenience as `NEG_ONE` occurs regularly in
     /// the proving system. This also is slightly faster than computing
@@ -85,129 +107,176 @@ pub trait FieldAlgebra:
     /// If the field has characteristic 2 this is equal to ONE.
     const NEG_ONE: Self;
 
+    /// Embed an element of the prime field `ℤ/p` into the ring `R`.
+    ///
+    /// Given any element `[r] ∈ ℤ/p`, represented by an integer `r` between `0` and `p - 1`
+    /// `from_prime_subfield([r])` will be equal to:
+    ///
+    /// `Self::ONE + ... + Self::ONE (r times)`
+    #[must_use]
+    fn from_prime_subfield(f: Self::PrimeSubfield) -> Self;
+
+    /// Return `Self::ONE` if `b` is `true` and `Self::ZERO` if `b` is `false`.
+    #[must_use]
+    #[inline(always)]
+    fn from_bool(b: bool) -> Self {
+        // Some rings might reimplement this to avoid the branch.
+        if b { Self::ONE } else { Self::ZERO }
+    }
+
+    from_integer_types!(
+        u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
+    );
+
+    /// Backward-compatible alias for `Self::ZERO`.
+    #[must_use]
     #[inline(always)]
     fn zero() -> Self {
         Self::ZERO
     }
 
+    /// Backward-compatible alias for `Self::ONE`.
+    #[must_use]
     #[inline(always)]
     fn one() -> Self {
         Self::ONE
     }
 
+    /// Backward-compatible alias for `Self::TWO`.
+    #[must_use]
     #[inline(always)]
     fn two() -> Self {
         Self::TWO
     }
 
+    /// Backward-compatible alias for `Self::NEG_ONE`.
+    #[must_use]
     #[inline(always)]
     fn neg_one() -> Self {
         Self::NEG_ONE
     }
 
-    #[inline(always)]
-    fn generator() -> Self {
-        Self::from_f(Self::F::GENERATOR)
-    }
-
-    /// Interpret a field element as a commutative algebra element.
-    ///
-    /// Mathematically speaking, this map is a ring homomorphism from the base field
-    /// to the commutative algebra. The existence of this map makes this structure
-    /// an algebra and not simply a commutative ring.
-    fn from_f(f: Self::F) -> Self;
-
-    /// Convert from a `bool`.
-    fn from_bool(b: bool) -> Self;
-
-    /// Convert from a canonical `u8`.
-    ///
-    /// If the input is not canonical, i.e. if it exceeds the field's characteristic, then the
-    /// behavior is undefined.
-    fn from_canonical_u8(n: u8) -> Self;
-
-    /// Convert from a canonical `u16`.
-    ///
-    /// If the input is not canonical, i.e. if it exceeds the field's characteristic, then the
-    /// behavior is undefined.
-    fn from_canonical_u16(n: u16) -> Self;
-
-    /// Convert from a canonical `u32`.
-    ///
-    /// If the input is not canonical, i.e. if it exceeds the field's characteristic, then the
-    /// behavior is undefined.
-    fn from_canonical_u32(n: u32) -> Self;
-
-    /// Convert from a canonical `u64`.
-    ///
-    /// If the input is not canonical, i.e. if it exceeds the field's characteristic, then the
-    /// behavior is undefined.
-    fn from_canonical_u64(n: u64) -> Self;
-
-    /// Convert from a canonical `usize`.
-    ///
-    /// If the input is not canonical, i.e. if it exceeds the field's characteristic, then the
-    /// behavior is undefined.
-    fn from_canonical_usize(n: usize) -> Self;
-
-    fn from_wrapped_u32(n: u32) -> Self;
-    fn from_wrapped_u64(n: u64) -> Self;
-
     /// The elementary function `double(a) = 2*a`.
     ///
-    /// This function should be preferred over calling `a + a` or `TWO * a` as a faster implementation may be available for some algebras.
+    /// This function should be preferred over calling `a + a` or `TWO * a` as a faster implementation may be available for some rings.
     /// If the field has characteristic 2 then this returns 0.
     #[must_use]
+    #[inline(always)]
     fn double(&self) -> Self {
-        self.clone() + self.clone()
+        self.dup() + self.dup()
+    }
+
+    /// The elementary function `halve(a) = a/2`.
+    ///
+    /// # Panics
+    /// The function will panic if the field has characteristic 2.
+    #[must_use]
+    #[inline]
+    fn halve(&self) -> Self {
+        // This must be overwritten by PrimeField implementations as this definition
+        // is circular when PrimeSubfield = Self. It should also be overwritten by
+        // most rings to avoid the multiplication.
+        let half = Self::from_prime_subfield(Self::PrimeSubfield::ONE.halve());
+        self.dup() * half
     }
 
     /// The elementary function `square(a) = a^2`.
     ///
-    /// This function should be preferred over calling `a * a`, as a faster implementation may be available for some algebras.
+    /// This function should be preferred over calling `a * a`, as a faster implementation may be available for some rings.
     #[must_use]
+    #[inline(always)]
     fn square(&self) -> Self {
-        self.clone() * self.clone()
+        self.dup() * self.dup()
     }
 
     /// The elementary function `cube(a) = a^3`.
     ///
-    /// This function should be preferred over calling `a * a * a`, as a faster implementation may be available for some algebras.
+    /// This function should be preferred over calling `a * a * a`, as a faster implementation may be available for some rings.
     #[must_use]
+    #[inline(always)]
     fn cube(&self) -> Self {
-        self.square() * self.clone()
+        self.square() * self.dup()
+    }
+
+    /// Computes the arithmetic generalization of boolean `xor`.
+    ///
+    /// For boolean inputs, `x ^ y = x + y - 2 xy`.
+    #[must_use]
+    #[inline(always)]
+    fn xor(&self, y: &Self) -> Self {
+        self.dup() + y.dup() - self.dup() * y.dup().double()
+    }
+
+    /// Computes the arithmetic generalization of a triple `xor`.
+    ///
+    /// For boolean inputs `x ^ y ^ z = x + y + z - 2(xy + xz + yz) + 4xyz`.
+    #[must_use]
+    #[inline(always)]
+    fn xor3(&self, y: &Self, z: &Self) -> Self {
+        self.xor(y).xor(z)
+    }
+
+    /// Computes the arithmetic generalization of `andnot`.
+    ///
+    /// For boolean inputs `(!x) & y = (1 - x)y`.
+    #[must_use]
+    #[inline(always)]
+    fn andn(&self, y: &Self) -> Self {
+        (Self::ONE - self.dup()) * y.dup()
+    }
+
+    /// The vanishing polynomial for boolean values: `x * (x - 1)`.
+    ///
+    /// This is a polynomial of degree `2` that evaluates to `0` if the input is `0` or `1`.
+    /// If our space is a field, then this will be nonzero on all other inputs.
+    #[must_use]
+    #[inline(always)]
+    fn bool_check(&self) -> Self {
+        // Note: We could delegate to `andn`, but to maintain backwards
+        // compatible AIR definitions, we stick with `x * (x - 1)` here.
+        self.dup() * (self.dup() - Self::ONE)
     }
 
     /// Exponentiation by a `u64` power.
     ///
-    /// The default implementation calls `exp_u64_generic`, which by default performs exponentiation
-    /// by squaring. Rather than override this method, it is generally recommended to have the
-    /// concrete field type override `exp_u64_generic`, so that any optimizations will apply to all
-    /// abstract fields.
+    /// This uses the standard square and multiply approach.
+    /// For specific powers regularly used and known in advance,
+    /// this will be slower than custom addition chain exponentiation.
     #[must_use]
     #[inline]
     fn exp_u64(&self, power: u64) -> Self {
-        Self::F::exp_u64_generic(self.clone(), power)
+        let mut current = self.dup();
+        let mut product = Self::ONE;
+
+        for j in 0..bits_u64(power) {
+            if (power >> j) & 1 != 0 {
+                product *= current.dup();
+            }
+            current = current.square();
+        }
+        product
     }
 
-    /// Exponentiation by a constant power.
+    /// Exponentiation by a small constant power.
     ///
     /// For a collection of small values we implement custom multiplication chain circuits which can be faster than the
     /// simpler square and multiply approach.
+    ///
+    /// For large values this defaults back to `self.exp_u64`.
     #[must_use]
     #[inline(always)]
     fn exp_const_u64<const POWER: u64>(&self) -> Self {
         match POWER {
             0 => Self::ONE,
-            1 => self.clone(),
+            1 => self.dup(),
             2 => self.square(),
             3 => self.cube(),
             4 => self.square().square(),
-            5 => self.square().square() * self.clone(),
+            5 => self.square().square() * self.dup(),
             6 => self.square().cube(),
             7 => {
                 let x2 = self.square();
-                let x3 = x2.clone() * self.clone();
+                let x3 = x2.dup() * self.dup();
                 let x4 = x2.square();
                 x3 * x4
             }
@@ -215,66 +284,137 @@ pub trait FieldAlgebra:
         }
     }
 
-    /// Compute self^{2^power_log} by repeated squaring.
+    /// The elementary function `exp_power_of_2(a, power_log) = a^{2^power_log}`.
+    ///
+    /// Computed via repeated squaring.
     #[must_use]
+    #[inline]
     fn exp_power_of_2(&self, power_log: usize) -> Self {
-        let mut res = self.clone();
+        let mut res = self.dup();
         for _ in 0..power_log {
             res = res.square();
         }
         res
     }
 
-    /// self * 2^exp
+    /// The elementary function `mul_2exp_u64(a, exp) = a * 2^{exp}`.
+    ///
+    /// Here `2^{exp}` is computed using the square and multiply approach.
     #[must_use]
     #[inline]
     fn mul_2exp_u64(&self, exp: u64) -> Self {
-        self.clone() * Self::TWO.exp_u64(exp)
+        // Some rings might want to reimplement this to avoid the
+        // exponentiations (and potentially even the multiplication).
+        self.dup() * Self::TWO.exp_u64(exp)
     }
 
-    /// Construct an iterator which returns powers of `self: self^0, self^1, self^2, ...`.
+    /// Divide by a given power of two. `div_2exp_u64(a, exp) = a/2^exp`
+    ///
+    /// # Panics
+    /// The function will panic if the field has characteristic 2.
     #[must_use]
-    fn powers(&self) -> Powers<Self> {
-        self.shifted_powers(Self::one())
+    #[inline]
+    fn div_2exp_u64(&self, exp: u64) -> Self {
+        // Some rings might want to reimplement this to avoid the
+        // exponentiations (and potentially even the multiplication).
+        self.dup() * Self::from_prime_subfield(Self::PrimeSubfield::ONE.halve().exp_u64(exp))
     }
 
-    /// Construct an iterator which returns powers of `self` shifted by `start: start, start*self^1, start*self^2, ...`.
+    /// Construct an iterator which returns powers of `self`: `self^0, self^1, self^2, ...`.
+    #[must_use]
+    #[inline]
+    fn powers(&self) -> Powers<Self> {
+        self.shifted_powers(Self::ONE)
+    }
+
+    /// Construct an iterator which returns powers of `self` shifted by `start`: `start, start*self^1, start*self^2, ...`.
+    #[must_use]
+    #[inline]
     fn shifted_powers(&self, start: Self) -> Powers<Self> {
         Powers {
-            base: self.clone(),
+            base: self.dup(),
             current: start,
         }
     }
 
-    /// Construct an iterator which returns powers of `self` packed into `PackedField` elements.
-    ///
-    /// E.g. if `PACKING::WIDTH = 4` this returns the elements:
-    /// `[self^0, self^1, self^2, self^3], [self^4, self^5, self^6, self^7], ...`.
-    fn powers_packed<P: PackedField<Scalar = Self>>(&self) -> Powers<P> {
-        self.shifted_powers_packed(Self::ONE)
-    }
-
-    /// Construct an iterator which returns powers of `self` shifted by start
-    /// and packed into `PackedField` elements.
-    ///
-    /// E.g. if `PACKING::WIDTH = 4` this returns the elements:
-    /// `[start, start*self, start*self^2, start*self^3], [start*self^4, start*self^5, start*self^6, start*self^7], ...`.
-    fn shifted_powers_packed<P: PackedField<Scalar = Self>>(&self, start: Self) -> Powers<P> {
-        let mut current = P::from_f(start);
-        let slice = current.as_slice_mut();
-        for i in 1..P::WIDTH {
-            slice[i] = slice[i - 1].clone() * self.clone();
-        }
-
-        Powers {
-            base: P::from_f(self.clone()).exp_u64(P::WIDTH as u64),
-            current,
-        }
-    }
-
     /// Compute the dot product of two vectors.
+    ///
+    /// ```text
+    ///     result = u[0]*v[0] + u[1]*v[1] + ... + u[N-1]*v[N-1]
+    /// ```
+    ///
+    /// The products are combined with a balanced tree rather than a running accumulator.
+    /// A running accumulator makes every addition wait for the previous one to retire.
+    /// The tree keeps several partial sums in flight, so the latency chain is shorter.
+    ///
+    /// Rings whose modular reduction is linear over the accumulated representation
+    /// should override this to accumulate all `N` products unreduced and reduce once.
+    #[must_use]
+    #[inline]
     fn dot_product<const N: usize>(u: &[Self; N], v: &[Self; N]) -> Self {
-        u.iter().zip(v).map(|(x, y)| x.clone() * y.clone()).sum()
+        // Materialise the `N` products first, so none of the multiplies waits on a sum.
+        let products: [Self; N] = array::from_fn(|i| u[i].dup() * v[i].dup());
+
+        // Balanced tree of depth log2(N) instead of a linear chain of N - 1 adds.
+        Self::sum_array::<N>(&products)
+    }
+
+    /// Compute the sum of a slice of elements whose length is a compile time constant.
+    ///
+    /// The rust compiler doesn't realize that add is associative
+    /// so we help it out and minimize the dependency chains by hand.
+    /// Thus while this function has the same throughput as `input.iter().sum()`,
+    /// it will usually have much lower latency.
+    ///
+    /// # Panics
+    ///
+    /// May panic if the length of the input slice is not equal to `N`.
+    #[must_use]
+    #[inline]
+    fn sum_array<const N: usize>(input: &[Self]) -> Self {
+        // It looks a little strange but using a const parameter and an assert_eq! instead of
+        // using input.len() leads to a significant performance improvement.
+        // We could make this input &[Self; N] but that would require sticking .try_into().unwrap() everywhere.
+        // Checking godbolt, the compiler seems to unroll everything anyway.
+        assert_eq!(N, input.len());
+
+        // For `N <= 8` we implement a tree sum structure and for `N > 8` we break the input into
+        // chunks of `8`, perform a tree sum on each chunk and sum the results. The parameter `8`
+        // was determined experimentally by testing the speed of the poseidon2 internal layer computations.
+        // This is a useful benchmark as we have a mix of summations of size 15, 23 with other work in between.
+        // I only tested this on `AVX2` though so there might be a better value for other architectures.
+        match N {
+            0 => Self::ZERO,
+            1 => input[0].dup(),
+            2 => input[0].dup() + input[1].dup(),
+            3 => input[0].dup() + input[1].dup() + input[2].dup(),
+            4 => (input[0].dup() + input[1].dup()) + (input[2].dup() + input[3].dup()),
+            5 => Self::sum_array::<4>(&input[..4]) + Self::sum_array::<1>(&input[4..]),
+            6 => Self::sum_array::<4>(&input[..4]) + Self::sum_array::<2>(&input[4..]),
+            7 => Self::sum_array::<4>(&input[..4]) + Self::sum_array::<3>(&input[4..]),
+            8 => Self::sum_array::<4>(&input[..4]) + Self::sum_array::<4>(&input[4..]),
+            _ => {
+                // We know that N > 8 here so this saves an add over the usual
+                // initialisation of acc to Self::ZERO.
+                let mut acc = Self::sum_array::<8>(&input[..8]);
+                for i in (16..=N).step_by(8) {
+                    acc += Self::sum_array::<8>(&input[(i - 8)..i]);
+                }
+                // This would be much cleaner if we could use const generic expressions but
+                // this will do for now.
+                match N & 7 {
+                    0 => acc,
+                    1 => acc + Self::sum_array::<1>(&input[(8 * (N / 8))..]),
+                    2 => acc + Self::sum_array::<2>(&input[(8 * (N / 8))..]),
+                    3 => acc + Self::sum_array::<3>(&input[(8 * (N / 8))..]),
+                    4 => acc + Self::sum_array::<4>(&input[(8 * (N / 8))..]),
+                    5 => acc + Self::sum_array::<5>(&input[(8 * (N / 8))..]),
+                    6 => acc + Self::sum_array::<6>(&input[(8 * (N / 8))..]),
+                    7 => acc + Self::sum_array::<7>(&input[(8 * (N / 8))..]),
+                    _ => unreachable!(),
+                }
+            }
+        }
     }
 
     /// Allocates a vector of zero elements of length `len`. Many operating systems zero pages
@@ -282,21 +422,717 @@ pub trait FieldAlgebra:
     /// write zeros, which would be redundant. However, the compiler may not always recognize this.
     ///
     /// In particular, `vec![Self::ZERO; len]` appears to result in redundant userspace zeroing.
-    /// This is the default implementation, but implementors may wish to provide their own
+    /// This is the default implementation, but implementers may wish to provide their own
     /// implementation which transmutes something like `vec![0u32; len]`.
+    #[must_use]
     #[inline]
     fn zero_vec(len: usize) -> Vec<Self> {
         vec![Self::ZERO; len]
     }
 }
 
-/// An element of a finite field.
+/// A vector space `V` over `F` with a fixed basis. Fixing the basis allows elements of `V` to be
+/// converted to and from `DIMENSION` many elements of `F` which are interpreted as basis coefficients.
+///
+/// We usually expect `F` to be a field but do not enforce this and so allow it to be just a ring.
+/// This lets every ring implement `BasedVectorSpace<Self>` and is useful in a couple of other cases.
+///
+/// ## Safety
+/// We make no guarantees about consistency of the choice of basis across different versions of Plonky3.
+/// If this choice of basis changes, the behaviour of `BasedVectorSpace` will also change. Due to this,
+/// we recommend avoiding using this trait unless absolutely necessary.
+///
+/// ### Mathematical Description
+/// Given a vector space, `A` over `F`, a basis is a set of elements `B = {b_0, ..., b_{n-1}}`
+/// in `A` such that, given any element `a`, we can find a unique set of `n` elements of `F`,
+/// `f_0, ..., f_{n - 1}` satisfying `a = f_0 b_0 + ... + f_{n - 1} b_{n - 1}`. Thus the choice
+/// of `B` gives rise to a natural linear map between the vector space `A` and the canonical
+/// `n` dimensional vector space `F^n`.
+///
+/// This allows us to map between elements of `A` and arrays of `n` elements of `F`.
+/// Clearly this map depends entirely on the choice of basis `B` which may change
+/// across versions of Plonky3.
+///
+/// The situation is slightly more complicated in cases where `F` is not a field but boils down
+/// to an identical description once we enforce that `A` is a free module over `F`.
+pub trait BasedVectorSpace<F: PrimeCharacteristicRing>: Sized {
+    /// The dimension of the vector space, i.e. the number of elements in
+    /// its basis.
+    const DIMENSION: usize;
+
+    /// Fixes a basis for the algebra `A` and uses this to
+    /// map an element of `A` to a slice of `DIMENSION` `F` elements.
+    ///
+    /// # Safety
+    ///
+    /// The value produced by this function fundamentally depends
+    /// on the choice of basis. Care must be taken
+    /// to ensure portability if these values might ever be passed to
+    /// (or rederived within) another compilation environment where a
+    /// different basis might have been used.
+    #[must_use]
+    fn as_basis_coefficients_slice(&self) -> &[F];
+
+    /// Fixes a basis for the algebra `A` and uses this to
+    /// map `DIMENSION` `F` elements to an element of `A`.
+    ///
+    /// # Safety
+    ///
+    /// The value produced by this function fundamentally depends
+    /// on the choice of basis. Care must be taken
+    /// to ensure portability if these values might ever be passed to
+    /// (or rederived within) another compilation environment where a
+    /// different basis might have been used.
+    ///
+    /// Returns `None` if the length of the slice is different to `DIMENSION`.
+    #[must_use]
+    #[inline]
+    fn from_basis_coefficients_slice(slice: &[F]) -> Option<Self> {
+        Self::from_basis_coefficients_iter(slice.iter().cloned())
+    }
+
+    /// Fixes a basis for the algebra `A` and uses this to
+    /// map `DIMENSION` `F` elements to an element of `A`. Similar
+    /// to `core:array::from_fn`, the `DIMENSION` `F` elements are
+    /// given by `Fn(0), ..., Fn(DIMENSION - 1)` called in that order.
+    ///
+    /// # Safety
+    ///
+    /// The value produced by this function fundamentally depends
+    /// on the choice of basis. Care must be taken
+    /// to ensure portability if these values might ever be passed to
+    /// (or rederived within) another compilation environment where a
+    /// different basis might have been used.
+    #[must_use]
+    fn from_basis_coefficients_fn<Fn: FnMut(usize) -> F>(f: Fn) -> Self;
+
+    /// Fixes a basis for the algebra `A` and uses this to
+    /// map `DIMENSION` `F` elements to an element of `A`.
+    ///
+    /// # Safety
+    ///
+    /// The value produced by this function fundamentally depends
+    /// on the choice of basis. Care must be taken
+    /// to ensure portability if these values might ever be passed to
+    /// (or rederived within) another compilation environment where a
+    /// different basis might have been used.
+    ///
+    /// Returns `None` if the length of the iterator is different to `DIMENSION`.
+    #[must_use]
+    fn from_basis_coefficients_iter<I: ExactSizeIterator<Item = F>>(iter: I) -> Option<Self>;
+
+    /// Given a basis for the Algebra `A`, return the i'th basis element.
+    ///
+    /// # Safety
+    ///
+    /// The value produced by this function fundamentally depends
+    /// on the choice of basis. Care must be taken
+    /// to ensure portability if these values might ever be passed to
+    /// (or rederived within) another compilation environment where a
+    /// different basis might have been used.
+    ///
+    /// Returns `None` if `i` is greater than or equal to `DIMENSION`.
+    #[must_use]
+    #[inline]
+    fn ith_basis_element(i: usize) -> Option<Self> {
+        (i < Self::DIMENSION).then(|| Self::from_basis_coefficients_fn(|j| F::from_bool(i == j)))
+    }
+
+    /// Borrow a slice's basis coefficients when their storage is contiguous.
+    ///
+    /// The returned slice concatenates [`Self::as_basis_coefficients_slice`] for each element,
+    /// in order, and borrows the input storage. Implementations with padding or another layout
+    /// can retain the default `None`; callers must then use coefficient iteration.
+    ///
+    /// Support must be a property of the type's layout: an implementation must return `Some`
+    /// for every input slice, including empty slices, or `None` for every input slice. It must
+    /// not depend on the slice's contents, length, or address, and must remain stable when the
+    /// input storage moves or this method is called again.
+    #[must_use]
+    #[inline]
+    fn flatten_slice_to_base(_values: &[Self]) -> Option<&[F]> {
+        None
+    }
+
+    /// Convert from a vector of `Self` to a vector of `F` by flattening the basis coefficients.
+    ///
+    /// Depending on the `BasedVectorSpace` this may be essentially a no-op and should certainly
+    /// be reimplemented in those cases.
+    ///
+    /// # Safety
+    ///
+    /// The value produced by this function fundamentally depends
+    /// on the choice of basis. Care must be taken
+    /// to ensure portability if these values might ever be passed to
+    /// (or rederived within) another compilation environment where a
+    /// different basis might have been used.
+    #[must_use]
+    #[inline]
+    fn flatten_to_base(vec: Vec<Self>) -> Vec<F> {
+        vec.into_iter()
+            .flat_map(|x| x.as_basis_coefficients_slice().to_vec())
+            .collect()
+    }
+
+    /// Convert from a vector of `F` to a vector of `Self` by combining the basis coefficients.
+    ///
+    /// Depending on the `BasedVectorSpace` this may be essentially a no-op and should certainly
+    /// be reimplemented in those cases.
+    ///
+    /// # Panics
+    /// This will panic if the length of `vec` is not a multiple of `Self::DIMENSION`.
+    ///
+    /// # Safety
+    ///
+    /// The value produced by this function fundamentally depends
+    /// on the choice of basis. Care must be taken
+    /// to ensure portability if these values might ever be passed to
+    /// (or rederived within) another compilation environment where a
+    /// different basis might have been used.
+    #[must_use]
+    #[inline]
+    fn reconstitute_from_base(vec: Vec<F>) -> Vec<Self>
+    where
+        F: Sync,
+        Self: Send,
+    {
+        assert_eq!(vec.len() % Self::DIMENSION, 0);
+
+        vec.par_chunks_exact(Self::DIMENSION)
+            .map(|chunk| {
+                Self::from_basis_coefficients_slice(chunk)
+                    .expect("Chunk length not equal to dimension")
+            })
+            .collect()
+    }
+}
+
+/// Compiler-independent identity of an algebra's ordered coefficient basis over `F`.
+///
+/// Together with the coefficient field identity and dimension, these bytes must
+/// uniquely identify the defining relations and the ordered basis used by
+/// [`BasedVectorSpace`]. Different polynomials or basis orderings require different
+/// identifiers, even for isomorphic fields. Use an unambiguous, versioned encoding;
+/// Rust type names, memory layouts, and compiler-dependent encodings are forbidden.
+/// Changing this identity changes Fiat-Shamir transcripts.
+pub trait AlgebraIdentity<F: PrimeCharacteristicRing>: BasedVectorSpace<F> {
+    /// Return the stable, unambiguous identifier of the defining relations and basis.
+    fn algebra_id() -> Vec<u8>;
+}
+
+impl<F: PrimeCharacteristicRing> AlgebraIdentity<F> for F {
+    fn algebra_id() -> Vec<u8> {
+        b"p3-scalar-basis-v1".to_vec()
+    }
+}
+
+/// Values that can act as sponge lanes for delimiter padding.
+///
+/// This is used by symmetric sponge adapters that need canonical `0` and `1` symbols while
+/// supporting both field/ring-based lanes and `u64`-based Keccak lanes behind one API.
+pub trait SpongePaddingValue: Copy {
+    /// The empty-lane value.
+    const PAD_ZERO: Self;
+
+    /// The delimiter value injected after the final absorbed element.
+    const PAD_ONE: Self;
+}
+
+impl<T: PrimeCharacteristicRing + Copy> SpongePaddingValue for T {
+    const PAD_ZERO: Self = Self::ZERO;
+    const PAD_ONE: Self = Self::ONE;
+}
+
+impl SpongePaddingValue for u64 {
+    const PAD_ZERO: Self = 0;
+    const PAD_ONE: Self = 1;
+}
+
+impl<const N: usize> SpongePaddingValue for [u64; N] {
+    const PAD_ZERO: Self = [0; N];
+    const PAD_ONE: Self = [1; N];
+}
+
+/// Trait for fields that support uniform bit sampling optimizations.
+pub trait UniformSamplingField {
+    /// Maximum number of bits we can sample at negligible (~1/field prime) probability of
+    /// triggering an error / requiring a resample.
+    const MAX_SINGLE_SAMPLE_BITS: usize;
+    /// An array storing the largest value `m_k` for each `k` in [0, 31], such that `m_k`
+    /// is a multiple of `2^k` and less than P. `m_k` is defined as:
+    ///
+    /// \( m_k = ⌊P / 2^k⌋ · 2^k \)
+    ///
+    /// This is used as a rejection sampling threshold (or error trigger), when sampling
+    /// random bits from uniformly sampled field elements. As long as we sample up to the `k`
+    /// least significant bits in the range [0, m_k), we sample from exactly `m_k` elements. As
+    /// `m_k` is divisible by 2^k, each of the least significant `k` bits has exactly the same
+    /// number of zeroes and ones, leading to a uniform sampling.
+    const SAMPLING_BITS_M: [u64; 64];
+}
+
+impl<F: PrimeCharacteristicRing> BasedVectorSpace<F> for F {
+    const DIMENSION: usize = 1;
+
+    #[inline]
+    fn as_basis_coefficients_slice(&self) -> &[F] {
+        slice::from_ref(self)
+    }
+
+    #[inline]
+    fn from_basis_coefficients_fn<Fn: FnMut(usize) -> F>(mut f: Fn) -> Self {
+        f(0)
+    }
+
+    #[inline]
+    fn from_basis_coefficients_iter<I: ExactSizeIterator<Item = F>>(mut iter: I) -> Option<Self> {
+        (iter.len() == 1).then(|| iter.next().unwrap()) // Unwrap will not panic as we know the length is 1.
+    }
+
+    #[inline]
+    fn flatten_slice_to_base(values: &[Self]) -> Option<&[F]> {
+        Some(values)
+    }
+
+    #[inline]
+    fn flatten_to_base(vec: Vec<Self>) -> Vec<F> {
+        vec
+    }
+
+    #[inline]
+    fn reconstitute_from_base(vec: Vec<F>) -> Vec<Self> {
+        vec
+    }
+}
+
+/// A ring implements `InjectiveMonomial<N>` if the algebraic function
+/// `f(x) = x^N` is an injective map on elements of the ring.
+///
+/// We do not enforce that this map be invertible as there are useful
+/// cases such as polynomials or symbolic expressions where no inverse exists.
+///
+/// However, if the ring is a field with order `q` or an array of such field elements,
+/// then `f(x) = x^N` will be injective if and only if it is invertible and so in
+/// such cases this monomial acts as a permutation. Moreover, this will occur
+/// exactly when `N` and `q - 1` are relatively prime i.e. `gcd(N, q - 1) = 1`.
+pub trait InjectiveMonomial<const N: u64>: PrimeCharacteristicRing {
+    /// Compute `x -> x^n` for a given `n > 1` such that this
+    /// map is injective.
+    #[must_use]
+    #[inline]
+    fn injective_exp_n(&self) -> Self {
+        self.exp_const_u64::<N>()
+    }
+}
+
+/// A ring implements `PermutationMonomial<N>` if the algebraic function
+/// `f(x) = x^N` is invertible and thus acts as a permutation on elements of the ring.
+///
+/// In all cases we care about, this means that we can find another integer `K` such
+/// that `x = x^{NK}` for all elements of our ring.
+pub trait PermutationMonomial<const N: u64>: InjectiveMonomial<N> {
+    /// Compute `x -> x^K` for a given `K > 1` such that
+    /// `x^{NK} = x` for all elements `x`.
+    #[must_use]
+    fn injective_exp_root_n(&self) -> Self;
+}
+
+/// A ring `R` implements `Algebra<F>` if there is an injective homomorphism
+///  from `F` into `R`; in particular only `F::ZERO` maps to `R::ZERO`.
+///
+/// For the most part, we will usually expect `F` to be a field but there
+/// are a few cases where it is handy to allow it to just be a ring. In
+/// particular, every ring naturally implements `Algebra<Self>`.
+///
+/// ### Mathematical Description
+///
+/// Let `x` and `y` denote arbitrary elements of `F`. Then
+/// we require that our map `from` has the properties:
+/// - Preserves Identity: `from(F::ONE) = R::ONE`
+/// - Commutes with Addition: `from(x + y) = from(x) + from(y)`
+/// - Commutes with Multiplication: `from(x * y) = from(x) * from(y)`
+///
+/// Such maps are known as ring homomorphisms and are injective if the
+/// only element which maps to `R::ZERO` is `F::ZERO`.
+///
+/// The existence of this map makes `R` into an `F`-module and hence an `F`-algebra.
+/// If, additionally, `R` is a field, then this makes `R` a field extension of `F`.
+pub trait Algebra<F>:
+    PrimeCharacteristicRing
+    + From<F>
+    + Add<F, Output = Self>
+    + AddAssign<F>
+    + Sub<F, Output = Self>
+    + SubAssign<F>
+    + Mul<F, Output = Self>
+    + MulAssign<F>
+{
+    /// Square `a[0] + a[1] X` modulo `X^2 - w`.
+    ///
+    /// Returns `[a[0]^2 + w * a[1]^2, 2 * a[0] * a[1]]` for arbitrary `w`.
+    /// The default uses a dot product to share reduction work; packed algebras can
+    /// override it when dedicated squaring is cheaper than the two-product reduction.
+    #[must_use]
+    #[inline]
+    fn quadratic_extension_square(a: &[Self; 2], w: F) -> [Self; 2] {
+        let a1_w = a[1].dup() * w;
+        [
+            Self::dot_product(a, &[a[0].dup(), a1_w]),
+            a[0].dup() * a[1].double(),
+        ]
+    }
+
+    /// Dot product between algebra elements and base field scalars.
+    ///
+    /// Given arrays `a` (algebra) and `f` (scalars), computes:
+    ///
+    /// ```text
+    ///   result = a[0]*f[0] + a[1]*f[1] + ... + a[N-1]*f[N-1]
+    /// ```
+    ///
+    /// Uses a tree-structured summation to minimize dependency chains and
+    /// maximize throughput on pipelined architectures.
+    #[must_use]
+    #[inline]
+    fn mixed_dot_product<const N: usize>(a: &[Self; N], f: &[F; N]) -> Self
+    where
+        F: Dup,
+    {
+        let products: [Self; N] = core::array::from_fn(|i| a[i].dup() * f[i].dup());
+        Self::sum_array::<N>(&products)
+    }
+
+    /// Optimal chunk size for [`batched_linear_combination`](Self::batched_linear_combination).
+    ///
+    /// Override in implementations where a different chunk size is faster.
+    /// Must be one of 1, 2, 4, 8, 16, 32, or 64; other values cause a compile error.
+    const BATCHED_LC_CHUNK: usize = 8;
+
+    /// Runtime-length linear combination: `Σ values[i] * coeffs[i]`.
+    ///
+    /// Like [`mixed_dot_product`](Self::mixed_dot_product) but for slices whose
+    /// length is not known at compile time. Processes in chunks of
+    /// [`BATCHED_LC_CHUNK`](Self::BATCHED_LC_CHUNK), delegating each chunk to
+    /// `mixed_dot_product` to leverage SIMD-specialized overrides.
+    #[must_use]
+    #[inline]
+    fn batched_linear_combination(values: &[Self], coeffs: &[F]) -> Self
+    where
+        F: Dup,
+    {
+        const {
+            assert!(
+                matches!(Self::BATCHED_LC_CHUNK, 1 | 2 | 4 | 8 | 16 | 32 | 64),
+                "BATCHED_LC_CHUNK must be one of 1, 2, 4, 8, 16, 32, or 64"
+            );
+        }
+        match Self::BATCHED_LC_CHUNK {
+            1 => chunked_linear_combination::<1, Self, F>(values, coeffs),
+            2 => chunked_linear_combination::<2, Self, F>(values, coeffs),
+            4 => chunked_linear_combination::<4, Self, F>(values, coeffs),
+            8 => chunked_linear_combination::<8, Self, F>(values, coeffs),
+            16 => chunked_linear_combination::<16, Self, F>(values, coeffs),
+            32 => chunked_linear_combination::<32, Self, F>(values, coeffs),
+            64 => chunked_linear_combination::<64, Self, F>(values, coeffs),
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Compute `Σ values[i] * coeffs[i]` over `N` pairs.
+///
+/// A single long sum forces every add to wait for the previous one. Instead,
+/// we split the pairs into groups of `CHUNK`, sum each group on its own, and
+/// add up the group totals. Several partial sums run in parallel on the CPU,
+/// so the total latency is shorter than one straight chain.
+///
+/// The result is the same for every valid `CHUNK` — only the speed changes.
+///
+/// # Layout
+///
+/// For `N = q * CHUNK + r` with `0 <= r < CHUNK`:
+///
+/// ```text
+///     ┌── group 0 ──┬── group 1 ──┬─ ... ─┬── tail (r) ──┐
+///     │   CHUNK     │   CHUNK     │       │   r pairs    │
+///     └──────┬──────┴──────┬──────┴───────┴──────┬───────┘
+///            ▼             ▼                     ▼
+///       tree-sum      tree-sum             scalar adds
+///            └──► acc ◄────┴──────► acc ◄────────┘
+/// ```
+///
+/// # Panics
+///
+/// Compile-time panic if `CHUNK` is zero.
+#[must_use]
+#[inline]
+pub fn chunked_mixed_dot_product<
+    const CHUNK: usize,
+    A: Algebra<F> + Dup,
+    F: Dup,
+    const N: usize,
+>(
+    values: &[A; N],
+    coeffs: &[F; N],
+) -> A {
+    // CHUNK = 0 would make the group count undefined.
+    const { assert!(CHUNK != 0, "chunked_mixed_dot_product requires CHUNK > 0") }
+
+    // Fast path: N fits in one group → single balanced tree, no outer loop.
+    if N <= CHUNK {
+        let products: [A; N] = core::array::from_fn(|i| values[i].dup() * coeffs[i].dup());
+        return A::sum_array::<N>(&products);
+    }
+
+    // Split off q complete groups; r leftover pairs go to the tail.
+    let (val_chunks, val_rem) = values.as_slice().as_chunks::<CHUNK>();
+    let (coeff_chunks, coeff_rem) = coeffs.as_slice().as_chunks::<CHUNK>();
+    debug_assert_eq!(val_chunks.len(), coeff_chunks.len());
+
+    // One add per group; runs in parallel with the next group's multiplies.
+    let mut acc = A::ZERO;
+    for (vc, cc) in zip(val_chunks, coeff_chunks) {
+        let products: [A; CHUNK] = core::array::from_fn(|i| vc[i].dup() * cc[i].dup());
+        // Balanced tree of depth log2(CHUNK), folded into acc.
+        acc += A::sum_array::<CHUNK>(&products);
+    }
+
+    // Tail: at most CHUNK - 1 pairs as a serial multiply-add chain.
+    debug_assert_eq!(val_rem.len(), coeff_rem.len());
+    for (v, c) in zip(val_rem, coeff_rem) {
+        acc += v.dup() * c.dup();
+    }
+    acc
+}
+
+/// Lower a runtime chunk size into a const-generic call to the fixed-chunk dot product.
+///
+/// Each backend picks its preferred chunk size at runtime; the inner routine
+/// needs it as a const for unrolling. This wrapper bridges the gap.
+///
+/// Supported sizes: `1, 2, 4, 8, 16, 32, 64` — powers of two only, so the
+/// inner balanced tree stays balanced.
+///
+/// # Panics
+///
+/// Runtime panic if `chunk` is outside the supported set.
+#[must_use]
+#[inline]
+pub fn dispatch_chunked_mixed_dot_product<A: Algebra<F> + Dup, F: Dup, const N: usize>(
+    values: &[A; N],
+    coeffs: &[F; N],
+    chunk: usize,
+) -> A {
+    match chunk {
+        1 => chunked_mixed_dot_product::<1, A, F, N>(values, coeffs),
+        2 => chunked_mixed_dot_product::<2, A, F, N>(values, coeffs),
+        4 => chunked_mixed_dot_product::<4, A, F, N>(values, coeffs),
+        8 => chunked_mixed_dot_product::<8, A, F, N>(values, coeffs),
+        16 => chunked_mixed_dot_product::<16, A, F, N>(values, coeffs),
+        32 => chunked_mixed_dot_product::<32, A, F, N>(values, coeffs),
+        64 => chunked_mixed_dot_product::<64, A, F, N>(values, coeffs),
+        // Unsupported chunk = configuration bug in a backend.
+        _ => panic!("mixed_dot_product chunk must be one of 1, 2, 4, 8, 16, 32, or 64"),
+    }
+}
+
+/// Linear combination over runtime-length slices, processing in chunks of `CHUNK`.
+///
+/// Computes `Σ values[i] * coeffs[i]` by batching into fixed-size chunks and
+/// delegating each to [`Algebra::mixed_dot_product`], which SIMD implementations
+/// override with fused multiply-accumulate intrinsics.
+///
+/// This is the implementation backing [`Algebra::batched_linear_combination`].
+/// Use it directly when overriding that method with a different chunk size.
+#[must_use]
+#[inline]
+pub fn chunked_linear_combination<const CHUNK: usize, A: Algebra<F> + Dup, F: Dup>(
+    values: &[A],
+    coeffs: &[F],
+) -> A {
+    const { assert!(CHUNK != 0, "chunked_linear_combination requires CHUNK > 0") }
+    assert_eq!(values.len(), coeffs.len());
+
+    let (val_chunks, val_rem) = values.as_chunks::<CHUNK>();
+    let (coeff_chunks, coeff_rem) = coeffs.as_chunks::<CHUNK>();
+
+    debug_assert_eq!(val_chunks.len(), coeff_chunks.len());
+    let mut acc = A::ZERO;
+    for (vc, cc) in zip(val_chunks, coeff_chunks) {
+        acc += A::mixed_dot_product::<CHUNK>(vc, cc);
+    }
+
+    debug_assert_eq!(val_rem.len(), coeff_rem.len());
+    if !val_rem.is_empty() {
+        acc = linear_combination_tail(acc, val_rem, coeff_rem);
+    }
+    acc
+}
+
+/// Add `sum_i values[i] * coeffs[i]` to `acc`, one pair at a time.
+///
+/// It sums the fewer than `CHUNK` pairs left after the blocks.
+///
+/// On AArch64 it stays out of line so that its loop does not disturb the block loop.
+///
+/// Inlined there, it makes a 1024-term `Poly192 x Poly64` combination 3.7x slower.
+///
+/// Elsewhere it is inlined, which saves the call on short slices.
+#[cfg_attr(target_arch = "aarch64", inline(never))]
+#[cfg_attr(not(target_arch = "aarch64"), inline)]
+fn linear_combination_tail<A: Algebra<F> + Dup, F: Dup>(
+    mut acc: A,
+    values: &[A],
+    coeffs: &[F],
+) -> A {
+    for (v, c) in zip(values, coeffs) {
+        acc += v.dup() * c.dup();
+    }
+    acc
+}
+
+// Every ring is an algebra over itself.
+impl<R: PrimeCharacteristicRing> Algebra<R> for R {
+    #[inline]
+    fn mixed_dot_product<const N: usize>(a: &[Self; N], f: &[R; N]) -> Self {
+        // Scalars and algebra elements are the same type here, so the ring's own
+        // dot product accepts both sides unchanged.
+        //
+        //     mixed dot product over (R, R)  ==  R's own dot product
+        //
+        // That primitive is where delayed reduction lives: a ring that can accumulate
+        // `N` products in an unreduced representation reduces once instead of `N` times.
+        // Without this delegation the generic tile kernels would never see it.
+        Self::dot_product::<N>(a, f)
+    }
+}
+
+/// A collection of methods designed to help hash field elements.
+///
+/// Most fields will want to reimplement many/all of these methods as the default implementations
+/// are slow and involve converting to/from byte representations.
+pub trait RawDataSerializable: Sized {
+    /// The number of bytes which this field element occupies in memory.
+    /// Must be equal to the length of self.into_bytes().
+    const NUM_BYTES: usize;
+
+    /// Convert a field element into a collection of bytes.
+    #[must_use]
+    fn into_bytes(self) -> impl IntoIterator<Item = u8>;
+
+    /// Borrow the serialized bytes of a slice when its memory layout matches the encoding.
+    ///
+    /// If provided, the bytes must match `into_byte_stream` in both order and contents,
+    /// with exactly `input.len() * Self::NUM_BYTES` bytes. Matching the element size alone
+    /// is insufficient: padding, byte order, and the stored representation must also match.
+    /// The default retains the iterator-based serialization path.
+    #[must_use]
+    #[inline]
+    fn as_serialized_bytes(_input: &[Self]) -> Option<&[u8]> {
+        None
+    }
+
+    /// Convert an iterator of field elements into an iterator of bytes.
+    #[must_use]
+    fn into_byte_stream(input: impl IntoIterator<Item = Self>) -> impl IntoIterator<Item = u8> {
+        input.into_iter().flat_map(|elem| elem.into_bytes())
+    }
+
+    /// Convert an iterator of field elements into an iterator of u32s.
+    ///
+    /// If `NUM_BYTES` does not divide `4`, multiple `F`s may be packed together to make a single `u32`. Furthermore,
+    /// if `NUM_BYTES * input.len()` does not divide `4`, the final `u32` will involve padding bytes which are set to `0`.
+    #[must_use]
+    fn into_u32_stream(input: impl IntoIterator<Item = Self>) -> impl IntoIterator<Item = u32> {
+        let bytes = Self::into_byte_stream(input);
+        iter_array_chunks_padded(bytes, 0).map(u32::from_le_bytes)
+    }
+
+    /// Convert an iterator of field elements into an iterator of u64s.
+    ///
+    /// If `NUM_BYTES` does not divide `8`, multiple `F`s may be packed together to make a single `u64`. Furthermore,
+    /// if `NUM_BYTES * input.len()` does not divide `8`, the final `u64` will involve padding bytes which are set to `0`.
+    #[must_use]
+    fn into_u64_stream(input: impl IntoIterator<Item = Self>) -> impl IntoIterator<Item = u64> {
+        let bytes = Self::into_byte_stream(input);
+        iter_array_chunks_padded(bytes, 0).map(u64::from_le_bytes)
+    }
+
+    /// Convert an iterator of field element arrays into an iterator of byte arrays.
+    ///
+    /// Converts an element `[F; N]` into the byte array `[[u8; N]; NUM_BYTES]`. This is
+    /// intended for use with vectorized hash functions which use vector operations
+    /// to compute several hashes in parallel.
+    #[must_use]
+    fn into_parallel_byte_streams<const N: usize>(
+        input: impl IntoIterator<Item = [Self; N]>,
+    ) -> impl IntoIterator<Item = [u8; N]> {
+        input.into_iter().flat_map(|vector| {
+            let bytes = vector.map(|elem| elem.into_bytes().into_iter().collect::<Vec<_>>());
+            (0..Self::NUM_BYTES).map(move |i| array::from_fn(|j| bytes[j][i]))
+        })
+    }
+
+    /// Convert an iterator of field element arrays into an iterator of u32 arrays.
+    ///
+    /// Converts an element `[F; N]` into the u32 array `[[u32; N]; NUM_BYTES/4]`. This is
+    /// intended for use with vectorized hash functions which use vector operations
+    /// to compute several hashes in parallel.
+    ///
+    /// This function is guaranteed to be equivalent to starting with `Iterator<[F; N]>` performing a transpose
+    /// operation to get `[Iterator<F>; N]`, calling `into_u32_stream` on each element to get `[Iterator<u32>; N]` and then
+    /// performing another transpose operation to get `Iterator<[u32; N]>`.
+    ///
+    /// If `NUM_BYTES` does not divide `4`, multiple `[F; N]`s may be packed together to make a single `[u32; N]`. Furthermore,
+    /// if `NUM_BYTES * input.len()` does not divide `4`, the final `[u32; N]` will involve padding bytes which are set to `0`.
+    #[must_use]
+    fn into_parallel_u32_streams<const N: usize>(
+        input: impl IntoIterator<Item = [Self; N]>,
+    ) -> impl IntoIterator<Item = [u32; N]> {
+        let bytes = Self::into_parallel_byte_streams(input);
+        iter_array_chunks_padded(bytes, [0; N]).map(|byte_array: [[u8; N]; 4]| {
+            array::from_fn(|i| u32::from_le_bytes(array::from_fn(|j| byte_array[j][i])))
+        })
+    }
+
+    /// Convert an iterator of field element arrays into an iterator of u64 arrays.
+    ///
+    /// Converts an element `[F; N]` into the u64 array `[[u64; N]; NUM_BYTES/8]`. This is
+    /// intended for use with vectorized hash functions which use vector operations
+    /// to compute several hashes in parallel.
+    ///
+    /// This function is guaranteed to be equivalent to starting with `Iterator<[F; N]>` performing a transpose
+    /// operation to get `[Iterator<F>; N]`, calling `into_u64_stream` on each element to get `[Iterator<u64>; N]` and then
+    /// performing another transpose operation to get `Iterator<[u64; N]>`.
+    ///
+    /// If `NUM_BYTES` does not divide `8`, multiple `[F; N]`s may be packed together to make a single `[u64; N]`. Furthermore,
+    /// if `NUM_BYTES * input.len()` does not divide `8`, the final `[u64; N]` will involve padding bytes which are set to `0`.
+    #[must_use]
+    fn into_parallel_u64_streams<const N: usize>(
+        input: impl IntoIterator<Item = [Self; N]>,
+    ) -> impl IntoIterator<Item = [u64; N]> {
+        let bytes = Self::into_parallel_byte_streams(input);
+        iter_array_chunks_padded(bytes, [0; N]).map(|byte_array: [[u8; N]; 8]| {
+            array::from_fn(|i| u64::from_le_bytes(array::from_fn(|j| byte_array[j][i])))
+        })
+    }
+}
+
+/// A field `F`. This permits both modular fields `ℤ/p` along with their field extensions.
+///
+/// A ring is a field if every element `x` has a unique multiplicative inverse `x^{-1}`
+/// which satisfies `x * x^{-1} = F::ONE`.
 pub trait Field:
-    FieldAlgebra<F = Self>
+    Algebra<Self>
+    + RawDataSerializable
     + Packable
     + 'static
     + Copy
     + Div<Self, Output = Self>
+    + DivAssign
+    + Add<Self::Packing, Output = Self::Packing>
+    + Sub<Self::Packing, Output = Self::Packing>
+    + Mul<Self::Packing, Output = Self::Packing>
     + Eq
     + Hash
     + Send
@@ -307,39 +1143,59 @@ pub trait Field:
 {
     type Packing: PackedField<Scalar = Self>;
 
-    /// A generator of this field's entire multiplicative group.
+    /// A generator of this field's multiplicative group.
     const GENERATOR: Self;
 
-    /// A generator of this field's entire multiplicative group.
-    #[inline(always)]
-    fn generator() -> Self {
-        Self::GENERATOR
+    /// Whether evaluating multiple packed vectors of this field in lockstep (to overlap
+    /// independent dependency chains and hide packed-multiplication latency) is expected
+    /// to help throughput for this field.
+    ///
+    /// Only [`p3_uni_stark::quotient_values`](https://docs.rs/p3-uni-stark)'s `aarch64`
+    /// (`neon`)-gated path reads this constant; on every other target it has no effect,
+    /// so leaving it at the default is always safe there.
+    ///
+    /// Defaults to `false`, so fields fail safe into the plain (non-lockstep) path unless
+    /// explicitly measured to benefit. Override to `true` only once benchmarks confirm the
+    /// field's packed multiplication is latency-bound enough for lockstep evaluation to help.
+    const BENEFITS_FROM_LOCKSTEP_EVALUATION: bool = false;
+
+    /// Prepares a target-specific expansion of 64 bit-plane words into 64 weighted sums.
+    ///
+    /// For lane `l`, the prepared operation appends the sum of `weights[c]` for every corner
+    /// `c` whose word has bit `l` set. Unsupported fields and targets return `None` so callers
+    /// retain their portable path.
+    #[must_use]
+    fn prepare_bit_plane_expansion(
+        weights: &[Self; 64],
+    ) -> Option<impl Fn(&[u64; 64], &mut Vec<Self>) + Send + Sync + 'static> {
+        let _ = weights;
+        None::<fn(&[u64; 64], &mut Vec<Self>)>
     }
 
+    /// Prepares a target-specific expansion of 16 bit-plane words into 64 weighted sums.
+    ///
+    /// As with [`Self::prepare_bit_plane_expansion`], each input word holds one bit per output
+    /// lane. Unsupported fields and targets return `None` to retain the portable path.
+    #[must_use]
+    fn prepare_bit_plane_expansion_16(
+        weights: &[Self; 16],
+    ) -> Option<impl Fn(&[u64; 16], &mut Vec<Self>) + Send + Sync + 'static> {
+        let _ = weights;
+        None::<fn(&[u64; 16], &mut Vec<Self>)>
+    }
+
+    /// Check if the given field element is equal to the unique additive identity (ZERO).
+    #[must_use]
+    #[inline]
     fn is_zero(&self) -> bool {
         *self == Self::ZERO
     }
 
+    /// Check if the given field element is equal to the unique multiplicative identity (ONE).
+    #[must_use]
+    #[inline]
     fn is_one(&self) -> bool {
         *self == Self::ONE
-    }
-
-    /// self / 2^exp
-    #[must_use]
-    #[inline]
-    fn div_2exp_u64(&self, exp: u64) -> Self {
-        *self / Self::TWO.exp_u64(exp)
-    }
-
-    /// Exponentiation by a `u64` power. This is similar to `exp_u64`, but more general in that it
-    /// can be used with `FieldAlgebra`s, not just this concrete field.
-    ///
-    /// The default implementation uses naive square and multiply. Implementations may want to
-    /// override this and handle certain powers with more optimal addition chains.
-    #[must_use]
-    #[inline]
-    fn exp_u64_generic<FA: FieldAlgebra<F = Self>>(val: FA, power: u64) -> FA {
-        exp_u64_by_squaring(val, power)
     }
 
     /// The multiplicative inverse of this field element, if it exists.
@@ -348,205 +1204,262 @@ pub trait Field:
     #[must_use]
     fn try_inverse(&self) -> Option<Self>;
 
+    /// The multiplicative inverse of this field element.
+    ///
+    /// # Panics
+    /// The function will panic if the field element is `0`.
+    /// Use try_inverse if you want to handle this case.
     #[must_use]
     fn inverse(&self) -> Self {
         self.try_inverse().expect("Tried to invert zero")
     }
 
-    /// Computes input/2.
-    /// Should be overwritten by most field implementations to use bitshifts.
-    /// Will error if the field characteristic is 2.
+    /// A square root of this field element, if one exists.
+    ///
+    /// Returns `Some(r)` with `r * r == *self` when this element is a quadratic
+    /// residue, and `None` when it is a quadratic non-residue. `ZERO` returns
+    /// `Some(ZERO)`. When two square roots exist, which one is returned is
+    /// unspecified.
+    ///
+    /// The default implementation uses the Tonelli–Shanks algorithm. Fields with
+    /// a more direct formula (e.g. those with `|F| ≡ 3 mod 4`) may override it.
     #[must_use]
-    fn halve(&self) -> Self {
-        let half = Self::TWO
-            .try_inverse()
-            .expect("Cannot divide by 2 in fields with characteristic 2");
-        *self * half
+    fn try_sqrt(&self) -> Option<Self> {
+        crate::sqrt::tonelli_shanks(*self)
     }
 
+    /// The `i`-th element of a fixed injective enumeration of `Self`, used as an
+    /// interpolation node. Must satisfy `interpolation_node(0) == ZERO` and
+    /// `interpolation_node(1) == ONE`, and be injective for every `i` below the size
+    /// of the field — no enumeration can do better, and a field smaller than the
+    /// degree of the polynomial being interpolated is unusable for that protocol
+    /// anyway. Round-polynomial degrees are tiny, so `0..min(64, |Self|)` is the
+    /// tested range.
+    ///
+    /// The default maps `i` through the prime subfield and is injective only while
+    /// `i` is below the characteristic. Fields of characteristic below `2^32` must
+    /// override it.
+    #[must_use]
+    fn interpolation_node(i: usize) -> Self {
+        Self::from_usize(i)
+    }
+
+    /// Add two slices of field elements together, returning the result in the first slice.
+    ///
+    /// Makes use of packing to speed up the addition.
+    ///
+    /// This is optimal for cases where the two slices are small to medium length. E.g. between
+    /// `F::Packing::WIDTH` and roughly however many elements fit in a cache line.
+    ///
+    /// For larger slices, it's likely worthwhile to use parallelization before calling this.
+    /// Similarly if you need to add a large number of slices together, it's best to
+    /// break them into small chunks and call this on the smaller chunks.
+    ///
+    /// # Panics
+    /// The function will panic if the lengths of the two slices are not equal.
+    #[inline]
+    fn add_slices(slice_1: &mut [Self], slice_2: &[Self]) {
+        let (shorts_1, suffix_1) = Self::Packing::pack_slice_with_suffix_mut(slice_1);
+        let (shorts_2, suffix_2) = Self::Packing::pack_slice_with_suffix(slice_2);
+        debug_assert_eq!(shorts_1.len(), shorts_2.len());
+        debug_assert_eq!(suffix_1.len(), suffix_2.len());
+        for (x_1, &x_2) in shorts_1.iter_mut().zip(shorts_2) {
+            *x_1 += x_2;
+        }
+        for (x_1, &x_2) in suffix_1.iter_mut().zip(suffix_2) {
+            *x_1 += x_2;
+        }
+    }
+
+    /// Accumulate `acc[c * N + j] += scales[j] * row[c]` over a stream of packed rows.
+    ///
+    /// Each item provides one matrix row as `acc.len() / N` packed base-field words,
+    /// together with the row's `N` extension-field weights. `acc` is laid out with the
+    /// `N` weights of each word group adjacent, and its length must be a multiple of `N`.
+    ///
+    /// This is the inner kernel of batched columnwise (weighted-sum-of-rows) dot
+    /// products. Fields may override it to defer modular reductions across rows.
+    fn batched_columnwise_dot_product<EF, R, I, const N: usize>(
+        acc: &mut [EF::ExtensionPacking],
+        items: I,
+    ) where
+        EF: ExtensionField<Self>,
+        R: Iterator<Item = Self::Packing>,
+        I: Iterator<Item = (R, [EF; N])>,
+    {
+        generic_batched_columnwise_dot_product::<Self, EF, R, I, N>(acc, items);
+    }
+
+    /// The number of elements in the field.
+    ///
+    /// This will either be prime if the field is a PrimeField or a power of a
+    /// prime if the field is an extension field.
+    #[must_use]
     fn order() -> BigUint;
 
-    /// A list of (factor, exponent) pairs.
-    fn multiplicative_group_factors() -> Vec<(BigUint, usize)> {
-        let primality_test = MillerRabin { error_bits: 128 };
-        let composite_splitter = PollardRho;
-        let factorizer = FactorizerFromSplitter {
-            primality_test,
-            composite_splitter,
-        };
-        let n = Self::order() - BigUint::one();
-        factorizer.factor_counts(&n)
-    }
-
+    /// The number of bits required to define an element of this field.
+    ///
+    /// Usually due to storage and practical reasons the memory size of
+    /// a field element will be a little larger than bits().
+    #[must_use]
     #[inline]
     fn bits() -> usize {
         Self::order().bits() as usize
     }
 }
 
-pub trait PrimeField: Field + Ord {
+/// The generic accumulation behind [`Field::batched_columnwise_dot_product`]:
+/// `acc[c * N + j] += scales[j] * row[c]` over a stream of packed rows.
+///
+/// Kept as a free function so that specialized `Field` implementations can fall back
+/// to it for extension degrees their kernels do not cover.
+pub fn generic_batched_columnwise_dot_product<F, EF, R, I, const N: usize>(
+    acc: &mut [EF::ExtensionPacking],
+    items: I,
+) where
+    F: Field,
+    EF: ExtensionField<F>,
+    R: Iterator<Item = F::Packing>,
+    I: Iterator<Item = (R, [EF; N])>,
+{
+    for (row, scales) in items {
+        let packed_scales = scales.map(EF::ExtensionPacking::from);
+        for (acc_c, r) in acc.as_chunks_mut::<N>().0.iter_mut().zip(row) {
+            for (a, &s) in acc_c.iter_mut().zip(&packed_scales) {
+                *a += s * r;
+            }
+        }
+    }
+}
+
+/// A field isomorphic to `ℤ/p` for some prime `p`.
+///
+/// There is a natural map from `ℤ` to `ℤ/p` which sends an integer `r` to its conjugacy class `[r]`.
+/// Canonically, each conjugacy class `[r]` can be represented by the unique integer `s` in `[0, p - 1)`
+/// satisfying `s = r mod p`. This however is often not the most convenient computational representation
+/// and so internal representations of field elements might differ from this and may change over time.
+pub trait PrimeField:
+    Field
+    + Ord
+    + QuotientMap<u8>
+    + QuotientMap<u16>
+    + QuotientMap<u32>
+    + QuotientMap<u64>
+    + QuotientMap<u128>
+    + QuotientMap<usize>
+    + QuotientMap<i8>
+    + QuotientMap<i16>
+    + QuotientMap<i32>
+    + QuotientMap<i64>
+    + QuotientMap<i128>
+    + QuotientMap<isize>
+{
+    /// Return the representative of `value` in canonical form
+    /// which lies in the range `0 <= x < self.order()`.
+    #[must_use]
     fn as_canonical_biguint(&self) -> BigUint;
 }
 
-/// A prime field of order less than `2^64`.
+/// A prime field `ℤ/p` with order, `p < 2^64`.
 pub trait PrimeField64: PrimeField {
     const ORDER_U64: u64;
 
-    /// Return the representative of `value` that is less than `ORDER_U64`.
+    /// Return the representative of `value` in canonical form
+    /// which lies in the range `0 <= x < ORDER_U64`.
+    #[must_use]
     fn as_canonical_u64(&self) -> u64;
+
+    /// Convert a field element to a `u64` such that any two field elements
+    /// are converted to the same `u64` if and only if they represent the same value.
+    ///
+    /// This will be the fastest way to convert a field element to a `u64` and
+    /// is intended for use in hashing. It will also be consistent across different targets.
+    #[must_use]
+    #[inline(always)]
+    fn to_unique_u64(&self) -> u64 {
+        // A simple default which is optimal for some fields.
+        self.as_canonical_u64()
+    }
 }
 
-/// A prime field of order less than `2^32`.
+/// A prime field `ℤ/p` with order `p < 2^32`.
 pub trait PrimeField32: PrimeField64 {
     const ORDER_U32: u32;
 
-    /// Return the representative of `value` that is less than `ORDER_U32`.
+    /// Return the representative of `value` in canonical form
+    /// which lies in the range `0 <= x < ORDER_U64`.
+    #[must_use]
     fn as_canonical_u32(&self) -> u32;
-}
 
-/// A commutative algebra over an extension field.
-///
-/// Mathematically, this trait captures a slightly more interesting structure than the above one liner.
-/// As implemented here, A FieldExtensionAlgebra `FEA` over and extension field `EF` is
-/// really the result of applying extension of scalars to a FieldAlgebra `FA` to lift `FA`
-/// from an algebra over `F` to an algebra over `EF` and so `FEA = EF ⊗ FA` where the tensor
-/// product is over `F`.
-pub trait FieldExtensionAlgebra<Base: FieldAlgebra>:
-    FieldAlgebra
-    + From<Base>
-    + Add<Base, Output = Self>
-    + AddAssign<Base>
-    + Sub<Base, Output = Self>
-    + SubAssign<Base>
-    + Mul<Base, Output = Self>
-    + MulAssign<Base>
-{
-    const D: usize;
-
-    fn from_base(b: Base) -> Self;
-
-    /// Suppose this field extension is represented by the quotient
-    /// ring B[X]/(f(X)) where B is `Base` and f is an irreducible
-    /// polynomial of degree `D`. This function takes a slice `bs` of
-    /// length at exactly D, and constructs the field element
-    /// \sum_i bs[i] * X^i.
+    /// Convert a field element to a `u32` such that any two field elements
+    /// are converted to the same `u32` if and only if they represent the same value.
     ///
-    /// NB: The value produced by this function fundamentally depends
-    /// on the choice of irreducible polynomial f. Care must be taken
-    /// to ensure portability if these values might ever be passed to
-    /// (or rederived within) another compilation environment where a
-    /// different f might have been used.
-    fn from_base_slice(bs: &[Base]) -> Self;
-
-    /// Similar to `core:array::from_fn`, with the same caveats as
-    /// `from_base_slice`.
-    fn from_base_fn<F: FnMut(usize) -> Base>(f: F) -> Self;
-    fn from_base_iter<I: Iterator<Item = Base>>(iter: I) -> Self;
-
-    /// Suppose this field extension is represented by the quotient
-    /// ring B[X]/(f(X)) where B is `Base` and f is an irreducible
-    /// polynomial of degree `D`. This function takes a field element
-    /// \sum_i bs[i] * X^i and returns the coefficients as a slice
-    /// `bs` of length at most D containing, from lowest degree to
-    /// highest.
-    ///
-    /// NB: The value produced by this function fundamentally depends
-    /// on the choice of irreducible polynomial f. Care must be taken
-    /// to ensure portability if these values might ever be passed to
-    /// (or rederived within) another compilation environment where a
-    /// different f might have been used.
-    fn as_base_slice(&self) -> &[Base];
-
-    /// Suppose this field extension is represented by the quotient
-    /// ring B[X]/(f(X)) where B is `Base` and f is an irreducible
-    /// polynomial of degree `D`. This function returns the field
-    /// element `X^exponent` if `exponent < D` and panics otherwise.
-    /// (The fact that f is not known at the point that this function
-    /// is defined prevents implementing exponentiation of higher
-    /// powers since the reduction cannot be performed.)
-    ///
-    /// NB: The value produced by this function fundamentally depends
-    /// on the choice of irreducible polynomial f. Care must be taken
-    /// to ensure portability if these values might ever be passed to
-    /// (or rederived within) another compilation environment where a
-    /// different f might have been used.
-    fn monomial(exponent: usize) -> Self {
-        assert!(exponent < Self::D, "requested monomial of too high degree");
-        let mut vec = vec![Base::ZERO; Self::D];
-        vec[exponent] = Base::ONE;
-        Self::from_base_slice(&vec)
-    }
-}
-
-pub trait ExtensionField<Base: Field>: Field + FieldExtensionAlgebra<Base> {
-    type ExtensionPacking: FieldExtensionAlgebra<Base::Packing, F = Self>
-        + 'static
-        + Copy
-        + Send
-        + Sync;
-
+    /// This will be the fastest way to convert a field element to a `u32` and
+    /// is intended for use in hashing. It will also be consistent across different targets.
+    #[must_use]
     #[inline(always)]
-    fn is_in_basefield(&self) -> bool {
-        self.as_base_slice()[1..].iter().all(Field::is_zero)
-    }
-
-    fn as_base(&self) -> Option<Base> {
-        if self.is_in_basefield() {
-            Some(self.as_base_slice()[0])
-        } else {
-            None
-        }
-    }
-
-    /// Construct an iterator which returns powers of `self` packed into `ExtensionPacking` elements.
-    ///
-    /// E.g. if `PACKING::WIDTH = 4` this returns the elements:
-    /// `[self^0, self^1, self^2, self^3], [self^4, self^5, self^6, self^7], ...`.
-    fn ext_powers_packed(&self) -> Powers<Self::ExtensionPacking> {
-        let powers = self.powers().take(Base::Packing::WIDTH + 1).collect_vec();
-        // Transpose first WIDTH powers
-        let current = Self::ExtensionPacking::from_base_fn(|i| {
-            Base::Packing::from_fn(|j| powers[j].as_base_slice()[i])
-        });
-        // Broadcast self^WIDTH
-        let multiplier = Self::ExtensionPacking::from_base_fn(|i| {
-            Base::Packing::from(powers[Base::Packing::WIDTH].as_base_slice()[i])
-        });
-
-        Powers {
-            base: multiplier,
-            current,
-        }
+    fn to_unique_u32(&self) -> u32 {
+        // A simple default which is optimal for some fields.
+        self.as_canonical_u32()
     }
 }
 
+/// A field `EF` which is also an algebra over a field `F`.
+///
+/// This provides a couple of convenience methods on top of the
+/// standard methods provided by `Field`, `Algebra<F>` and `BasedVectorSpace<F>`.
+///
+/// It also provides a type which handles packed vectors of extension field elements.
+pub trait ExtensionField<Base: Field>:
+    Field + Algebra<Base> + BasedVectorSpace<Base> + AlgebraIdentity<Base>
+{
+    type ExtensionPacking: PackedFieldExtension<Base, Self> + 'static + Copy + Send + Sync;
+
+    /// Determine if the given element lies in the base field.
+    #[must_use]
+    fn is_in_basefield(&self) -> bool;
+
+    /// If the element lies in the base field project it down.
+    /// Otherwise return None.
+    #[must_use]
+    fn as_base(&self) -> Option<Base>;
+
+    /// Reassemble an element of `Self` from `D = DIMENSION` coefficients in `Self`
+    /// via `Σⱼ basisⱼ · coeffsⱼ`. Returns `None` if `coeffs.len() != Self::DIMENSION`.
+    ///
+    /// This is the `Self`-coefficient counterpart to
+    /// [`BasedVectorSpace::from_basis_coefficients_slice`], which takes coefficients
+    /// in `Base`. It is the natural "lifting" operation in commit-and-open protocols:
+    /// if an extension polynomial decomposes as `f(X) = Σⱼ basisⱼ · fⱼ(X)` with
+    /// `fⱼ` over `Base`, then `f(z) = Σⱼ basisⱼ · fⱼ(z)` for any `z ∈ Self`.
+    #[inline]
+    #[must_use]
+    fn from_ext_basis_coefficients(coeffs: &[Self]) -> Option<Self> {
+        (coeffs.len() == Self::DIMENSION).then(|| {
+            (0..Self::DIMENSION)
+                .map(|j| Self::ith_basis_element(j).unwrap() * coeffs[j])
+                .sum()
+        })
+    }
+}
+
+// Every field is trivially a one dimensional extension over itself.
 impl<F: Field> ExtensionField<F> for F {
     type ExtensionPacking = F::Packing;
-}
 
-impl<FA: FieldAlgebra> FieldExtensionAlgebra<FA> for FA {
-    const D: usize = 1;
-
-    fn from_base(b: FA) -> Self {
-        b
+    #[inline]
+    fn is_in_basefield(&self) -> bool {
+        true
     }
 
-    fn from_base_slice(bs: &[FA]) -> Self {
-        assert_eq!(bs.len(), 1);
-        bs[0].clone()
+    #[inline]
+    fn as_base(&self) -> Option<F> {
+        Some(*self)
     }
 
-    fn from_base_iter<I: Iterator<Item = FA>>(mut iter: I) -> Self {
-        iter.next().unwrap()
-    }
-
-    fn from_base_fn<F: FnMut(usize) -> FA>(mut f: F) -> Self {
-        f(0)
-    }
-
-    #[inline(always)]
-    fn as_base_slice(&self) -> &[FA] {
-        slice::from_ref(self)
+    #[inline]
+    fn from_ext_basis_coefficients(coeffs: &[Self]) -> Option<Self> {
+        (coeffs.len() == 1).then(|| coeffs[0])
     }
 }
 
@@ -558,23 +1471,184 @@ pub trait TwoAdicField: Field {
 
     /// Returns a generator of the multiplicative group of order `2^bits`.
     /// Assumes `bits <= TWO_ADICITY`, otherwise the result is undefined.
+    ///
+    /// Generators must be nested: squaring the generator for `bits + 1` gives the generator for `bits`.
+    ///
+    /// FFTs rely on this to share one twiddle table across all sizes.
     #[must_use]
     fn two_adic_generator(bits: usize) -> Self;
 }
 
 /// An iterator which returns the powers of a base element `b` shifted by current `c`: `c, c * b, c * b^2, ...`.
 #[derive(Clone, Debug)]
-pub struct Powers<F> {
-    pub base: F,
-    pub current: F,
+pub struct Powers<R: PrimeCharacteristicRing> {
+    pub base: R,
+    pub current: R,
 }
 
-impl<FA: FieldAlgebra> Iterator for Powers<FA> {
-    type Item = FA;
+impl<R: PrimeCharacteristicRing> Iterator for Powers<R> {
+    type Item = R;
 
-    fn next(&mut self) -> Option<FA> {
-        let result = self.current.clone();
-        self.current = self.current.clone() * self.base.clone();
+    fn next(&mut self) -> Option<R> {
+        let result = self.current.dup();
+        self.current *= self.base.dup();
         Some(result)
+    }
+}
+
+impl<R: PrimeCharacteristicRing> Powers<R> {
+    /// Returns an iterator yielding the first `n` powers.
+    #[inline]
+    #[must_use]
+    pub const fn take(self, n: usize) -> BoundedPowers<R> {
+        BoundedPowers { iter: self, n }
+    }
+
+    /// Fills `slice` with the next `slice.len()` powers yielded by the iterator.
+    #[inline]
+    pub fn fill(self, slice: &mut [R]) {
+        slice
+            .iter_mut()
+            .zip(self)
+            .for_each(|(out, next)| *out = next);
+    }
+}
+
+impl<F: Field> Powers<F> {
+    /// Wrapper for `self.take(n).collect()`.
+    ///
+    /// Bounded to `F: Field` on purpose: the body resolves `.collect()` to the inherent
+    /// [`BoundedPowers::collect`] SIMD fast path, which only exists under `F: Field`.
+    /// Defining this method under a wider bound (e.g. `PrimeCharacteristicRing`) would
+    /// silently fall back to `Iterator::collect` and bypass packed-field acceleration.
+    #[inline]
+    #[must_use]
+    pub fn collect_n(self, n: usize) -> Vec<F> {
+        self.take(n).collect()
+    }
+}
+
+impl<F: Field> BoundedPowers<F> {
+    /// Collect exactly `num_powers` ascending powers of `self.base`, starting at `self.current`.
+    ///
+    /// # Details
+    ///
+    /// Each chunk is computed using packed fields.
+    ///
+    /// The shared task-size policy picks the chunk length.
+    ///
+    /// A request too short to pay for a dispatch is filled on the calling thread.
+    ///
+    /// # Performance
+    ///
+    /// Enable the `parallel` feature to enable parallelization.
+    #[must_use]
+    pub fn collect(self) -> Vec<F> {
+        let num_powers = self.n;
+
+        // When num_powers is small, fallback to serial computation
+        if num_powers < 16 {
+            return self.take(num_powers).collect();
+        }
+
+        // Allocate buffer storing packed powers, containing at least `num_powers` scalars.
+        let width = F::Packing::WIDTH;
+        let num_packed = num_powers.div_ceil(width);
+        let mut points_packed = F::Packing::zero_vec(num_packed);
+
+        let base = self.iter.base;
+        let shift = self.iter.current;
+
+        // One item writes a packed element and reads none.
+        // It therefore moves exactly that element's width.
+        //
+        // One number answers both questions this fill has:
+        //
+        //     chunk >= total  ->  fill the whole buffer on this thread
+        //     chunk <  total  ->  packed elements one parallel chunk holds
+        let chunk_size = min_task_len(num_packed, size_of::<F::Packing>());
+
+        if chunk_size >= num_packed {
+            fill_packed_shifted_powers(base, shift, &mut points_packed);
+        } else {
+            // Precompute base for each chunk.
+            let chunk_base = base.exp_u64((chunk_size * width) as u64);
+
+            points_packed
+                .par_chunks_mut(chunk_size)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk_slice)| {
+                    // First power in this chunk
+                    let chunk_start = shift * chunk_base.exp_u64(chunk_idx as u64);
+
+                    // Fill the chunk with packed powers.
+                    fill_packed_shifted_powers(base, chunk_start, chunk_slice);
+                });
+        }
+
+        // return the number of requested points, discarding the unused packed powers
+        // SAFETY: size_of::<F::Packing> always divides size_of::<F::Packing>.
+        let mut points = unsafe { flatten_to_base(points_packed) };
+        points.truncate(num_powers);
+        points
+    }
+}
+
+/// Number of independent multiplication chains advanced together by [`fill_packed_shifted_powers`].
+const NUM_POWER_CHAINS: usize = 8;
+
+/// Fill `out` with `start, start * base, start * base^2, ...` packed into `P`.
+///
+/// Packed output `i` comes from chain `i % NUM_POWER_CHAINS`, and each chain steps by
+/// `base^(NUM_POWER_CHAINS * P::WIDTH)`. The chains are independent of each other, so
+/// their multiplications can overlap in the pipeline. Outputs shorter than two rounds
+/// are filled by a single chain, as setting up the others would cost more than it saves.
+fn fill_packed_shifted_powers<P: PackedField>(base: P::Scalar, start: P::Scalar, out: &mut [P]) {
+    let mut powers = P::packed_shifted_powers(base, start);
+    if out.len() < 2 * NUM_POWER_CHAINS {
+        powers.fill(out);
+        return;
+    }
+
+    let mut chains: [P; NUM_POWER_CHAINS] = array::from_fn(|_| powers.next().unwrap());
+    let step: P = base.exp_u64((NUM_POWER_CHAINS * P::WIDTH) as u64).into();
+
+    let (rounds, tail) = out.as_chunks_mut::<NUM_POWER_CHAINS>();
+    for round in rounds {
+        *round = chains;
+        for chain in &mut chains {
+            *chain *= step;
+        }
+    }
+    tail.copy_from_slice(&chains[..tail.len()]);
+}
+
+/// Same as [`Powers`], but returns a bounded number of powers.
+#[derive(Clone, Debug)]
+pub struct BoundedPowers<R: PrimeCharacteristicRing> {
+    iter: Powers<R>,
+    n: usize,
+}
+
+impl<R: PrimeCharacteristicRing> Iterator for BoundedPowers<R> {
+    type Item = R;
+
+    fn next(&mut self) -> Option<R> {
+        (self.n != 0).then(|| {
+            self.n -= 1;
+            self.iter.next().unwrap()
+        })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.n, Some(self.n))
+    }
+}
+
+impl<R: PrimeCharacteristicRing> ExactSizeIterator for BoundedPowers<R> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.n
     }
 }

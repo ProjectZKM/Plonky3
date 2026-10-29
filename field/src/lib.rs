@@ -1,20 +1,38 @@
-//! A framework for finite fields.
-
+#![doc = include_str!("../README.md")]
 #![no_std]
 
 extern crate alloc;
 
 mod array;
 mod batch_inverse;
-mod exponentiation;
+pub mod coset;
+mod dup;
+pub mod exponentiation;
 pub mod extension;
 mod field;
 mod helpers;
+pub mod integers;
+pub mod op_assign_macros;
 mod packed;
+mod sqrt;
+mod subfield;
+mod vectorized;
 
+pub use BasedVectorSpace as FieldExtensionAlgebra;
+// Backward-compatible aliases for the old Plonky3 API names.
+pub use PrimeCharacteristicRing as FieldAlgebra;
 pub use array::*;
 pub use batch_inverse::*;
-pub use exponentiation::*;
+pub use dup::Dup;
+pub use exponentiation::FixedBase;
 pub use field::*;
 pub use helpers::*;
 pub use packed::*;
+// Re-exported so the macros this crate exports can name the token-pasting helper through
+// `$crate`, which resolves at the definition site.
+// Without it every crate expanding one of those macros would need its own dependency on it.
+#[doc(hidden)]
+pub use paste;
+pub use sqrt::{tonelli_shanks, tonelli_shanks_two_adic};
+pub use subfield::HasSubfield;
+pub use vectorized::*;

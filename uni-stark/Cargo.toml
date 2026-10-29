@@ -1,32 +1,49 @@
 [package]
 name = "p3-uni-stark"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "A minimal univariate STARK framework providing core components for proof generation and verification."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+parallel = ["p3-maybe-rayon/parallel"]
 
 [dependencies]
 p3-air.workspace = true
-p3-field.workspace = true
 p3-challenger.workspace = true
 p3-commit.workspace = true
-p3-dft.workspace = true
+p3-field.workspace = true
 p3-matrix.workspace = true
 p3-maybe-rayon.workspace = true
+p3-security.workspace = true
 p3-util.workspace = true
+
 itertools.workspace = true
-tracing.workspace = true
 serde = { workspace = true, features = ["derive", "alloc"] }
+thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-p3-baby-bear.workspace = true
-p3-commit = { workspace = true, features = ["test-utils"] }
-p3-circle.workspace = true
-p3-fri.workspace = true
-p3-keccak.workspace = true
-p3-mds.workspace = true
-p3-merkle-tree.workspace = true
-p3-mersenne-31.workspace = true
-p3-poseidon2.workspace = true
-p3-symmetric.workspace = true
-rand.workspace = true
+p3-baby-bear = { path = "../baby-bear" }
+p3-challenger = { path = "../challenger", features = ["test-utils"] }
+p3-circle = { path = "../circle" }
+p3-commit = { path = "../commit", features = ["test-utils"] }
+p3-dft = { path = "../dft" }
+p3-fri = { path = "../fri" }
+p3-keccak = { path = "../keccak" }
+p3-matrix = { path = "../matrix" }
+p3-merkle-tree = { path = "../merkle-tree" }
+p3-mersenne-31 = { path = "../mersenne-31" }
+p3-stir = { path = "../stir" }
+p3-symmetric = { path = "../symmetric" }
+
 postcard = { workspace = true, features = ["alloc"] }
+rand = { workspace = true, features = ["std_rng"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

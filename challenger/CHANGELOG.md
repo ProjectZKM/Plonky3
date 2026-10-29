@@ -1,0 +1,96 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+## [0.8.0] - 2026-09-23
+### Merged PRs
+- Feat(challenger): typed Fiat-Shamir transcript layer (DSFS / IETF draft) (#1603)
+- Perf(binary-field): squaring, Frobenius, dot products, and buffer reuse (#2042)
+- Feat(sumcheck)!: drive the generic-degree transcript through the typed Fiat-Shamir layer (#2024)
+- Feat(multi-stark): add binary-field end-to-end example (#2047)
+- Chore: expose the parallel feature on every crate that uses rayon (#2049)
+- Feat(fri)!: drive the FRI transcript through the typed Fiat-Shamir layer (#2035)
+- Feat(fri)!: drive the FRI PCS transcript through the typed Fiat-Shamir layer (#2086)
+- Feat(stir)!: drive the STIR transcript through the typed Fiat-Shamir layer (#2088)
+- Feat(whir)!: drive the plain WHIR transcript through the pattern player (#2104)
+- Test(challenger): assert no two protocols share a transcript seed (#2108)
+- Feat(security): check recorded grinding difficulties against the security model (#2109)
+- Review: couple tweaks here and there (#2120)
+- Feat(sumcheck)!: drive the ring-switching transcript through the typed Fiat-Shamir layer (#2122)
+- Feat(binary-pcs)!: drive the binary-tower PCS through the typed transcript (#2140)
+- Perf(challenger)!: squeeze the transcript before a proof-of-work search (#2199)
+- Perf(challenger)!: batch the byte-hash proof-of-work search (#2200)
+- Feat(errors)!: make diagnostics actionable (#2202)
+- Feat!: add WHIR over binary additive domains (#2198)
+- Refactor!: give sumcheck, STIR, WHIR and binary PCS planning, transcript steps and configuration a single owner (#2297)
+
+## [0.7.0] - 2026-09-04
+### Merged PRs
+- Feat: adapt log levels of some inner functions (#1999)
+
+## [0.6.0] - 2026-06-11
+### Merged PRs
+- Fix: use `u64` arithmetic in 64-bit challenger to avoid truncation (#1482)
+- Core: couple more compile time assertions (#1525)
+- Fix(whir): use unbiased rejection sampling for STIR query indices (#1598)
+- Refactor(challenger): align bits==0 short-circuit across grind impls (#1602)
+- Fix: local refs for dev-deps (#1663)
+- Couple fixes (#1688)
+- Couple miscellaneous tweaks (#1731)
+- Fix(challenger): reject absorb length tags that overflow u8 (#1738)
+- Fix(challenger): evaluate PoW bit-bound in u64 to close release-mode bypass (#1747)
+- Fix(challenger): make duplex sponge absorbs length-binding (#1769)
+- Chore: update CHANGELOGs (#1785)
+- Doc: add basic READMEs in main crates (#1786)
+- Perf(challenger): precompute the grind state for MultiField32Challenger (#1782)
+
+## [0.5.3] - 2026-05-15
+### Merged PRs
+- Core: couple more compile time assertions (#1525)
+
+## [0.5.2] - 2026-03-27
+### Merged PRs
+- Fix: use `u64` arithmetic in 64-bit challenger to avoid truncation (#1482)
+
+## [0.5.1] - 2026-03-16
+## [0.5.0] - 2026-03-10
+### Merged PRs
+- Perf: optimize HashChallenger buffering (#1266)
+- Refactor: minor code cleanups across blake3-air, bn254, challenger (#1287)
+- Feat: add Merkle Caps (#1321)
+- Fix: restrict MultiField32Challenger output to rate portion only (#1299)
+- Feat: add `CanFinalizeDigest` trait for challenger transcript commitment (#1409)
+
+## [0.4.2] - 2026-01-05
+### Merged PRs
+- SIMD optimization for proof-of-work grinding in DuplexChallenger (#1208) (Utsav Sharma)
+
+### Authors
+- Utsav Sharma
+
+## [0.4.1] - 2025-12-18
+### Authors
+
+## [0.4.0] - 2025-12-12
+### Merged PRs
+- Chore: add descriptions to all sub-crate manifests (#906) (Himess)
+- Add a comment about non-uniformity in `CanSampleBits` (#1026) (Tom Wambsgans)
+- Clippy: small step (#1102) (Thomas Coratger)
+- Clippy: add semicolon_if_nothing_returned (#1107) (Thomas Coratger)
+- Challenger: add `observe_base_as_algebra_element ` to `FieldChallenger` trait (#1152) (Thomas Coratger)
+- Challenger: add unit tests for `observe_base_as_algebra_element` (#1155) (Thomas Coratger)
+- Challenger: add `observe_algebra_elements` method (#1176) (Thomas Coratger)
+- Feat: add PoW phase for batching in FRI commit phase (#1164) (Zach Langley)
+- Implement uniform sampling of bits from field elements (#1050) (Sebastian)
+
+### Authors
+- Himess
+- Sebastian
+- Thomas Coratger
+- Tom Wambsgans
+- Zach Langley
+

@@ -1,0 +1,58 @@
+[package]
+name = "p3-binary-field"
+description = "Characteristic-2 tower fields GF(2) ⊂ GF(4) ⊂ … ⊂ GF(2^128) for Plonky3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# criterion pulls rayon transitively and rayon does not build on wasi.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion.workspace = true
+
+[features]
+parallel = ["p3-maybe-rayon/parallel"]
+# Expose the scalar model of the byte-sliced register, for tests of kernels written against it.
+test-utils = []
+
+# Select eight polynomial-field lanes on AVX-512 builds for throughput-oriented row kernels.
+wide-poly = []
+
+[dependencies]
+p3-challenger.workspace = true
+p3-field.workspace = true
+p3-maybe-rayon.workspace = true
+p3-symmetric.workspace = true
+p3-util.workspace = true
+
+num-bigint.workspace = true
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
+tracing.workspace = true
+
+[dev-dependencies]
+p3-challenger = { path = "../challenger", features = ["test-utils"] }
+p3-field-testing = { path = "../field-testing" }
+p3-keccak = { path = "../keccak" }
+
+postcard = { workspace = true, features = ["alloc"] }
+proptest.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "arithmetic"
+harness = false
+
+[[bench]]
+name = "bitslice"
+harness = false
+
+[[bench]]
+name = "fixed_base"
+harness = false
+
+[lints]
+workspace = true

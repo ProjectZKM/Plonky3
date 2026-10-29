@@ -6,25 +6,16 @@ use alloc::vec::Vec;
 
 use p3_poseidon2::{ExternalLayerConstants, ExternalLayerConstructor, InternalLayerConstructor};
 
-use serde::{Serialize, Deserialize};
 use crate::Mersenne31;
 
 /// The internal layers of the Poseidon2 permutation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "Vec<Mersenne31>: Serialize"))]
-#[serde(bound(
-    deserialize = "Vec<Mersenne31>: Deserialize<'de>"
-))]
+#[derive(Debug, Clone)]
 pub struct Poseidon2InternalLayerMersenne31 {
     pub(crate) internal_constants: Vec<Mersenne31>,
 }
 
 /// The external layers of the Poseidon2 permutation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "[Mersenne31; WIDTH]: Serialize"))]
-#[serde(bound(
-    deserialize = "[Mersenne31; WIDTH]: Deserialize<'de>"
-))]
+#[derive(Clone)]
 pub struct Poseidon2ExternalLayerMersenne31<const WIDTH: usize> {
     pub(crate) external_constants: ExternalLayerConstants<Mersenne31, WIDTH>,
 }

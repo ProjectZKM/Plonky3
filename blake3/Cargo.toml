@@ -1,14 +1,41 @@
 [package]
 name = "p3-blake3"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "The BLAKE3 hash function for Plonky3, with a batched SIMD path for many equal-length messages."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
-[dependencies]
-p3-symmetric.workspace = true
-p3-util.workspace = true
-blake3.workspace = true
+# Criterion pulls Rayon transitively, which does not build for WASI.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion.workspace = true
+
+# Picks the widest x86-64 backend the running CPU has, without `std`.
+[target.'cfg(all(target_arch = "x86_64", target_feature = "sse2"))'.dependencies]
+cpufeatures.workspace = true
 
 [features]
 neon = ["blake3/neon"]
 parallel = ["blake3/rayon"]
+# SIMD128 for one message in `blake3`, and for the batched path here, without a global `+simd128`.
+wasm32-simd = ["blake3/wasm32_simd"]
+
+[dependencies]
+p3-symmetric.workspace = true
+p3-util.workspace = true
+
+blake3.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "blake3"
+harness = false
+
+[lints]
+workspace = true

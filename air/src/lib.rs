@@ -5,8 +5,29 @@
 extern crate alloc;
 
 mod air;
+pub mod arithmetic;
+pub mod boundary;
+mod builder;
+mod check_constraints;
+mod filtered;
+mod named;
+pub mod symbolic;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod utils;
 mod virtual_column;
+mod window;
 
 pub use air::*;
+pub use arithmetic::{
+    ArithmeticAirBuilder, ArithmeticLoweringError, CapturedArithmeticConstraints,
+    capture_arithmetic,
+};
+pub use boundary::{BoundaryEnd, BoundaryIoError, BoundaryPublic};
+pub use builder::*;
+pub use check_constraints::*;
+pub use filtered::*;
+pub use named::*;
+pub use symbolic::*;
 pub use virtual_column::*;
+pub use window::*;

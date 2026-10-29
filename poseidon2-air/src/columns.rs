@@ -17,15 +17,13 @@ pub struct Poseidon2Cols<
     const HALF_FULL_ROUNDS: usize,
     const PARTIAL_ROUNDS: usize,
 > {
-    pub export: T,
-
     pub inputs: [T; WIDTH],
 
     /// Beginning Full Rounds
     pub beginning_full_rounds: [FullRound<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS>; HALF_FULL_ROUNDS],
 
     /// Partial Rounds
-    pub partial_rounds: [PartialRound<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS>; PARTIAL_ROUNDS],
+    pub partial_rounds: [PartialRound<T, SBOX_DEGREE, SBOX_REGISTERS>; PARTIAL_ROUNDS],
 
     /// Ending Full Rounds
     pub ending_full_rounds: [FullRound<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS>; HALF_FULL_ROUNDS],
@@ -42,8 +40,7 @@ pub struct FullRound<T, const WIDTH: usize, const SBOX_DEGREE: u64, const SBOX_R
 
 /// Partial round columns.
 #[repr(C)]
-pub struct PartialRound<T, const WIDTH: usize, const SBOX_DEGREE: u64, const SBOX_REGISTERS: usize>
-{
+pub struct PartialRound<T, const SBOX_DEGREE: u64, const SBOX_REGISTERS: usize> {
     /// Possible intermediate results within the S-box.
     pub sbox: SBox<T, SBOX_DEGREE, SBOX_REGISTERS>,
     /// The output of the S-box.
@@ -70,48 +67,24 @@ pub const fn num_cols<
     )
 }
 
-pub const fn make_col_map<
+impl<
+    T,
     const WIDTH: usize,
     const SBOX_DEGREE: u64,
     const SBOX_REGISTERS: usize,
     const HALF_FULL_ROUNDS: usize,
     const PARTIAL_ROUNDS: usize,
->() -> Poseidon2Cols<usize, WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS> {
-    todo!()
-    // let indices_arr = indices_arr::<
-    //     { num_cols::<WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>() },
-    // >();
-    // unsafe {
-    //     transmute::<
-    //         [usize;
-    //             num_cols::<WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>()],
-    //         Poseidon2Cols<
-    //             usize,
-    //             WIDTH,
-    //             SBOX_DEGREE,
-    //             SBOX_REGISTERS,
-    //             HALF_FULL_ROUNDS,
-    //             PARTIAL_ROUNDS,
-    //         >,
-    //     >(indices_arr)
-    // }
-}
-
-impl<
-        T,
-        const WIDTH: usize,
-        const SBOX_DEGREE: u64,
-        const SBOX_REGISTERS: usize,
-        const HALF_FULL_ROUNDS: usize,
-        const PARTIAL_ROUNDS: usize,
-    > Borrow<Poseidon2Cols<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>>
+> Borrow<Poseidon2Cols<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>>
     for [T]
 {
     fn borrow(
         &self,
     ) -> &Poseidon2Cols<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>
     {
-        // debug_assert_eq!(self.len(), NUM_COLS);
+        debug_assert_eq!(
+            self.len(),
+            num_cols::<WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>()
+        );
         let (prefix, shorts, suffix) = unsafe {
             self.align_to::<Poseidon2Cols<
                 T,
@@ -130,22 +103,23 @@ impl<
 }
 
 impl<
-        T,
-        const WIDTH: usize,
-        const SBOX_DEGREE: u64,
-        const SBOX_REGISTERS: usize,
-        const HALF_FULL_ROUNDS: usize,
-        const PARTIAL_ROUNDS: usize,
-    >
-    BorrowMut<
-        Poseidon2Cols<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>,
-    > for [T]
+    T,
+    const WIDTH: usize,
+    const SBOX_DEGREE: u64,
+    const SBOX_REGISTERS: usize,
+    const HALF_FULL_ROUNDS: usize,
+    const PARTIAL_ROUNDS: usize,
+> BorrowMut<Poseidon2Cols<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>>
+    for [T]
 {
     fn borrow_mut(
         &mut self,
     ) -> &mut Poseidon2Cols<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>
     {
-        // debug_assert_eq!(self.len(), NUM_COLS);
+        debug_assert_eq!(
+            self.len(),
+            num_cols::<WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>()
+        );
         let (prefix, shorts, suffix) = unsafe {
             self.align_to_mut::<Poseidon2Cols<
                 T,

@@ -1,23 +1,38 @@
 [package]
 name = "p3-sha256"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
 description = "Plonky3 hash trait implementations for the SHA2-256 hash function."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Criterion pulls Rayon transitively, which does not build for WASI.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion.workspace = true
+
+# Picks the x86-64 backend the running CPU has, without `std`.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+cpufeatures.workspace = true
+
+[features]
+default = []
 
 [dependencies]
 p3-symmetric.workspace = true
 p3-util.workspace = true
-sha2 = { workspace = true, features = ["compress"] }
 
-[features]
-default = []
-asm = [
-    "sha2/asm",
-] # Enable either x86 or aarch assembly implementation based on target.
-force-soft = [
-    "sha2/force-soft",
-] # Force software implementation (default if "asm" feature is not enabled).
+sha2.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "sha256"
+harness = false
+
+[lints]
+workspace = true

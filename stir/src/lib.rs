@@ -1,0 +1,83 @@
+//! STIR: Reed-Solomon Proximity Testing with Fewer Queries.
+//!
+//! This crate implements the STIR polynomial commitment scheme, a univariate PCS
+//! that achieves shorter proofs than FRI by replacing many direct proximity queries
+//! with a small number of out-of-domain (OOD) samples combined with an answer
+//! polynomial argument.
+//!
+//! # Structure
+//!
+//! - [`config`]: Protocol parameters ([`StirParameters`], [`StirConfig`], [`StirRoundConfig`]).
+//! - [`proof`]: Proof types ([`StirProof`], [`StirRoundProof`], [`StirQueryOpenings`]).
+//! - [`utils`]: Polynomial arithmetic primitives (ans, Horner eval, synthetic division).
+//! - [`prover`]: The STIR prover ([`prover::prove_stir`]).
+//! - [`verifier`]: The STIR verifier ([`verifier::verify_stir`]).
+//! - [`error`]: Verification failures ([`StirError`], [`ProofShapeError`]).
+//! - [`pcs`]: [`TwoAdicStirPcs`] implementing the [`p3_commit::Pcs`] trait.
+//!
+//! # Deviations from the STIR paper (eprint 2024/390)
+//!
+//! Several deliberate implementation choices differ from the construction stated in
+//! the paper:
+//!
+//! - **Prover-assisted Ans check.** The paper's verifier interpolates `Ans` itself. By default
+//!   the prover sends `Ans`, and the verifier checks it against the barycentric interpolant
+//!   through the round's points at a transcript-derived random point. Its Schwartz–Zippel
+//!   error is included explicitly in STIR's parameter validation. [`StirOptions::compact_answers`]
+//!   omits the coefficients and reconstructs them in the verifier, preserving the transcript
+//!   and the existing check while trading verifier computation for fewer proof bytes.
+//! - **Fixed `s` schedule.** OOD sample count is fixed per the paper's recommended schedule
+//!   (`s = 1` for Johnson, `s = 2` for capacity); [`config::StirConfig::new`] does not search
+//!   for the smallest valid `s`.
+//! - **Proximity-gaps formulas from later work.** Johnson-bound proximity gaps use the
+//!   \[DKT26\] bound ([2026/2056](https://eprint.iacr.org/2026/2056), Theorem 5.12
+//!   and §7.2) through `p3-security`.
+//! - **Round-0 joint queries-combination bound (CB only).**
+//!   The capacity-bound initial eta extends the paper's prox-gap formula with a joint
+//!   queries-combination × prox-gap term, using a closed-form upper bound on `t_0` in place
+//!   of the missing `t_{-1}`.
+//!   Without it, CB `queries_combination_error` at round 0 sags ~`log₂(t_0)` bits
+//!   below `target_bits`. JB needs no such term — its list size stays small.
+//! - **Union-bound buffer.** [`config::StirConfig::new`] adds an explicit
+//!   `ceil(log2(6 · total_folds))` buffer to every per-round error term. Each round
+//!   contributes up to six independent algebraic failure modes (query tier: query failure,
+//!   OOD, random-combination,
+//!   Ans-check; folding tier: proximity-gaps, sumcheck), so the union bound over the full
+//!   protocol is `≤ 6 · total_folds · 2^{-buffered_security_level}`. The paper's "+1 / +0"
+//!   rule only delivers the claimed bits when `total_folds ≤ 2` and per-round terms are
+//!   collapsed; the explicit log keeps deeper protocols tight across every term.
+
+#![no_std]
+
+extern crate alloc;
+
+// Only the transcript's unwind test reaches for `std`, and only where unwinding exists.
+#[cfg(all(test, panic = "unwind"))]
+extern crate std;
+
+mod batch_transcript;
+pub mod config;
+pub mod error;
+pub mod pcs;
+mod pcs_budget;
+pub mod pcs_transcript;
+pub mod proof;
+pub mod prover;
+mod soundness;
+pub mod transcript;
+pub mod utils;
+pub mod verifier;
+
+pub use batch_transcript::batch_domain_separator;
+pub use config::{
+    Stage, StirConfig, StirConfigError, StirOptions, StirParameters, StirRoundConfig,
+};
+pub use error::{ExternalSourceError, GrindStage, ProofShapeError, RoundLabel, StirError};
+pub use p3_security::whir::SecurityAssumption;
+pub use pcs::{DEFAULT_MAX_LOG_HEIGHT_SPREAD, StirCommitment, StirPcsProof, TwoAdicStirPcs};
+pub use proof::{StirProof, StirQueryOpenings, StirRoundProof};
+pub use transcript::{
+    ProverTranscript, StirInstanceShape, StirRoundShape, StirShape, TranscriptFailure,
+    VerifierTranscript,
+};
+pub use verifier::StirVerifyOutputs;

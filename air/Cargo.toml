@@ -1,12 +1,39 @@
 [package]
 name = "p3-air"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "Defines the Algebraic Intermediate Representation (AIR) interface and supporting utilities for STARK provers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.plonky3.ci]
+test-features = ["testing"]
+
+[features]
+testing = []
 
 [dependencies]
+hashbrown.workspace = true
 p3-field.workspace = true
 p3-matrix.workspace = true
+serde = { workspace = true, features = ["derive", "alloc"] }
+thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-p3-matrix.workspace = true
+criterion.workspace = true
+p3-baby-bear = { path = "../baby-bear" }
+p3-field = { path = "../field" }
+p3-mersenne-31 = { path = "../mersenne-31" }
+p3-monty-31 = { path = "../monty-31" }
+serde_json.workspace = true
+
+[[bench]]
+name = "constraint_analysis"
+harness = false
+
+[lints]
+workspace = true

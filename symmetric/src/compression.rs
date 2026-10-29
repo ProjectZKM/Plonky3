@@ -7,7 +7,47 @@ use crate::permutation::CryptographicPermutation;
 /// Instead it is only collision-resistant in hash-tree like settings where
 /// the preimage of a non-leaf node must consist of compression outputs.
 pub trait PseudoCompressionFunction<T, const N: usize>: Clone {
+    /// Number of independent compressions this implementation performs most efficiently in one call.
+    ///
+    /// One means every group is compressed on its own, which is the behaviour of a plain scalar permutation.
+    /// A vectorized implementation reports how many independent states its permutation advances at once.
+    ///
+    /// Callers read this only to decide whether grouping compressions is worth the bookkeeping.
+    const LANES: usize = 1;
+
     fn compress(&self, input: [T; N]) -> T;
+
+    /// Compress a batch of input groups, one output per group.
+    ///
+    /// ```text
+    ///     inputs: [ grp_0 | grp_1 | ... | grp_{m-1} ]   m groups of N inputs
+    ///     out:    [ dig_0 | dig_1 | ... | dig_{m-1} ]   m outputs
+    /// ```
+    ///
+    /// The default compresses the groups one at a time.
+    /// An override exists purely to exploit vector hardware and must return the very same outputs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the batch is ragged: the group count must equal the output count.
+    fn compress_many(&self, inputs: &[[T; N]], out: &mut [T])
+    where
+        T: Clone,
+    {
+        // A ragged batch is a caller bug, so it fails loudly rather than dropping groups.
+        assert_eq!(
+            inputs.len(),
+            out.len(),
+            "group count ({}) must equal the output count ({})",
+            inputs.len(),
+            out.len()
+        );
+
+        // Walk the groups in order so the outputs land in the caller's order.
+        for (output, group) in out.iter_mut().zip(inputs) {
+            *output = self.compress(group.clone());
+        }
+    }
 }
 
 /// An `N`-to-1 compression function.
@@ -22,6 +62,11 @@ impl<InnerP, const N: usize, const CHUNK: usize, const WIDTH: usize>
     TruncatedPermutation<InnerP, N, CHUNK, WIDTH>
 {
     pub const fn new(inner_permutation: InnerP) -> Self {
+        const {
+            assert!(N > 0);
+            assert!(CHUNK > 0);
+            assert!(CHUNK * N <= WIDTH);
+        }
         Self { inner_permutation }
     }
 }
@@ -33,7 +78,6 @@ where
     InnerP: CryptographicPermutation<[T; WIDTH]>,
 {
     fn compress(&self, input: [[T; CHUNK]; N]) -> [T; CHUNK] {
-        debug_assert!(CHUNK * N <= WIDTH);
         let mut pre = [T::default(); WIDTH];
         for i in 0..N {
             pre[i * CHUNK..(i + 1) * CHUNK].copy_from_slice(&input[i]);
@@ -60,8 +104,37 @@ where
     T: Clone,
     H: CryptographicHasher<T, [T; CHUNK]>,
 {
+    const LANES: usize = <H as CryptographicHasher<T, [T; CHUNK]>>::LANES;
+
     fn compress(&self, input: [[T; CHUNK]; N]) -> [T; CHUNK] {
-        self.hasher.hash_iter(input.into_iter().flatten())
+        // The `N` chunks sit back to back, so the preimage is already one slice.
+        //
+        // A slice lets a byte hasher take the whole preimage in one call instead of item by item.
+        self.hasher.hash_slice(input.as_flattened())
+    }
+
+    fn compress_many(&self, inputs: &[[[T; CHUNK]; N]], out: &mut [[T; CHUNK]]) {
+        // A ragged batch is a caller bug, so it fails loudly rather than dropping groups.
+        assert_eq!(
+            inputs.len(),
+            out.len(),
+            "group count ({}) must equal the output count ({})",
+            inputs.len(),
+            out.len()
+        );
+
+        // A group is `N` adjacent chunks of `CHUNK` items.
+        // A run of groups is therefore already one flat run of items:
+        //
+        //     inputs: [[c0 c1] [c2 c3] ...]  ->  flat: [c0 c1 c2 c3 ...]
+        //
+        // Flattening twice hands the hasher the concatenated preimages directly.
+        // No copying is needed.
+        let messages = inputs.as_flattened().as_flattened();
+
+        // Each message is `N * CHUNK` items long, so the batch hasher can split them itself.
+        // Equal counts make that split exact.
+        self.hasher.hash_many(messages, out);
     }
 }
 
@@ -71,4 +144,238 @@ where
     T: Clone,
     H: CryptographicHasher<T, [T; CHUNK]>,
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::array;
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::Permutation;
+
+    #[derive(Clone)]
+    struct MockPermutation;
+
+    impl<T, const WIDTH: usize> Permutation<[T; WIDTH]> for MockPermutation
+    where
+        T: Copy + core::ops::Add<Output = T> + Default,
+    {
+        fn permute_mut(&self, input: &mut [T; WIDTH]) {
+            let sum: T = input.iter().copied().fold(T::default(), |acc, x| acc + x);
+            // Simplest impl: set every element to the sum
+            *input = [sum; WIDTH];
+        }
+    }
+
+    impl<T, const WIDTH: usize> CryptographicPermutation<[T; WIDTH]> for MockPermutation where
+        T: Copy + core::ops::Add<Output = T> + Default
+    {
+    }
+
+    #[derive(Clone)]
+    struct MockHasher;
+
+    impl<const CHUNK: usize> CryptographicHasher<u64, [u64; CHUNK]> for MockHasher {
+        fn hash_iter<I: IntoIterator<Item = u64>>(&self, iter: I) -> [u64; CHUNK] {
+            let sum: u64 = iter.into_iter().sum();
+            // Simplest impl: set every element to the sum
+            [sum; CHUNK]
+        }
+    }
+
+    #[test]
+    fn test_truncated_permutation_compress() {
+        const N: usize = 2;
+        const CHUNK: usize = 4;
+        const WIDTH: usize = 8;
+
+        let permutation = MockPermutation;
+        let compressor = TruncatedPermutation::<MockPermutation, N, CHUNK, WIDTH>::new(permutation);
+
+        let input: [[u64; CHUNK]; N] = [[1, 2, 3, 4], [5, 6, 7, 8]];
+        let output = compressor.compress(input);
+        let expected_sum = 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8;
+
+        assert_eq!(output, [expected_sum; CHUNK]);
+    }
+
+    #[test]
+    fn test_compression_function_from_hasher_compress() {
+        const N: usize = 2;
+        const CHUNK: usize = 4;
+
+        let hasher = MockHasher;
+        let compressor = CompressionFunctionFromHasher::<MockHasher, N, CHUNK>::new(hasher);
+
+        let input = [[10, 20, 30, 40], [50, 60, 70, 80]];
+        let output = compressor.compress(input);
+        let expected_sum = 10 + 20 + 30 + 40 + 50 + 60 + 70 + 80;
+
+        assert_eq!(output, [expected_sum; CHUNK]);
+    }
+
+    #[test]
+    fn test_truncated_permutation_with_zeros() {
+        const N: usize = 2;
+        const CHUNK: usize = 4;
+        const WIDTH: usize = 8;
+
+        let permutation = MockPermutation;
+        let compressor = TruncatedPermutation::<MockPermutation, N, CHUNK, WIDTH>::new(permutation);
+
+        let input: [[u64; CHUNK]; N] = [[0, 0, 0, 0], [0, 0, 0, 0]];
+        let output = compressor.compress(input);
+
+        assert_eq!(output, [0; CHUNK]);
+    }
+
+    #[test]
+    fn test_truncated_permutation_with_extra_width() {
+        const N: usize = 2;
+        const CHUNK: usize = 3;
+        const WIDTH: usize = 10; // More than `CHUNK * N` (6 < 10)
+
+        let permutation = MockPermutation;
+        let compressor = TruncatedPermutation::<MockPermutation, N, CHUNK, WIDTH>::new(permutation);
+
+        let input: [[u64; CHUNK]; N] = [[1, 2, 3], [4, 5, 6]];
+        let output = compressor.compress(input);
+
+        let expected_sum = 1 + 2 + 3 + 4 + 5 + 6;
+
+        assert_eq!(
+            output, [expected_sum; CHUNK],
+            "Compression should correctly handle extra WIDTH space."
+        );
+    }
+
+    #[test]
+    fn compress_many_matches_compressing_each_group_alone() {
+        const N: usize = 2;
+        const CHUNK: usize = 4;
+        const WIDTH: usize = 8;
+
+        let compressor = TruncatedPermutation::<_, N, CHUNK, WIDTH>::new(MockPermutation);
+
+        // Three groups of two four-word children.
+        let groups: [[[u64; CHUNK]; N]; 3] =
+            array::from_fn(|g| array::from_fn(|n| array::from_fn(|i| (g * 8 + n * 4 + i) as u64)));
+
+        let mut batched = [[0u64; CHUNK]; 3];
+        compressor.compress_many(&groups, &mut batched);
+
+        let expected: [[u64; CHUNK]; 3] = groups.map(|group| compressor.compress(group));
+        assert_eq!(batched, expected);
+    }
+
+    #[test]
+    fn compress_many_of_an_empty_batch_writes_nothing() {
+        const N: usize = 2;
+        const CHUNK: usize = 4;
+        const WIDTH: usize = 8;
+
+        let compressor = TruncatedPermutation::<_, N, CHUNK, WIDTH>::new(MockPermutation);
+
+        // Both counts are zero, which is a well-formed batch of no groups.
+        let groups: [[[u64; CHUNK]; N]; 0] = [];
+        compressor.compress_many(&groups, &mut []);
+    }
+
+    #[test]
+    #[should_panic(expected = "must equal the output count")]
+    fn compress_many_rejects_a_ragged_batch() {
+        const N: usize = 2;
+        const CHUNK: usize = 4;
+        const WIDTH: usize = 8;
+
+        let compressor = TruncatedPermutation::<_, N, CHUNK, WIDTH>::new(MockPermutation);
+
+        // Two groups with one slot for their outputs: the caller has miscounted, so the batch
+        // fails rather than quietly compressing only the first group.
+        let groups = [[[0u64; CHUNK]; N]; 2];
+        let mut out = [[0u64; CHUNK]; 1];
+        compressor.compress_many(&groups, &mut out);
+    }
+
+    #[test]
+    fn compress_many_from_hasher_matches_compressing_each_group_alone() {
+        const N: usize = 2;
+        const CHUNK: usize = 4;
+
+        let compressor = CompressionFunctionFromHasher::<MockHasher, N, CHUNK>::new(MockHasher);
+
+        let groups: [[[u64; CHUNK]; N]; 3] =
+            array::from_fn(|g| array::from_fn(|n| array::from_fn(|i| (g * 8 + n * 4 + i) as u64)));
+
+        let mut batched = vec![[0u64; CHUNK]; 3];
+        compressor.compress_many(&groups, &mut batched);
+
+        let expected: Vec<[u64; CHUNK]> = groups.iter().map(|&g| compressor.compress(g)).collect();
+        assert_eq!(batched, expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "must equal the output count")]
+    fn compress_many_from_hasher_rejects_a_ragged_batch() {
+        const N: usize = 2;
+        const CHUNK: usize = 4;
+
+        let compressor = CompressionFunctionFromHasher::<MockHasher, N, CHUNK>::new(MockHasher);
+
+        // The adapter hands the whole flattened run to the batch hasher, so unequal counts would
+        // silently redraw every message boundary.
+        let groups = [[[0u64; CHUNK]; N]; 3];
+        let mut out = [[0u64; CHUNK]; 2];
+        compressor.compress_many(&groups, &mut out);
+    }
+
+    /// A hasher that folds its items in order and records the slices it is handed.
+    #[derive(Clone, Default)]
+    struct SliceRecorder {
+        /// Length of every slice passed to the one-slice entry point, in call order.
+        slices: alloc::rc::Rc<core::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl CryptographicHasher<u64, [u64; 4]> for SliceRecorder {
+        fn hash_iter<I: IntoIterator<Item = u64>>(&self, iter: I) -> [u64; 4] {
+            // An order-sensitive fold, so a reordered preimage gives a different digest.
+            let acc = iter.into_iter().fold(0u64, |acc, x| {
+                acc.wrapping_mul(0x100_0000_01b3).wrapping_add(x)
+            });
+            [acc, acc ^ 1, acc ^ 2, acc ^ 3]
+        }
+
+        fn hash_slice(&self, input: &[u64]) -> [u64; 4] {
+            self.slices.borrow_mut().push(input.len());
+            self.hash_iter(input.iter().copied())
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn compress_from_hasher_hashes_the_preimage_as_one_slice(
+            two in prop::array::uniform2(any::<[u64; 4]>()),
+            four in prop::array::uniform4(any::<[u64; 4]>()),
+        ) {
+            // Invariant: one compression hashes the N chunks as one slice, in order.
+            //
+            //     2 chunks of 4 -> one slice of 8 items
+            //     4 chunks of 4 -> one slice of 16 items
+            let hasher = SliceRecorder::default();
+            let two_to_one = CompressionFunctionFromHasher::<_, 2, 4>::new(hasher.clone());
+            let four_to_one = CompressionFunctionFromHasher::<_, 4, 4>::new(hasher.clone());
+
+            // Same digest as hashing the chunks item by item.
+            prop_assert_eq!(two_to_one.compress(two), hasher.hash_iter(two.into_iter().flatten()));
+            prop_assert_eq!(four_to_one.compress(four), hasher.hash_iter(four.into_iter().flatten()));
+
+            // Each compression reached the hasher once, with the whole preimage.
+            let slices = hasher.slices.borrow().clone();
+            prop_assert_eq!(slices, vec![8, 16]);
+        }
+    }
 }

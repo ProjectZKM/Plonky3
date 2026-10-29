@@ -1,19 +1,29 @@
 [package]
 name = "p3-monolith"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "Deprecated since 0.9.0. Implements the Monolith permutation family over Mersenne31 and Goldilocks fields."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 p3-field.workspace = true
-p3-mersenne-31.workspace = true
+p3-goldilocks.workspace = true
 p3-mds.workspace = true
+p3-mersenne-31.workspace = true
 p3-symmetric.workspace = true
-sha3.workspace = true
+
+shake.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 
 [[bench]]
-name = "permute"
+name = "monolith"
 harness = false
+
+[lints]
+workspace = true

@@ -1,237 +1,348 @@
-use core::ops::{Add, Mul, Sub};
+use alloc::borrow::Cow;
+use alloc::vec::Vec;
 
-use p3_field::{ExtensionField, Field, FieldAlgebra, FieldExtensionAlgebra};
+use p3_field::{ExtensionField, Field};
 use p3_matrix::dense::RowMajorMatrix;
-use p3_matrix::Matrix;
 
-/// An AIR (algebraic intermediate representation).
+use crate::boundary::BoundaryPublic;
+use crate::builder::AirBuilder;
+
+/// The underlying structure of an AIR.
 pub trait BaseAir<F>: Sync {
     /// The number of columns (a.k.a. registers) in this AIR.
     fn width(&self) -> usize;
 
+    /// Return an optional preprocessed trace matrix to be included in the prover's trace.
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
         None
     }
-}
 
-///  An AIR with 0 or more public values.
-pub trait BaseAirWithPublicValues<F>: BaseAir<F> {
+    /// Width of the preprocessed trace, in columns.
+    ///
+    /// Defaults to `0`, matching the default [`Self::preprocessed_trace`] of
+    /// `None`. Implementors that override [`Self::preprocessed_trace`] **must**
+    /// also override this method to return a matching width — callers use this
+    /// to size symbolic builders without materializing the preprocessed matrix.
+    fn preprocessed_width(&self) -> usize {
+        0
+    }
+
+    /// Return the number of periodic columns.
+    ///
+    /// Override when this AIR uses periodic columns; see [`Self::periodic_columns`].
+    fn num_periodic_columns(&self) -> usize {
+        0
+    }
+
+    /// Return the periodic table data.
+    ///
+    /// Periodic columns are columns whose values repeat with a fixed period that divides the
+    /// trace length. They are derived from public parameters and are never committed as part
+    /// of the trace — instead, both prover and verifier compute them from the data provided here.
+    ///
+    /// # Mathematical model
+    ///
+    /// For a trace of length n evaluated over a multiplicative subgroup H = {g⁰, g¹, ..., gⁿ⁻¹},
+    /// a periodic column with period p (where p divides n, both powers of 2) is defined as follows:
+    ///
+    /// - Let r = n/p be the number of repetitions.
+    /// - The p values are interpreted as evaluations of a polynomial f(x) of degree < p
+    ///   over the subgroup Hʳ = {g⁰, gʳ, g²ʳ, ..., g⁽ᵖ⁻¹⁾ʳ} of order p.
+    /// - The periodic extension f'(X) = f(Xʳ) has degree < p·r = n and satisfies
+    ///   f'(gⁱ) = f(gⁱʳ), which cycles through the p values as i increases.
+    ///
+    /// # Commitment
+    ///
+    /// Periodic columns are public parameters and must be committed during initialization of
+    /// the Fiat-Shamir transcript; [`Self::periodic_statement`] gives the bytes to commit. The
+    /// values returned are evaluations over a subgroup; callers may convert to coefficient form
+    /// for efficient evaluation if needed.
+    fn periodic_columns(&self) -> Cow<'_, [Vec<F>]>
+    where
+        F: Clone,
+    {
+        Cow::Borrowed(&[])
+    }
+
+    /// Return the period of each periodic column, in declaration order.
+    ///
+    /// Override when the columns are expensive to materialize.
+    fn periodic_periods(&self) -> Vec<usize>
+    where
+        F: Clone,
+    {
+        self.periodic_columns().iter().map(Vec::len).collect()
+    }
+
+    /// Evaluate every periodic column's multilinear extension at `point`, when the AIR has a closed form.
+    ///
+    /// Each column is first repeated to the trace height, one row per Boolean point.
+    ///
+    /// `point` has one coordinate per trace variable, the most significant bit first.
+    ///
+    /// Returns `None` to let the backend evaluate the columns itself.
+    ///
+    /// An override must return what the backend would compute, one value per column.
+    fn periodic_evaluations<EF>(&self, _point: &[EF]) -> Option<Vec<EF>>
+    where
+        F: Field,
+        EF: ExtensionField<F>,
+    {
+        None
+    }
+
+    /// Bytes that fix the value of every periodic column.
+    ///
+    /// A backend binds them into its transcript before the first challenge.
+    ///
+    /// The default writes each column's length, then its values.
+    ///
+    /// An override must still determine every value, for example from a sparse description.
+    ///
+    /// A non-empty statement must not be exactly 8 bytes, the width of every other label chunk.
+    fn periodic_statement(&self) -> Vec<u8>
+    where
+        F: Field,
+    {
+        let mut bytes = Vec::new();
+        for column in self.periodic_columns().iter() {
+            bytes.extend((column.len() as u64).to_le_bytes());
+            for &value in column {
+                bytes.extend(value.into_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// Return the periodic values for the given row index.
+    fn periodic_values(&self, row_index: usize) -> Vec<F>
+    where
+        F: Clone,
+    {
+        self.periodic_columns()
+            .iter()
+            .map(|col| col[row_index % col.len()].clone())
+            .collect()
+    }
+
+    /// Return a matrix with all periodic columns extended to a common height.
+    ///
+    /// The result is a row-major matrix where each row corresponds to a row index in the
+    /// common extended domain (of size equal to the maximum period), and each column
+    /// corresponds to one periodic column. Columns with smaller periods are repeated
+    /// cyclically to fill the extended domain.
+    ///
+    /// Returns `None` if there are no periodic columns.
+    fn periodic_columns_matrix(&self) -> Option<RowMajorMatrix<F>>
+    where
+        F: Clone + Send + Sync,
+    {
+        let cols = self.periodic_columns();
+        if cols.is_empty() {
+            return None;
+        }
+
+        let max_period = cols.iter().map(|c| c.len()).max()?;
+
+        let values = (0..max_period)
+            .flat_map(|row| cols.iter().map(move |col| col[row % col.len()].clone()))
+            .collect();
+
+        Some(RowMajorMatrix::new(values, cols.len()))
+    }
+
+    /// Which main trace columns have their next row accessed by this AIR's
+    /// constraints.
+    ///
+    /// By default this returns every column index, which will require
+    /// opening all main columns at both `zeta` and `zeta_next`.
+    ///
+    /// AIRs that only ever read the current main row (and never access an
+    /// offset-1 main entry) can override this to return an empty vector to
+    /// allow the prover and verifier to open only at `zeta`.
+    ///
+    /// # When to override
+    ///
+    /// - **Return empty**: single-row AIRs where all constraints are
+    ///   evaluated within one row.
+    /// - **Keep default** (all columns): AIRs with transition constraints
+    ///   that reference `main.next_slice()`.
+    /// - **Return a subset**: AIRs where only a few columns need next-row
+    ///   access, enabling future per-column opening optimizations.
+    ///
+    /// # Correctness
+    ///
+    /// Must be consistent with [`Air::eval`]. Omitting a column index when
+    /// the AIR actually reads its next row will cause verification failures
+    /// or, in the worst case, a soundness gap.
+    fn main_next_row_columns(&self) -> Vec<usize> {
+        (0..self.width()).collect()
+    }
+
+    /// Which preprocessed trace columns have their next row accessed by this
+    /// AIR's constraints.
+    ///
+    /// By default this returns every preprocessed column index, which will
+    /// require opening preprocessed columns at both `zeta` and `zeta_next`.
+    ///
+    /// AIRs that only ever read the current preprocessed row (and never
+    /// access an offset-1 preprocessed entry) can override this to return an
+    /// empty vector to allow the prover and verifier to open only at `zeta`.
+    fn preprocessed_next_row_columns(&self) -> Vec<usize> {
+        (0..self.preprocessed_width()).collect()
+    }
+
+    /// Optional hint for the number of constraints in this AIR.
+    ///
+    /// Normally the prover runs a full symbolic evaluation just to count
+    /// constraints. Overriding this method lets the prover skip that pass.
+    ///
+    /// The count must cover every constraint asserted during evaluation,
+    /// including both transition and boundary constraints. It must **not**
+    /// include lookup or permutation constraints, which are counted
+    /// separately.
+    ///
+    /// # Correctness
+    ///
+    /// The returned value **must** exactly match the actual number of
+    /// constraints. A wrong count will cause the prover to panic or
+    /// produce an invalid proof.
+    ///
+    /// Returns `None` by default, which falls back to symbolic evaluation.
+    fn num_constraints(&self) -> Option<usize> {
+        None
+    }
+
+    /// Optional hint for the maximum constraint degree in this AIR.
+    ///
+    /// The constraint degree is the factor by which trace length N
+    /// scales the constraint polynomial degree.
+    ///
+    /// For example, a constraint `x * y * z` where x, y, z are trace
+    /// variables has degree multiple 3.
+    ///
+    /// Uni-STARK and batch-STARK size the quotient using the maximum of this
+    /// hint and the symbolically inferred degree, including base and extension
+    /// constraints. Supplying a hint does not skip symbolic evaluation, and an
+    /// undersized hint does not reduce the quotient below the inferred bound.
+    /// Domains with a full trace-space transition selector, such as Circle,
+    /// include that selector in the inferred degree. The cached degree multiple
+    /// used by this hint treats transition selectors as degree zero and cannot
+    /// bound their repeated products there.
+    ///
+    /// Overestimating is permitted but increases prover work by selecting a
+    /// larger quotient domain.
+    ///
+    /// The hint covers only what this AIR asserts during its own evaluation.
+    /// A backend that injects extra constraints scores their degree separately.
+    ///
+    /// Returns `None` by default, which uses the inferred degree alone.
+    fn max_constraint_degree(&self) -> Option<usize> {
+        None
+    }
+
+    /// Return the number of expected public values.
     fn num_public_values(&self) -> usize {
         0
     }
-}
 
-/// An AIR that works with a particular `AirBuilder`.
-pub trait Air<AB: AirBuilder>: BaseAir<AB::F> {
-    fn eval(&self, builder: &mut AB);
-}
-
-pub trait AirBuilder: Sized {
-    type F: Field;
-
-    type Expr: FieldAlgebra
-        + From<Self::F>
-        + Add<Self::Var, Output = Self::Expr>
-        + Add<Self::F, Output = Self::Expr>
-        + Sub<Self::Var, Output = Self::Expr>
-        + Sub<Self::F, Output = Self::Expr>
-        + Mul<Self::Var, Output = Self::Expr>
-        + Mul<Self::F, Output = Self::Expr>;
-
-    type Var: Into<Self::Expr>
-        + Copy
-        + Send
-        + Sync
-        + Add<Self::F, Output = Self::Expr>
-        + Add<Self::Var, Output = Self::Expr>
-        + Add<Self::Expr, Output = Self::Expr>
-        + Sub<Self::F, Output = Self::Expr>
-        + Sub<Self::Var, Output = Self::Expr>
-        + Sub<Self::Expr, Output = Self::Expr>
-        + Mul<Self::F, Output = Self::Expr>
-        + Mul<Self::Var, Output = Self::Expr>
-        + Mul<Self::Expr, Output = Self::Expr>;
-
-    type M: Matrix<Self::Var>;
-
-    fn main(&self) -> Self::M;
-
-    fn is_first_row(&self) -> Self::Expr;
-    fn is_last_row(&self) -> Self::Expr;
-    fn is_transition(&self) -> Self::Expr {
-        self.is_transition_window(2)
+    /// Main-trace cells whose values are public inputs, named by position.
+    ///
+    /// A public input reaches a proof through one of two routes:
+    ///
+    /// ```text
+    ///     boundary constraint : asserted by the AIR, honored by every backend
+    ///     cell listed here    : bound by the backend, honored by some backends
+    /// ```
+    ///
+    /// Listing a cell is therefore not by itself a binding.
+    /// Support across this workspace:
+    ///
+    /// ```text
+    ///     multilinear multi-STARK : binds every listed cell, needs no AIR constraint
+    ///     univariate STARKs       : reject an AIR that lists any cell
+    ///     debug constraint check  : compares each listed cell against the trace
+    /// ```
+    ///
+    /// The default is the empty slice.
+    /// An AIR that overrides nothing keeps binding its public inputs by constraint.
+    ///
+    /// A wrapper or enum AIR must forward this method along with [`Self::width`].
+    /// Forgetting to leaves every wrapped cell unbound, and nothing reports it,
+    /// because an empty list is a valid declaration.
+    ///
+    /// An AIR that embeds another lists the embedded cells itself, in its own numbering.
+    /// Forwarding the embedded list verbatim is wrong: a sub-builder narrows the main
+    /// trace to a column range but passes the parent's public values straight through,
+    /// so each `column` shifts by the range start while `public_value` does not.
+    ///
+    /// Symbolic builders run only [`Air::eval`], so they never see the injected pins.
+    /// Anything that counts or scores constraints from a symbolic pass adds them back.
+    ///
+    /// # Correctness
+    ///
+    /// - Every column index is less than the main width.
+    /// - Every public-value index is less than the declared public-value count.
+    /// - No two cells name the same column and trace end.
+    fn public_boundary_io(&self) -> &[BoundaryPublic] {
+        &[]
     }
-    fn is_transition_window(&self, size: usize) -> Self::Expr;
 
-    /// Returns a sub-builder whose constraints are enforced only when `condition` is nonzero.
-    fn when<I: Into<Self::Expr>>(&mut self, condition: I) -> FilteredAirBuilder<'_, Self> {
-        FilteredAirBuilder {
-            inner: self,
-            condition: condition.into(),
+    /// Whether the AIR is sound only when every main-trace cell is a bit, which its constraints
+    /// do not enforce.
+    ///
+    /// Such an AIR must be proven under a commitment whose alphabet is one bit per cell, such as a
+    /// commitment to the trace's bits, where a cell outside `{0, 1}` is not representable.
+    ///
+    /// The multi-STARK prover and verifier refuse such an AIR under a commitment that does not hold every column as bits.
+    ///
+    /// Other code that pairs it with a commitment to field elements must check the hint itself.
+    ///
+    /// A wrapper or enum AIR must forward this method, since the default reports no reliance.
+    ///
+    /// Returns `false` by default.
+    fn assumes_boolean_trace(&self) -> bool {
+        false
+    }
+
+    /// Number of leading main-trace columns that hold bits.
+    ///
+    /// These columns form the bit region, committed one bit per cell.
+    ///
+    /// The remaining columns form the dense region, committed one field element per cell.
+    ///
+    /// Both regions share one height, so one row reads both.
+    ///
+    /// The AIR may leave the booleanity of the bit region to the commitment.
+    ///
+    /// The multi-STARK prover and verifier refuse a commitment whose own bit region is narrower.
+    ///
+    /// A wrapper or enum AIR must forward this method along with [`Self::width`].
+    ///
+    /// Returns the whole width when [`Self::assumes_boolean_trace`] holds, and zero otherwise.
+    fn boolean_columns(&self) -> usize {
+        if self.assumes_boolean_trace() {
+            self.width()
+        } else {
+            0
         }
     }
-
-    /// Returns a sub-builder whose constraints are enforced only when `x != y`.
-    fn when_ne<I1: Into<Self::Expr>, I2: Into<Self::Expr>>(
-        &mut self,
-        x: I1,
-        y: I2,
-    ) -> FilteredAirBuilder<'_, Self> {
-        self.when(x.into() - y.into())
-    }
-
-    /// Returns a sub-builder whose constraints are enforced only on the first row.
-    fn when_first_row(&mut self) -> FilteredAirBuilder<'_, Self> {
-        self.when(self.is_first_row())
-    }
-
-    /// Returns a sub-builder whose constraints are enforced only on the last row.
-    fn when_last_row(&mut self) -> FilteredAirBuilder<'_, Self> {
-        self.when(self.is_last_row())
-    }
-
-    /// Returns a sub-builder whose constraints are enforced on all rows except the last.
-    fn when_transition(&mut self) -> FilteredAirBuilder<'_, Self> {
-        self.when(self.is_transition())
-    }
-
-    /// Returns a sub-builder whose constraints are enforced on all rows except the last `size - 1`.
-    fn when_transition_window(&mut self, size: usize) -> FilteredAirBuilder<'_, Self> {
-        self.when(self.is_transition_window(size))
-    }
-
-    fn assert_zero<I: Into<Self::Expr>>(&mut self, x: I);
-
-    fn assert_one<I: Into<Self::Expr>>(&mut self, x: I) {
-        self.assert_zero(x.into() - Self::Expr::one());
-    }
-
-    fn assert_eq<I1: Into<Self::Expr>, I2: Into<Self::Expr>>(&mut self, x: I1, y: I2) {
-        self.assert_zero(x.into() - y.into());
-    }
-
-    /// Assert that `x` is a boolean, i.e. either 0 or 1.
-    fn assert_bool<I: Into<Self::Expr>>(&mut self, x: I) {
-        let x = x.into();
-        self.assert_zero(x.clone() * (x - Self::Expr::one()));
-    }
-
-    /// Assert that `x` is ternary, i.e. either 0, 1 or 2.
-    fn assert_tern<I: Into<Self::Expr>>(&mut self, x: I) {
-        let x = x.into();
-        self.assert_zero(x.clone() * (x.clone() - Self::Expr::one()) * (x - Self::Expr::two()));
-    }
 }
 
-pub trait AirBuilderWithPublicValues: AirBuilder {
-    type PublicVar: Into<Self::Expr> + Copy;
-
-    fn public_values(&self) -> &[Self::PublicVar];
-}
-
-pub trait PairBuilder: AirBuilder {
-    fn preprocessed(&self) -> Self::M;
-}
-
-pub trait ExtensionBuilder: AirBuilder {
-    type EF: ExtensionField<Self::F>;
-
-    type ExprEF: FieldExtensionAlgebra<Self::Expr, F = Self::EF>;
-
-    type VarEF: Into<Self::ExprEF> + Copy + Send + Sync;
-
-    fn assert_zero_ext<I>(&mut self, x: I)
-    where
-        I: Into<Self::ExprEF>;
-
-    fn assert_eq_ext<I1, I2>(&mut self, x: I1, y: I2)
-    where
-        I1: Into<Self::ExprEF>,
-        I2: Into<Self::ExprEF>,
-    {
-        self.assert_zero_ext(x.into() - y.into());
-    }
-
-    fn assert_one_ext<I>(&mut self, x: I)
-    where
-        I: Into<Self::ExprEF>,
-    {
-        self.assert_eq_ext(x, Self::ExprEF::ONE)
-    }
-}
-
-pub trait PermutationAirBuilder: ExtensionBuilder {
-    type MP: Matrix<Self::VarEF>;
-
-    type RandomVar: Into<Self::ExprEF> + Copy;
-
-    fn permutation(&self) -> Self::MP;
-
-    fn permutation_randomness(&self) -> &[Self::RandomVar];
-}
-
-#[derive(Debug)]
-pub struct FilteredAirBuilder<'a, AB: AirBuilder> {
-    pub inner: &'a mut AB,
-    condition: AB::Expr,
-}
-
-impl<'a, AB: AirBuilder> FilteredAirBuilder<'a, AB> {
-    pub fn condition(&self) -> AB::Expr {
-        self.condition.clone()
-    }
-}
-
-impl<'a, AB: AirBuilder> AirBuilder for FilteredAirBuilder<'a, AB> {
-    type F = AB::F;
-    type Expr = AB::Expr;
-    type Var = AB::Var;
-    type M = AB::M;
-
-    fn main(&self) -> Self::M {
-        self.inner.main()
-    }
-
-    fn is_first_row(&self) -> Self::Expr {
-        self.inner.is_first_row()
-    }
-
-    fn is_last_row(&self) -> Self::Expr {
-        self.inner.is_last_row()
-    }
-
-    fn is_transition_window(&self, size: usize) -> Self::Expr {
-        self.inner.is_transition_window(size)
-    }
-
-    fn assert_zero<I: Into<Self::Expr>>(&mut self, x: I) {
-        self.inner.assert_zero(self.condition() * x.into());
-    }
-}
-
-impl<'a, AB: ExtensionBuilder> ExtensionBuilder for FilteredAirBuilder<'a, AB> {
-    type EF = AB::EF;
-    type ExprEF = AB::ExprEF;
-    type VarEF = AB::VarEF;
-
-    fn assert_zero_ext<I>(&mut self, x: I)
-    where
-        I: Into<Self::ExprEF>,
-    {
-        self.inner.assert_zero_ext(x.into() * self.condition());
-    }
-}
-
-impl<'a, AB: PermutationAirBuilder> PermutationAirBuilder for FilteredAirBuilder<'a, AB> {
-    type MP = AB::MP;
-
-    type RandomVar = AB::RandomVar;
-
-    fn permutation(&self) -> Self::MP {
-        self.inner.permutation()
-    }
-
-    fn permutation_randomness(&self) -> &[Self::RandomVar] {
-        self.inner.permutation_randomness()
-    }
+/// An algebraic intermediate representation (AIR) definition.
+///
+/// Contains an evaluation function for computing the constraints of the AIR.
+/// This function can be applied to an evaluation trace in which case each
+/// constraint will compute a particular value or it can be applied symbolically
+/// with each constraint computing a symbolic expression.
+pub trait Air<AB: AirBuilder>: BaseAir<AB::F> {
+    /// Evaluate all AIR constraints using the provided builder.
+    ///
+    /// The builder provides both the trace on which the constraints
+    /// are evaluated on as well as the method of accumulating the
+    /// constraint evaluations.
+    ///
+    /// # Arguments
+    /// - `builder`: Mutable reference to an `AirBuilder` for defining constraints.
+    fn eval(&self, builder: &mut AB);
 }

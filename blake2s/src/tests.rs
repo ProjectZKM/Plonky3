@@ -1,0 +1,287 @@
+//! Every test pins this implementation to an outside reference:
+//!
+//! - RFC 7693's own vectors.
+//! - The official BLAKE2 known answers.
+//! - RustCrypto's `blake2`.
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use blake2::digest::consts::U32;
+use blake2::{Blake2s, Digest};
+use hex_literal::hex;
+use p3_symmetric::{CompressionFunctionFromHasher, CryptographicHasher, PseudoCompressionFunction};
+use proptest::prelude::*;
+
+use crate::{Blake2s256, DIGEST_BYTES, LANES};
+
+/// BLAKE2s-256 of "abc", from RFC 7693 appendix B.
+const ABC_DIGEST: [u8; DIGEST_BYTES] =
+    hex!("508C5E8C327C14E2E1A72BA34EEB452F37458B209ED63A294D999B4C86675982");
+
+/// The digest RustCrypto produces, which is the reference every comparison uses.
+fn reference(message: &[u8]) -> [u8; DIGEST_BYTES] {
+    Blake2s::<U32>::digest(message).into()
+}
+
+/// A deterministic byte stream, so a failure is the same failure next run.
+fn fixture(bytes: usize) -> Vec<u8> {
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    (0..bytes)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+/// Official BLAKE2s-256 known answers, as input and digest pairs.
+///
+/// Input `n` is the bytes `00 01 .. n-1`, for `n` from 0 to 255.
+///
+/// Each file is one hex digest per line, from the BLAKE2 reference repository:
+///
+/// ```text
+/// jq -r '.[] | select(.hash == "blake2s" and .key == "") | .out' testvectors/blake2-kat.json
+/// ```
+///
+/// The keyed file selects a non-empty key instead, always `00 01 .. 1f`.
+pub(crate) fn official_vectors(file: &str) -> impl Iterator<Item = (Vec<u8>, [u8; DIGEST_BYTES])> {
+    // A truncated file would silently skip the longest inputs.
+    assert_eq!(file.lines().count(), 256, "the vector file is truncated");
+    file.lines().enumerate().map(|(n, line)| {
+        // Input n counts up from zero.
+        let input = (0..n).map(|i| i as u8).collect();
+
+        // Two hex characters per digest byte.
+        let digest = core::array::from_fn(|i| {
+            u8::from_str_radix(&line[2 * i..2 * i + 2], 16).expect("hex digest")
+        });
+        (input, digest)
+    })
+}
+
+#[test]
+fn the_rfc_7693_vector_matches() {
+    assert_eq!(Blake2s256::hash(b"abc"), ABC_DIGEST);
+}
+
+#[test]
+fn known_answers_match_in_every_lane_of_a_batch() {
+    // Two full lane groups plus one spare, all of the same known message.
+    let count = 2 * LANES + 1;
+    let messages = b"abc".repeat(count);
+    let mut digests = vec![[0u8; DIGEST_BYTES]; count];
+    Blake2s256.hash_many(&messages, &mut digests);
+    assert!(digests.iter().all(|digest| digest == &ABC_DIGEST));
+}
+
+#[test]
+fn the_official_unkeyed_vectors_match() {
+    // Every length from 0 to 255 bytes: empty, every tail size, and up to four blocks.
+    for (input, digest) in official_vectors(include_str!("test_vectors/unkeyed.txt")) {
+        let len = input.len();
+        assert_eq!(Blake2s256::hash(&input), digest, "{len} bytes");
+        assert_eq!(Blake2s256.hash_slice(&input), digest, "{len} bytes");
+        assert_eq!(
+            Blake2s256.hash_iter(input.iter().copied()),
+            digest,
+            "{len} bytes, iterator"
+        );
+
+        // One byte per piece: the streaming state must hold back every block boundary.
+        assert_eq!(
+            Blake2s256.hash_iter_slices(input.chunks(1)),
+            digest,
+            "{len} bytes, one byte per piece"
+        );
+
+        // One full lane group plus one spare, so both the full and the padded group run.
+        let count = LANES + 1;
+        let mut digests = vec![[0u8; DIGEST_BYTES]; count];
+        Blake2s256.hash_many(&input.repeat(count), &mut digests);
+        assert!(digests.iter().all(|d| d == &digest), "{len} bytes, batched");
+    }
+}
+
+#[test]
+fn single_messages_match_the_blake2_crate() {
+    // Lengths that bracket every boundary: empty, inside one block, exactly one block, just
+    // past it, and several blocks with and without a tail.
+    for len in [0, 1, 55, 63, 64, 65, 127, 128, 129, 256, 1000] {
+        let message = fixture(len);
+        assert_eq!(
+            Blake2s256::hash(&message),
+            reference(&message),
+            "message of {len} bytes"
+        );
+    }
+}
+
+#[test]
+fn a_message_fed_in_pieces_hashes_the_same() {
+    // The last block is compressed differently from every other, so a split that lands on a
+    // block boundary is the one that would break a hasher that compresses too early.
+    let message = fixture(200);
+    for split in [0, 1, 63, 64, 65, 128, 199, 200] {
+        let (head, tail) = message.split_at(split);
+        assert_eq!(
+            Blake2s256.hash_iter_slices([head, tail]),
+            reference(&message),
+            "split at {split}"
+        );
+    }
+}
+
+#[test]
+fn hash_iter_matches_the_contiguous_message() {
+    for len in [0, 64, 513] {
+        let message = fixture(len);
+        assert_eq!(
+            Blake2s256.hash_iter(message.iter().copied()),
+            reference(&message),
+            "message of {len} bytes"
+        );
+    }
+}
+
+#[test]
+fn batches_match_the_blake2_crate() {
+    // Counts that fill a group exactly, leave a remainder, and fall short of one.
+    //
+    // Lengths cover every final-block size twice, plus one long message.
+    for count in [1, 3, LANES, LANES + 1, 2 * LANES, 2 * LANES + 5] {
+        for len in (0..=130).chain([1000]) {
+            let messages = fixture(len * count);
+            let mut digests = vec![[0u8; DIGEST_BYTES]; count];
+            Blake2s256.hash_many(&messages, &mut digests);
+
+            for (digest, message) in digests.iter().zip(messages.chunks_exact(len.max(1))) {
+                let expected = reference(if len == 0 { &[] } else { message });
+                assert_eq!(digest, &expected, "{count} messages of {len} bytes");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_batch_agrees_with_hashing_one_at_a_time() {
+    let count = 2 * LANES + 3;
+    let len = 137;
+    let messages = fixture(len * count);
+    let mut digests = vec![[0u8; DIGEST_BYTES]; count];
+    Blake2s256.hash_many(&messages, &mut digests);
+
+    for (digest, message) in digests.iter().zip(messages.chunks_exact(len)) {
+        assert_eq!(digest, &Blake2s256::hash(message));
+    }
+}
+
+#[test]
+fn every_partial_batch_matches_the_reference() {
+    // Each possible tail, alone and after a complete SIMD group. Empty messages still
+    // produce one digest per output slot; chunks() would silently skip those assertions.
+    for count in 1..=2 * LANES {
+        for len in [0, 63, 64, 65, 1024] {
+            let messages = fixture(len * count);
+            let mut digests = vec![[0u8; DIGEST_BYTES]; count];
+            Blake2s256.hash_many(&messages, &mut digests);
+            for (i, digest) in digests.iter().enumerate() {
+                assert_eq!(
+                    *digest,
+                    reference(&messages[i * len..(i + 1) * len]),
+                    "{count} messages of {len} bytes, message {i}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_empty_batch_reads_nothing() {
+    let mut digests: [[u8; DIGEST_BYTES]; 0] = [];
+    Blake2s256.hash_many(&[], &mut digests);
+}
+
+#[test]
+#[should_panic(expected = "whole multiple")]
+fn a_ragged_batch_is_rejected() {
+    let mut digests = vec![[0u8; DIGEST_BYTES]; 3];
+    Blake2s256.hash_many(&fixture(10), &mut digests);
+}
+
+#[test]
+fn every_length_matches_the_blake2_crate() {
+    // Invariant: the one-message path agrees with the reference at every length.
+    //
+    // Fixture state: 0 to 1100 bytes, seventeen block boundaries and every tail length.
+    for len in 0..=1100 {
+        let message = fixture(len);
+        assert_eq!(
+            Blake2s256::hash(&message),
+            reference(&message),
+            "{len} bytes"
+        );
+        assert_eq!(
+            Blake2s256.hash_iter(message.iter().copied()),
+            reference(&message),
+            "{len} bytes"
+        );
+    }
+}
+
+#[test]
+fn a_two_to_one_node_matches_the_blake2_crate() {
+    // A Merkle node: two 32-byte children hashed as one 64-byte message.
+    let compress = CompressionFunctionFromHasher::<_, 2, 32>::new(Blake2s256);
+    let message = fixture(64);
+    let children: [[u8; 32]; 2] = [
+        message[..32].try_into().unwrap(),
+        message[32..].try_into().unwrap(),
+    ];
+    assert_eq!(compress.compress(children), reference(&message));
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn any_split_of_a_message_hashes_the_same(
+        message in prop::collection::vec(any::<u8>(), 0..1100),
+        cuts in prop::collection::vec(0usize..1100, 0..8),
+    ) {
+        // Cut the message at random places, including empty pieces and cuts on block boundaries.
+        let mut cuts: Vec<usize> = cuts.into_iter().map(|c| c.min(message.len())).collect();
+        cuts.sort_unstable();
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        for cut in cuts.into_iter().chain([message.len()]) {
+            pieces.push(&message[start..cut]);
+            start = cut;
+        }
+        prop_assert_eq!(Blake2s256.hash_iter_slices(pieces), reference(&message));
+    }
+
+    #[test]
+    fn any_message_matches_the_blake2_crate(message in prop::collection::vec(any::<u8>(), 0..300)) {
+        prop_assert_eq!(Blake2s256::hash(&message), reference(&message));
+    }
+
+    #[test]
+    fn any_equal_length_batch_matches_one_at_a_time(
+        len in 0usize..=1100,
+        count in 1usize..=3 * LANES + 7,
+    ) {
+        // Counts reach three full groups, and most leave a partial group after them.
+        // Lengths reach seventeen blocks, and most end in a partial final block.
+        let messages = fixture(len * count);
+        let mut digests = vec![[0u8; DIGEST_BYTES]; count];
+        Blake2s256.hash_many(&messages, &mut digests);
+        for (digest, message) in digests.iter().zip(messages.chunks(len.max(1))) {
+            let expected = if len == 0 { Blake2s256::hash(&[]) } else { Blake2s256::hash(message) };
+            prop_assert_eq!(digest, &expected);
+        }
+    }
+}

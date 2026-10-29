@@ -1,0 +1,2008 @@
+//! Derived WHIR protocol configuration computed from user-facing parameters.
+
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::ops::Deref;
+
+use p3_challenger::{FieldChallenger, GrindingChallenger};
+use p3_field::{ExtensionField, Field, TwoAdicField};
+use p3_security::ErrorBits;
+use thiserror::Error;
+
+use super::{FoldingFactor, FoldingFactorError, ProtocolParameters, SecurityAssumption};
+use crate::domain::WhirDomain;
+
+/// Reasons a set of user-facing parameters cannot form a valid WHIR configuration.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum WhirConfigError {
+    /// The number of claims cannot be represented by the budget counter.
+    #[error("initial claim count overflow")]
+    InitialClaimCountOverflow,
+    /// Initial alpha batching cannot reach the target without grinding.
+    #[error(
+        "initial claim combination of {num_claims} claims retains {bits} bits, below the {security_level}-bit target; reduce the claim count or use a larger extension field"
+    )]
+    InitialClaimsBelowTarget {
+        num_claims: usize,
+        bits: f64,
+        security_level: usize,
+    },
+    /// The evaluation domain does not support the requested soundness regime.
+    #[error("the evaluation domain does not support the {assumption} soundness regime")]
+    UnsupportedSecurityAssumption {
+        /// Requested Reed--Solomon soundness regime.
+        assumption: SecurityAssumption,
+    },
+    /// The folding factor is incompatible with the polynomial size.
+    #[error(transparent)]
+    FoldingFactor(#[from] FoldingFactorError),
+
+    /// A domain after a fold exceeds the encoder's capacity.
+    ///
+    /// - Twiddles and query equality polynomials must stay in the base field.
+    /// - A larger folding factor in that round shrinks this domain.
+    #[error(
+        "folded domain 2^{log_folded_domain_size} exceeds encoder capacity 2^{max_log_domain_size}; fold more variables in that round"
+    )]
+    FoldedDomainExceedsCapacity {
+        /// Base-two logarithm of the domain required after the fold.
+        log_folded_domain_size: usize,
+        /// Largest base-two domain dimension supported by the encoder.
+        max_log_domain_size: usize,
+    },
+
+    /// The initial Reed-Solomon evaluation domain cannot be represented as a
+    /// `usize` length.
+    ///
+    /// The initial domain has size `2^(num_variables + starting_log_inv_rate)`.
+    /// That exponent must fit in `usize` and be strictly less than
+    /// `usize::BITS` before computing `1 << exponent`.
+    #[error(
+        "initial domain exponent num_variables ({num_variables}) + starting_log_inv_rate ({starting_log_inv_rate}) must fit and be less than usize::BITS ({usize_bits})"
+    )]
+    InitialDomainExceedsUsize {
+        num_variables: usize,
+        starting_log_inv_rate: usize,
+        usize_bits: usize,
+    },
+
+    /// Explicit per-round codeword rates have the wrong length.
+    #[error("expected {expected} explicit codeword rates (one per round), got {actual}")]
+    RoundRateCountMismatch { expected: usize, actual: usize },
+
+    /// Explicit per-round folding factors have the wrong length.
+    #[error("expected {expected} explicit folding factors (one per phase), got {actual}")]
+    FoldingFactorCountMismatch { expected: usize, actual: usize },
+
+    /// A requested codeword rate would require growing the Reed-Solomon domain.
+    #[error("round {round}: requested codeword rate would require growing the RS domain")]
+    RateGrowsDomain { round: usize },
+
+    /// The starting code rate is not redundant.
+    ///
+    /// - A rate of `2^-0 = 1` adds no Reed-Solomon redundancy.
+    /// - A proximity test needs redundancy, so there is nothing to check.
+    /// - At rate `1` the proximity parameter `delta` is `<= 0`.
+    /// - The query count `ceil(-lambda / log2(1 - delta))` is then non-positive.
+    /// - A non-positive count rounds down to zero queries.
+    /// - With zero queries the verifier accepts any committed function.
+    ///
+    /// Every code rate must be redundant: rate `<= 1/2`.
+    #[error(
+        "starting_log_inv_rate must be >= 1 (rate <= 1/2); got 2^-{log_inv_rate}, a non-redundant code whose proximity test makes zero queries"
+    )]
+    NonRedundantStartingRate { log_inv_rate: usize },
+
+    /// The derived schedule opens no position.
+    ///
+    /// - Queries are the only part of the run that tests proximity.
+    /// - A schedule opening none of them accepts any committed function.
+    /// - A redundant rate rules out the usual way of reaching zero.
+    /// - Crediting grinding with the whole target reaches it anyway.
+    ///
+    /// The protocol level is a saturating difference.
+    ///
+    /// So the credit is whole whenever the budget reaches the target, not only at zero:
+    ///
+    /// ```text
+    ///     pow_bits >= security_level  ->  protocol level 0  ->  no query is bought
+    /// ```
+    ///
+    /// The count is derived, so this catches every parameter combination that lands on zero.
+    #[error(
+        "the derived schedule opens no position, so the proximity test accepts any committed function"
+    )]
+    ZeroQueries,
+
+    /// A per-round code rate is not redundant.
+    ///
+    /// - The codeword committed after one intermediate round has rate `1`.
+    /// - A rate of `1` drives that round's query count to zero.
+    /// - The failure matches a non-redundant starting rate.
+    #[error(
+        "round {round}: log_inv_rate must be >= 1 (rate <= 1/2); got 2^-{log_inv_rate}, a non-redundant code whose proximity test makes zero queries"
+    )]
+    NonRedundantRoundRate { round: usize, log_inv_rate: usize },
+
+    /// No out-of-domain sample count reaches the requested security level.
+    ///
+    /// - The field is too small for the requested security level.
+    /// - Lower the security level or use a larger extension field.
+    #[error(
+        "no out-of-domain sample count reaches {security_level}-bit security with a {field_size_bits}-bit field"
+    )]
+    OodSamplesInfeasible {
+        security_level: usize,
+        field_size_bits: usize,
+    },
+
+    /// A derived proof-of-work difficulty exceeds the configured grinding budget.
+    ///
+    /// - Each phase grinds `security_level - algebraic_bits` bits to hit target.
+    /// - When the field or rate is too weak, that gap exceeds the budget.
+    /// - The instance then cannot reach `security_level` within allowed grinding.
+    ///
+    /// Raise the grinding budget, lower the security level, or use a larger
+    /// extension field or smaller rate.
+    #[error(
+        "derived proof-of-work of {required} bits exceeds the {budget}-bit grinding budget; the field or rate is too weak for the requested security"
+    )]
+    PowBitsExceedBudget { required: usize, budget: usize },
+    /// A derived proof-of-work difficulty is at least the base field's bit length.
+    ///
+    /// A witness is checked by sampling that many bits of one base field element.
+    ///
+    /// A difficulty that wide cannot be sampled, so grinding at it panics.
+    #[error("derived proof-of-work of {bits} bits does not fit a {field_bits}-bit base field")]
+    PowBitsExceedField { bits: usize, field_bits: usize },
+}
+
+/// Derived configuration for a single intermediate WHIR round.
+///
+/// All values are computed from the user-facing protocol parameters
+/// and the accumulated state from prior rounds.
+#[derive(Debug, Clone)]
+pub struct RoundConfig {
+    /// Proof-of-work difficulty (in bits) for the STIR query phase.
+    pub pow_bits: usize,
+    /// Proof-of-work difficulty (in bits) for the folding sumcheck phase.
+    pub folding_pow_bits: usize,
+    /// Number of STIR proximity queries to make in this round.
+    pub num_queries: usize,
+    /// Number of out-of-domain evaluation samples.
+    pub ood_samples: usize,
+    /// Number of multilinear variables remaining after folding in this round.
+    pub num_variables: usize,
+    /// Number of variables folded in this round.
+    pub folding_factor: usize,
+    /// Log-inverse rate of the codeword committed after this round.
+    pub log_inv_rate: usize,
+    /// Size of the evaluation domain before folding in this round.
+    pub domain_size: usize,
+    /// Base-two logarithm of the folded evaluation domain size.
+    pub log_folded_domain_size: usize,
+}
+
+/// Query budget of one terminal proximity test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalBudget {
+    /// Number of proximity queries against the terminal codeword.
+    pub num_queries: usize,
+    /// Proof-of-work difficulty (in bits) guarding those queries.
+    pub pow_bits: usize,
+}
+
+/// Fully derived WHIR protocol configuration.
+///
+/// Built from user-facing protocol parameters plus the polynomial size.
+///
+/// Contains all precomputed values needed by the prover and verifier.
+///
+/// Fields are written only by the constructors in this module; the schedule
+/// is read through accessors.
+///
+/// ```
+/// use p3_field::{ExtensionField, Field};
+/// use p3_whir::WhirConfig;
+///
+/// fn final_queries<EF: ExtensionField<F>, F: Field, C>(config: &WhirConfig<EF, F, C>) -> usize {
+///     config.terminal().num_queries
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use p3_field::{ExtensionField, Field};
+/// use p3_whir::WhirConfig;
+///
+/// fn weaken<EF: ExtensionField<F>, F: Field, C>(config: &mut WhirConfig<EF, F, C>) {
+///     config.terminal.num_queries = 0;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use p3_field::{ExtensionField, Field};
+/// use p3_whir::{SecurityAssumption, WhirConfig};
+///
+/// fn swap_regime<EF: ExtensionField<F>, F: Field, C>(config: &mut WhirConfig<EF, F, C>) {
+///     config.params.soundness_type = SecurityAssumption::CapacityBound;
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct WhirConfig<EF, F, Challenger>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    /// Number of variables in the original multilinear polynomial.
+    pub(crate) num_variables: usize,
+    /// Largest base-two domain dimension supported by the encoder.
+    pub(crate) max_log_domain_size: usize,
+    /// Stable evaluation-domain identity committed by the transcript.
+    pub(crate) domain_id: Vec<u8>,
+    /// Whether proximity queries are allocated to protocol-fixed strata.
+    pub(crate) stratified_queries: bool,
+    /// Protocol parameters.
+    pub(crate) params: ProtocolParameters,
+    /// Per-round derived configuration for each intermediate STIR round.
+    pub(crate) round_parameters: Vec<RoundConfig>,
+    /// Concrete folding factors used before the final direct-send phase.
+    ///
+    /// For constant schedules the last entry may be smaller than the nominal
+    /// configured factor, e.g. `Constant(8)` on 15 variables derives `[8, 7]`.
+    pub(crate) folding_schedule: Vec<usize>,
+    /// Number of out-of-domain samples during the commitment phase.
+    pub(crate) commitment_ood_samples: usize,
+    /// PoW bits for the initial folding sumcheck (before any STIR rounds).
+    pub(crate) starting_folding_pow_bits: usize,
+    /// Query budget of the final proximity test against the last committed codeword.
+    pub(crate) terminal: TerminalBudget,
+    /// Number of sumcheck rounds in the final phase.
+    pub(crate) final_sumcheck_rounds: usize,
+    /// PoW bits for the final folding sumcheck.
+    pub(crate) final_folding_pow_bits: usize,
+    /// Phantom marker for the extension field type.
+    _extension_field: PhantomData<EF>,
+    /// Phantom marker for the base field type.
+    _base_field: PhantomData<F>,
+    /// Phantom marker for the challenger type.
+    _challenger: PhantomData<Challenger>,
+}
+
+impl<EF, F, Challenger> Deref for WhirConfig<EF, F, Challenger>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    type Target = ProtocolParameters;
+
+    fn deref(&self) -> &Self::Target {
+        &self.params
+    }
+}
+
+impl<EF, F, Challenger> WhirConfig<EF, F, Challenger>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+{
+    /// Number of variables in the original multilinear polynomial.
+    pub const fn num_variables(&self) -> usize {
+        self.num_variables
+    }
+
+    /// User-facing parameters the schedule was derived from.
+    pub const fn params(&self) -> &ProtocolParameters {
+        &self.params
+    }
+
+    /// Derived configuration of each intermediate round, in round order.
+    pub fn round_parameters(&self) -> &[RoundConfig] {
+        &self.round_parameters
+    }
+
+    /// Concrete folding factors used before the final direct-send phase.
+    pub fn folding_schedule(&self) -> &[usize] {
+        &self.folding_schedule
+    }
+
+    /// Number of out-of-domain samples during the commitment phase.
+    pub const fn commitment_ood_samples(&self) -> usize {
+        self.commitment_ood_samples
+    }
+
+    /// The same schedule with no out-of-domain sample on the initial commitment.
+    ///
+    /// Every term the security report charges already union-bounds over the commitment's decoding list.
+    ///
+    /// That list is also reported as the candidate set, which a caller's own challenges are charged over.
+    ///
+    /// The sample is drawn at opening time, after those challenges, so it binds nothing they rely on.
+    ///
+    /// Dropping it removes its term from the report and one pass over the committed table.
+    #[must_use]
+    pub const fn without_commitment_ood(mut self) -> Self {
+        self.commitment_ood_samples = 0;
+        self
+    }
+
+    /// PoW bits for the initial folding sumcheck.
+    pub const fn starting_folding_pow_bits(&self) -> usize {
+        self.starting_folding_pow_bits
+    }
+
+    /// Query budget of the final proximity test against the last committed codeword.
+    pub const fn terminal(&self) -> TerminalBudget {
+        self.terminal
+    }
+
+    /// Number of sumcheck rounds in the final phase.
+    pub const fn final_sumcheck_rounds(&self) -> usize {
+        self.final_sumcheck_rounds
+    }
+
+    /// PoW bits for the final folding sumcheck.
+    pub const fn final_folding_pow_bits(&self) -> usize {
+        self.final_folding_pow_bits
+    }
+
+    /// Whether each query phase draws one index in every stratum of its power-of-two summands.
+    pub const fn stratified_queries(&self) -> bool {
+        self.stratified_queries
+    }
+}
+
+/// Round a real-valued proof-of-work gap up to whole grinding bits.
+///
+/// Grinding contributes whole bits of security: a witness with `b` leading
+/// zero bits adds exactly `b` bits.
+///
+/// The gap to grind is `security_level - algebraic_bits`, a real number.
+/// - Flooring drops the fractional part.
+/// - Achieved security `algebraic_bits + floor(gap)` then dips below target.
+/// - Rounding up keeps `algebraic_bits + ceil(gap) >= security_level`.
+///
+/// Mirrors the query-count derivation, which rounds up for the same reason.
+fn ceil_pow_bits(gap: f64) -> usize {
+    libm::ceil(gap) as usize
+}
+
+/// Reject a proof-of-work difficulty the base field cannot grind.
+///
+/// A witness is checked by sampling that many bits of one base field element.
+///
+/// An odd prime of bit length b exceeds 2^(b - 1), so up to b - 1 bits can be sampled.
+///
+/// At b bits or more the sample does not exist, and grinding panics.
+pub(crate) fn check_grindable<F: Field>(bits: usize) -> Result<(), WhirConfigError> {
+    // The sampled bits come back as a machine word, so the word size caps the field size too.
+    let field_bits = F::bits().min(usize::BITS as usize);
+    if bits >= field_bits {
+        return Err(WhirConfigError::PowBitsExceedField { bits, field_bits });
+    }
+    Ok(())
+}
+
+impl<EF, F, Challenger> WhirConfig<EF, F, Challenger>
+where
+    F: TwoAdicField,
+    EF: ExtensionField<F> + TwoAdicField,
+    Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
+    /// Derive a configuration and check the concrete opening-claim count.
+    /// Commitment-phase OOD claims are added automatically after derivation.
+    pub fn new_with_initial_claims(
+        num_variables: usize,
+        whir_parameters: ProtocolParameters,
+        num_opening_claims: usize,
+    ) -> Result<Self, WhirConfigError> {
+        let config = Self::new(num_variables, whir_parameters)?;
+        config.validate_initial_claims(
+            num_opening_claims.saturating_add(config.commitment_ood_samples),
+        )?;
+        Ok(config)
+    }
+
+    /// Derive a full protocol configuration from user-facing parameters.
+    ///
+    /// When the opening count is known, prefer [`Self::new_with_initial_claims`];
+    /// otherwise the PCS validates the full batch at opening and verification time.
+    /// The target applies per error term. Full PCS security composes their
+    /// probabilities.
+    ///
+    /// # Errors
+    ///
+    /// - The domain does not support the requested soundness regime.
+    /// - The folding factor does not fit the polynomial size.
+    /// - The first fold leaves a domain larger than the encoder's capacity.
+    /// - Explicit per-round rates or folding factors have the wrong length.
+    /// - A requested rate would grow the Reed-Solomon domain.
+    /// - The field is too small to reach the requested security level.
+    /// - A derived proof-of-work difficulty exceeds the grinding budget.
+    pub fn new(
+        num_variables: usize,
+        whir_parameters: ProtocolParameters,
+    ) -> Result<Self, WhirConfigError> {
+        Self::new_with_max_domain_log(num_variables, whir_parameters, F::TWO_ADICITY)
+    }
+}
+
+impl<EF, F, Challenger> WhirConfig<EF, F, Challenger>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+    Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+{
+    /// Derives a configuration for a concrete evaluation domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WhirConfigError`] when the domain cannot support the derived
+    /// schedule or the requested security target is infeasible.
+    pub fn new_with_domain<D>(
+        num_variables: usize,
+        whir_parameters: ProtocolParameters,
+        domain: &D,
+    ) -> Result<Self, WhirConfigError>
+    where
+        D: WhirDomain<F, EF>,
+    {
+        // A domain may rule out regimes whose distance assumptions do not hold.
+        if !domain.supports_security_assumption(whir_parameters.soundness_type) {
+            return Err(WhirConfigError::UnsupportedSecurityAssumption {
+                assumption: whir_parameters.soundness_type,
+            });
+        }
+
+        // Derive the schedule only after its security regime is accepted.
+        let mut config = Self::new_with_max_domain_log(
+            num_variables,
+            whir_parameters,
+            domain.max_log_domain_size(),
+        )?;
+        config.domain_id = domain.protocol_id().to_vec();
+        config.stratified_queries = domain.stratified_queries();
+        Ok(config)
+    }
+
+    /// Bits retained by the initial alpha combination, without later PoW credit.
+    ///
+    /// The count includes concrete openings and commitment-phase OOD claims.
+    pub fn initial_claims_error(&self, num_claims: usize) -> f64 {
+        // The bit width rounds up.
+        // Subtracting one conservatively lower-bounds `log_2(|EF|)`.
+        self.soundness_type.initial_claims_error(
+            EF::bits() - 1,
+            self.num_variables,
+            self.starting_log_inv_rate,
+            num_claims,
+        )
+    }
+
+    /// Reject an initial claim batch whose algebraic bound misses the target.
+    ///
+    /// The batching challenge precedes the first folding grind.
+    /// Grinding therefore cannot recover security lost by this combination.
+    pub fn validate_initial_claims(&self, num_claims: usize) -> Result<(), WhirConfigError> {
+        let bits = self.initial_claims_error(num_claims);
+        if bits < self.security_level as f64 {
+            return Err(WhirConfigError::InitialClaimsBelowTarget {
+                num_claims,
+                bits,
+                security_level: self.security_level,
+            });
+        }
+        Ok(())
+    }
+
+    /// Derive a configuration for a domain with the supplied maximum dimension.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn new_with_max_domain_log(
+        num_variables: usize,
+        whir_parameters: ProtocolParameters,
+        max_log_domain_size: usize,
+    ) -> Result<Self, WhirConfigError> {
+        // ---------------------------------------------------------------
+        // Phase 1: Validate inputs and set up global constants.
+        // ---------------------------------------------------------------
+
+        // Preserve the original variable count; the mutable copy below
+        // tracks the remaining variables as we consume them round by round.
+        let initial_num_variables = num_variables;
+
+        // Invariant: the Reed-Solomon code must be redundant, rate <= 1/2.
+        //
+        //     rate 1             -> proximity parameter delta <= 0
+        //     delta <= 0         -> query count ceil(-lambda / log2(1 - delta)) <= 0
+        //     non-positive count -> rounds down to zero STIR queries
+        //     zero queries       -> verifier accepts any committed function
+        if whir_parameters.starting_log_inv_rate == 0 {
+            return Err(WhirConfigError::NonRedundantStartingRate {
+                log_inv_rate: whir_parameters.starting_log_inv_rate,
+            });
+        }
+
+        // Derive the concrete folding schedule once. Validation is a property
+        // of this derivation, so all later code uses the same source of truth.
+        let folding_schedule = whir_parameters
+            .folding_factor
+            .compute_folding_schedule(num_variables)?;
+
+        // PoW contributes an independent additive term to security,
+        // so the algebraic protocol only needs to cover the remainder.
+        let protocol_security_level = whir_parameters
+            .security_level
+            .saturating_sub(whir_parameters.pow_bits);
+
+        // Field size, in bits, that every per-element error is priced against.
+        //
+        //     BabyBear^4: |EF| < 2^124  ->  bit length 124  ->  priced at 123
+        //
+        // The bit length of the order rounds log_2(|EF|) up, so one bit less is a lower bound.
+        //
+        // Johnson drops one more bit, the reserve the security report takes off each proximity gap.
+        //
+        // Its other terms, priced one bit lower than the report needs, only gain slack.
+        let field_size_bits = (EF::bits() - 1).saturating_sub(usize::from(
+            whir_parameters.soundness_type == SecurityAssumption::JohnsonBound,
+        ));
+
+        // Mutable state that evolves as we derive per-round parameters.
+        let mut log_inv_rate = whir_parameters.starting_log_inv_rate;
+        let mut num_variables = num_variables;
+
+        // Initial evaluation domain: 2^(num_variables + log_inv_rate) points.
+        let log_domain_size = num_variables
+            .checked_add(log_inv_rate)
+            .filter(|&log_domain_size| log_domain_size < usize::BITS as usize)
+            .ok_or(WhirConfigError::InitialDomainExceedsUsize {
+                num_variables,
+                starting_log_inv_rate: log_inv_rate,
+                usize_bits: usize::BITS as usize,
+            })?;
+        let mut domain_size: usize = 1 << log_domain_size;
+
+        // ---------------------------------------------------------------
+        // Phase 2: Encoder-capacity guard.
+        // ---------------------------------------------------------------
+        //
+        // After the first fold the domain has size 2^log_folded_domain_size.
+        // Every later fold is checked once the schedule is derived, below.
+        // We restrict these to the domain's advertised maximum so that:
+        //   - transform twiddle factors stay in the base field (faster).
+        //   - WHIR query equality polynomials stay in the base field.
+        //
+        // A larger folding_factor_0 pushes the folded domain below the limit.
+        // This does NOT restrict how much data can be committed.
+        let log_folded_domain_size = log_domain_size - folding_schedule[0];
+        if log_folded_domain_size > max_log_domain_size {
+            return Err(WhirConfigError::FoldedDomainExceedsCapacity {
+                log_folded_domain_size,
+                max_log_domain_size,
+            });
+        }
+
+        // ---------------------------------------------------------------
+        // Phase 3: Determine round structure.
+        // ---------------------------------------------------------------
+
+        // How many intermediate STIR rounds, and how many variables remain
+        // for the final direct-send sumcheck.
+        // An invalid per-round schedule surfaces as a folding-factor config error.
+        let folded_variables: usize = folding_schedule.iter().sum();
+        let num_rounds = folding_schedule.len() - 1;
+        let final_sumcheck_rounds = num_variables - folded_variables;
+
+        let round_log_inv_rates = if whir_parameters.round_log_inv_rates.is_empty() {
+            let mut rates = Vec::with_capacity(num_rounds);
+            let mut rate = whir_parameters.starting_log_inv_rate;
+            for &folding_factor in folding_schedule.iter().take(num_rounds) {
+                rate += folding_factor - 1;
+                rates.push(rate);
+            }
+            rates
+        } else {
+            if whir_parameters.round_log_inv_rates.len() != num_rounds {
+                return Err(WhirConfigError::RoundRateCountMismatch {
+                    expected: num_rounds,
+                    actual: whir_parameters.round_log_inv_rates.len(),
+                });
+            }
+            whir_parameters.round_log_inv_rates.clone()
+        };
+
+        // Same redundancy invariant, applied to each intermediate-round rate.
+        //
+        //     derived rates  : inherit the starting rate and only grow -> always >= 1
+        //     explicit rates : caller-supplied, so a 0 entry must be rejected here
+        if let Some(round) = round_log_inv_rates.iter().position(|&rate| rate == 0) {
+            return Err(WhirConfigError::NonRedundantRoundRate {
+                round,
+                log_inv_rate: round_log_inv_rates[round],
+            });
+        }
+
+        if let FoldingFactor::PerRound(factors) = &whir_parameters.folding_factor
+            && factors.len() != num_rounds + 1
+        {
+            return Err(WhirConfigError::FoldingFactorCountMismatch {
+                expected: num_rounds + 1,
+                actual: factors.len(),
+            });
+        }
+
+        // OOD samples for the commitment phase (before any folding).
+        let commitment_ood_samples = whir_parameters
+            .soundness_type
+            .determine_ood_samples(
+                whir_parameters.security_level,
+                num_variables,
+                log_inv_rate,
+                field_size_bits,
+            )
+            .ok_or(WhirConfigError::OodSamplesInfeasible {
+                security_level: whir_parameters.security_level,
+                field_size_bits,
+            })?;
+
+        // PoW difficulty for the very first folding sumcheck.
+        let starting_folding_pow_bits = whir_parameters.soundness_type.folding_pow_bits(
+            whir_parameters.security_level,
+            field_size_bits,
+            num_variables,
+            log_inv_rate,
+        );
+
+        // ---------------------------------------------------------------
+        // Phase 4: Per-round parameter derivation.
+        // ---------------------------------------------------------------
+        //
+        // After the initial fold, each round i:
+        //   1. Reads the configured/derived code rate after folding.
+        //   2. Determines query count from the old rate (queries test
+        //      proximity to the code *before* this round's fold).
+        //   3. Determines OOD sample count from the new rate.
+        //   4. Derives PoW for both the query and folding sub-steps.
+        //   5. Records the domain generator for the folded evaluation domain.
+
+        let mut round_parameters = Vec::with_capacity(num_rounds);
+
+        // Subtract the first-round folding factor; the loop below
+        // handles subsequent rounds.
+        num_variables -= folding_schedule[0];
+
+        for (round, &next_rate) in round_log_inv_rates.iter().enumerate() {
+            let folding_factor = folding_schedule[round];
+            if next_rate > log_inv_rate + folding_factor {
+                return Err(WhirConfigError::RateGrowsDomain { round });
+            }
+            let rs_reduction_factor = log_inv_rate + folding_factor - next_rate;
+
+            // Queries use the *old* rate; OOD and folding use the *new* rate.
+            // Number of STIR proximity queries at the current (old) rate.
+            let num_queries = whir_parameters
+                .soundness_type
+                .queries(protocol_security_level, log_inv_rate);
+
+            // OOD samples needed at the post-fold (new) rate.
+            let ood_samples = whir_parameters
+                .soundness_type
+                .determine_ood_samples(
+                    whir_parameters.security_level,
+                    num_variables,
+                    next_rate,
+                    field_size_bits,
+                )
+                .ok_or(WhirConfigError::OodSamplesInfeasible {
+                    security_level: whir_parameters.security_level,
+                    field_size_bits,
+                })?;
+
+            // Two error sources bound the STIR round:
+            //   - query_error: (1 - delta)^num_queries proximity test.
+            //   - combination_error: random linear combination of OOD + queries.
+            // Either failure breaks the round, so the two probabilities add (WHIR, Theorem 5.2).
+            let query_error = whir_parameters
+                .soundness_type
+                .queries_error(log_inv_rate, num_queries);
+            let combination_error = whir_parameters.soundness_type.queries_combination_error(
+                field_size_bits,
+                num_variables,
+                next_rate,
+                ood_samples,
+                num_queries,
+            );
+
+            // PoW bridges the gap between the target and the summed error.
+            //
+            //     bits:        a, b
+            //     probability: 2^-a + 2^-b
+            //     total bits:  -log_2(2^-a + 2^-b), at most min(a, b)
+            let round_error = ErrorBits::sum(&[
+                ErrorBits::from_log2(query_error),
+                ErrorBits::from_log2(combination_error),
+            ])
+            .bits();
+            let pow_bits = 0_f64.max(whir_parameters.security_level as f64 - round_error);
+
+            // PoW difficulty for the folding sumcheck at the new rate.
+            let folding_pow_bits = whir_parameters.soundness_type.folding_pow_bits(
+                whir_parameters.security_level,
+                field_size_bits,
+                num_variables,
+                next_rate,
+            );
+
+            let next_folding_factor = folding_schedule[round + 1];
+
+            let log_folded_domain_size = domain_size.ilog2() as usize - folding_factor;
+
+            round_parameters.push(RoundConfig {
+                pow_bits: ceil_pow_bits(pow_bits),
+                folding_pow_bits: ceil_pow_bits(folding_pow_bits),
+                num_queries,
+                ood_samples,
+                num_variables,
+                folding_factor,
+                log_inv_rate: next_rate,
+                domain_size,
+                log_folded_domain_size,
+            });
+
+            // Advance mutable state for the next iteration.
+            num_variables -= next_folding_factor;
+            log_inv_rate = next_rate;
+            domain_size >>= rs_reduction_factor;
+        }
+
+        // ---------------------------------------------------------------
+        // Phase 5: Final round parameters.
+        // ---------------------------------------------------------------
+
+        // Final proximity queries at the last accumulated rate.
+        let final_queries = whir_parameters
+            .soundness_type
+            .queries(protocol_security_level, log_inv_rate);
+
+        // PoW for the final query phase: covers the gap between the
+        // target and the query error at the final rate.
+        let final_pow_bits = 0_f64.max(
+            whir_parameters.security_level as f64
+                - whir_parameters
+                    .soundness_type
+                    .queries_error(log_inv_rate, final_queries),
+        );
+
+        // The final folding sumcheck error is bounded by 1/|F|,
+        // so PoW = max(0, security_level - (field_size - 1)).
+        let final_folding_pow_bits =
+            0_f64.max(whir_parameters.security_level as f64 - (field_size_bits - 1) as f64);
+
+        // Validate construction
+        assert_eq!(
+            initial_num_variables,
+            folding_schedule.iter().sum::<usize>() + final_sumcheck_rounds
+        );
+
+        let config = Self {
+            params: whir_parameters,
+            max_log_domain_size,
+            domain_id: Vec::new(),
+            stratified_queries: false,
+            commitment_ood_samples,
+            num_variables: initial_num_variables,
+            starting_folding_pow_bits: ceil_pow_bits(starting_folding_pow_bits),
+            round_parameters,
+            folding_schedule,
+            terminal: TerminalBudget {
+                num_queries: final_queries,
+                pow_bits: ceil_pow_bits(final_pow_bits),
+            },
+            final_sumcheck_rounds,
+            final_folding_pow_bits: ceil_pow_bits(final_folding_pow_bits),
+            _extension_field: PhantomData,
+            _base_field: PhantomData,
+            _challenger: PhantomData,
+        };
+
+        // The final-round config must expose exactly the direct-send variable count.
+        //
+        //     prover     : sends 2^count final evaluations in the clear
+        //     verifier   : length-checks the final polynomial against 2^count
+        //     transcript : absorbs 2^count final coefficients
+        assert_eq!(
+            config.final_round_config().num_variables,
+            config.final_sumcheck_rounds
+        );
+
+        // Every folded domain must fit the encoder, not only the first one.
+        //
+        // A round that folds fewer variables than the first keeps a larger folded domain:
+        //
+        //     BabyBear, 28 variables, schedule [8, 2, 18], rates [10, 10]
+        //
+        //     round 0:  domain 2^30, fold 8  ->  2^22   (checked above)
+        //     round 1:  domain 2^30, fold 2  ->  2^28   (above the two-adicity 27)
+        //
+        // Its codeword then needs a 2^28-point transform, and its query points a generator of that order.
+        let later_folds = config
+            .round_parameters
+            .iter()
+            .map(|round| round.log_folded_domain_size)
+            .chain(core::iter::once(
+                config.final_round_config().log_folded_domain_size,
+            ));
+        if let Some(log_folded_domain_size) =
+            later_folds.max().filter(|&log| log > max_log_domain_size)
+        {
+            return Err(WhirConfigError::FoldedDomainExceedsCapacity {
+                log_folded_domain_size,
+                max_log_domain_size,
+            });
+        }
+
+        // Invariant: the schedule must open at least one position.
+        //
+        // A non-redundant rate is refused above, which rules out the usual route to zero.
+        //
+        // Crediting grinding with the whole target is the other, and nothing above sees it.
+        //
+        // The protocol level is a saturating difference.
+        //
+        // So that credit is whole whenever the budget reaches the target, not only at zero:
+        //
+        //     - pow_bits >= security_level  ->  protocol level 0, so no query is bought
+        //     - zero queries                ->  nothing ties a codeword to its commitment
+        if config.terminal.num_queries == 0
+            && config
+                .round_parameters
+                .iter()
+                .all(|round| round.num_queries == 0)
+        {
+            return Err(WhirConfigError::ZeroQueries);
+        }
+
+        // Enforce the grinding budget.
+        // A derived PoW above the cap means the field or rate cannot reach
+        // security_level within the allowed grinding, so the claimed security
+        // would be aspirational rather than met.
+        let required = config.max_pow_bits();
+        if required > config.params.pow_bits {
+            return Err(WhirConfigError::PowBitsExceedBudget {
+                required,
+                budget: config.params.pow_bits,
+            });
+        }
+
+        // The budget can exceed what the base field grinds, so check the largest difficulty.
+        //
+        //     BabyBear, 40-bit budget: 31 bits fits the budget, but 2^31 > p cannot be sampled
+        check_grindable::<F>(required)?;
+
+        Ok(config)
+    }
+
+    /// Returns the size of the initial evaluation domain.
+    ///
+    /// This is the size of the domain used to evaluate the original multilinear polynomial
+    /// before any folding or reduction steps are applied in the WHIR protocol.
+    ///
+    /// It is computed as:
+    ///
+    /// \begin{equation}
+    /// 2^{\text{num\_variables} + \text{starting\_log\_inv\_rate}}
+    /// \end{equation}
+    ///
+    /// - `num_variables` is the number of variables in the original multivariate polynomial.
+    /// - `starting_log_inv_rate` is the initial inverse rate of the Reed-Solomon code,
+    ///   controlling redundancy relative to the degree.
+    ///
+    /// # Returns
+    /// A power-of-two value representing the number of evaluation points in the starting domain.
+    pub const fn starting_domain_size(&self) -> usize {
+        1 << (self.num_variables + self.params.starting_log_inv_rate)
+    }
+
+    /// Returns the number of intermediate STIR rounds (excludes the final round).
+    pub const fn n_rounds(&self) -> usize {
+        self.round_parameters.len()
+    }
+
+    /// Returns how many bits the RS domain shrinks by at the given round.
+    pub fn rs_reduction_factor(&self, round: usize) -> usize {
+        let previous_log_inv_rate = if round == 0 {
+            self.params.starting_log_inv_rate
+        } else {
+            self.round_parameters[round - 1].log_inv_rate
+        };
+        previous_log_inv_rate + self.round_folding_factor(round)
+            - self.round_parameters[round].log_inv_rate
+    }
+
+    /// Returns the log2 size of the largest FFT
+    /// (At commitment we perform 2^folding_factor FFT of size 2^max_fft_size)
+    pub fn max_fft_size(&self) -> usize {
+        self.num_variables + self.params.starting_log_inv_rate - self.round_folding_factor(0)
+    }
+
+    /// Returns whether all PoW difficulties are within the configured maximum.
+    ///
+    /// Checks the starting, final, and per-round PoW bits against the ceiling.
+    /// Returns false if any value exceeds the limit.
+    pub fn check_pow_bits(&self) -> bool {
+        self.max_pow_bits() <= self.params.pow_bits
+    }
+
+    /// Largest proof-of-work difficulty (in bits) demanded by any phase.
+    ///
+    /// Scans every grinding step: the starting fold, each round's query and
+    /// fold steps, and the final query and fold steps.
+    ///
+    /// Comparing this against the configured budget tells whether the field
+    /// and rate can reach the requested security within allowed grinding.
+    pub fn max_pow_bits(&self) -> usize {
+        // Whole-protocol grinding steps outside the per-round loop.
+        let outer = self
+            .starting_folding_pow_bits
+            .max(self.terminal.pow_bits)
+            .max(self.final_folding_pow_bits);
+
+        // Each round grinds once for queries and once for folding.
+        self.round_parameters
+            .iter()
+            .map(|r| r.pow_bits.max(r.folding_pow_bits))
+            .fold(outer, usize::max)
+    }
+
+    /// Retrieves the concrete derived folding factor for a given round.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `round > self.n_rounds()`.
+    /// The schedule has one entry per fold, including the final pre-direct-send fold.
+    pub fn round_folding_factor(&self, round: usize) -> usize {
+        self.folding_schedule[round]
+    }
+
+    /// Total variables folded through the given round index, inclusive.
+    ///
+    /// Indices past the last fold saturate to the full folded variable count.
+    pub fn total_folded_through(&self, round: usize) -> usize {
+        self.folding_schedule.iter().take(round + 1).sum()
+    }
+
+    /// Compute the synthetic or derived `RoundConfig` for the final phase.
+    ///
+    /// - If no folding rounds were configured, constructs a fallback config
+    ///   based on the starting domain and folding factor.
+    /// - If rounds were configured, derives the final config by adapting
+    ///   the last round's values for the final folding phase.
+    ///
+    /// This is used by the verifier when verifying the final polynomial,
+    /// ensuring consistent challenge selection and STIR constraint handling.
+    pub fn final_round_config(&self) -> RoundConfig {
+        if self.round_parameters.is_empty() {
+            // No intermediate rounds: the polynomial was small enough that
+            // the initial fold leads directly to the final phase.
+            // Use the starting domain and initial folding factor.
+            RoundConfig {
+                num_variables: self.num_variables - self.round_folding_factor(0),
+                folding_factor: self.round_folding_factor(self.n_rounds()),
+                num_queries: self.terminal.num_queries,
+                pow_bits: self.terminal.pow_bits,
+                log_inv_rate: self.params.starting_log_inv_rate,
+                domain_size: self.starting_domain_size(),
+                log_folded_domain_size: self.starting_domain_size().ilog2() as usize
+                    - self.round_folding_factor(0),
+                ood_samples: 0,
+                folding_pow_bits: self.final_folding_pow_bits,
+            }
+        } else {
+            // Apply the last round's domain reduction to get the domain
+            // size entering the final phase.
+            let rs_reduction_factor = self.rs_reduction_factor(self.n_rounds() - 1);
+            let folding_factor = self.round_folding_factor(self.n_rounds());
+
+            let last = self.round_parameters.last().unwrap();
+
+            // The domain shrinks by the RS reduction factor from the last round.
+            let domain_size = last.domain_size >> rs_reduction_factor;
+
+            let log_folded_domain_size =
+                domain_size.ilog2() as usize - self.round_folding_factor(self.n_rounds());
+
+            RoundConfig {
+                // Variables remaining after this final fold.
+                num_variables: last.num_variables - folding_factor,
+                folding_factor,
+                num_queries: self.terminal.num_queries,
+                pow_bits: self.terminal.pow_bits,
+                log_inv_rate: last.log_inv_rate,
+                domain_size,
+                log_folded_domain_size,
+                // The final phase has no OOD step; this field is unused here.
+                ood_samples: 0,
+                folding_pow_bits: self.final_folding_pow_bits,
+            }
+        }
+    }
+
+    /// Returns the inverse rate of the codeword committed after an
+    /// intermediate round.
+    pub fn inv_rate(&self, round: usize) -> usize {
+        1 << self.round_parameters[round].log_inv_rate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
+    use p3_challenger::DuplexChallenger;
+    use p3_field::extension::BinomialExtensionField;
+
+    use super::*;
+    use crate::parameters::{FoldingFactor, SecurityAssumption};
+
+    type F = BabyBear;
+    type EF4 = BinomialExtensionField<F, 4>;
+    type Perm = Poseidon2BabyBear<16>;
+    type MyChallenger = DuplexChallenger<F, Perm, 16, 8>;
+
+    /// Generates default WHIR parameters
+    fn default_whir_params() -> ProtocolParameters {
+        ProtocolParameters {
+            security_level: 100,
+            pow_bits: 20,
+            round_log_inv_rates: vec![],
+            folding_factor: FoldingFactor::ConstantFromSecondRound(4, 4),
+            soundness_type: SecurityAssumption::CapacityBound,
+            starting_log_inv_rate: 1,
+        }
+    }
+
+    #[test]
+    fn initial_claims_builder_counts_ood_and_never_credits_later_pow() {
+        let params = default_whir_params();
+        let config = WhirConfig::<EF4, F, MyChallenger>::new(10, params.clone()).unwrap();
+        assert!(config.commitment_ood_samples > 0);
+        assert!(
+            WhirConfig::<EF4, F, MyChallenger>::new_with_initial_claims(10, params.clone(), 1)
+                .is_ok()
+        );
+        // 123 - log2(513) - log2(20 * 2^12) < 98, even with a 20-bit grind budget.
+        let err = WhirConfig::<EF4, F, MyChallenger>::new_with_initial_claims(10, params, 512)
+            .unwrap_err();
+        match err {
+            WhirConfigError::InitialClaimsBelowTarget {
+                num_claims,
+                bits,
+                security_level,
+            } => {
+                assert_eq!(num_claims, 512 + config.commitment_ood_samples);
+                assert!(bits < 98.);
+                assert_eq!(security_level, 100);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_whir_config_creation() {
+        let params = default_whir_params();
+
+        // Quartic extension: a realistic challenge field that meets the budget.
+        let config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+        assert_eq!(config.security_level, 100);
+        assert_eq!(config.params.pow_bits, 20);
+        assert_eq!(config.soundness_type, SecurityAssumption::CapacityBound);
+    }
+
+    #[test]
+    fn ceil_pow_bits_rounds_up() {
+        // Grinding adds whole bits, so a fractional gap rounds up.
+        // Flooring would undershoot the security target by up to one bit.
+        //
+        //     0.0  -> 0   (no grinding needed)
+        //     20.0 -> 20  (already whole)
+        //     19.001 -> 20 (round up)
+        //     20.7 -> 21  (round up)
+        assert_eq!(ceil_pow_bits(0.0), 0);
+        assert_eq!(ceil_pow_bits(20.0), 20);
+        assert_eq!(ceil_pow_bits(19.001), 20);
+        assert_eq!(ceil_pow_bits(20.7), 21);
+    }
+
+    #[test]
+    fn derived_pow_reaches_security_target_per_phase() {
+        // Invariant: achieved security per phase = algebraic_bits + pow_bits.
+        //
+        //     pow_bits = ceil(security_level - algebraic_bits)
+        //     => algebraic_bits + pow_bits >= security_level
+        //
+        // Flooring the gap would make the sum dip below the target whenever
+        // algebraic_bits is fractional.
+        //
+        // The query and combination errors are fractional, which is exactly
+        // the case where floor and ceil differ.
+        //
+        // The budget is the widest one the 31-bit base field can grind, so
+        // every phase that falls short of the target is made up by PoW.
+        //
+        // The budget stays below the target, so the algebraic protocol still covers bits.
+        //
+        // Crediting the whole target to grinding would buy no query at all.
+        //
+        // A run that opens no position is refused during construction.
+        let soundness = SecurityAssumption::UniqueDecoding;
+        let params = ProtocolParameters {
+            security_level: 128,
+            pow_bits: 30,
+            round_log_inv_rates: vec![],
+            folding_factor: FoldingFactor::Constant(4),
+            soundness_type: soundness,
+            starting_log_inv_rate: 1,
+        };
+        let config = WhirConfig::<EF4, F, MyChallenger>::new(20, params).unwrap();
+
+        // Target in bits, and the field size the combination error is taken over.
+        let target = config.security_level as f64;
+        let field_bits = EF4::bits();
+
+        // Walk the intermediate rounds, tracking the pre-fold (old) rate.
+        // Queries test proximity to the code before this round's fold.
+        let mut old_rate = config.params.starting_log_inv_rate;
+        for cfg in &config.round_parameters {
+            // Query phase fails through either error source, so the two add.
+            let query_error = soundness.queries_error(old_rate, cfg.num_queries);
+            let combination_error = soundness.queries_combination_error(
+                field_bits,
+                cfg.num_variables,
+                cfg.log_inv_rate,
+                cfg.ood_samples,
+                cfg.num_queries,
+            );
+            let algebraic = ErrorBits::sum(&[
+                ErrorBits::from_log2(query_error),
+                ErrorBits::from_log2(combination_error),
+            ])
+            .bits();
+
+            // Ceil keeps the sum at or above target; floor would drop below it.
+            assert!(
+                cfg.pow_bits as f64 + algebraic >= target,
+                "round query phase undershoots: {} + {algebraic} < {target}",
+                cfg.pow_bits
+            );
+
+            old_rate = cfg.log_inv_rate;
+        }
+
+        // Final query phase grinds at the last accumulated rate.
+        let final_error = soundness.queries_error(old_rate, config.terminal.num_queries);
+        assert!(
+            config.terminal.pow_bits as f64 + final_error >= target,
+            "final query phase undershoots: {} + {final_error} < {target}",
+            config.terminal.pow_bits
+        );
+    }
+
+    #[test]
+    fn round_query_pow_covers_both_query_errors() {
+        // Invariant: grinding plus the summed query and combination errors reaches the target.
+        //
+        // Fixture state: BabyBear^4, capacity bound, 80-bit target, 10-bit budget, 24 variables, rate 1/2.
+        //
+        //     round 0:  query error 79.44 bits, combination error 80.36 bits
+        //     summed:   78.82 bits
+        //
+        // Mutation: sizing the grinding against the larger error alone gives 1 bit, and 79.82 < 80.
+        let soundness = SecurityAssumption::CapacityBound;
+        let params = ProtocolParameters {
+            security_level: 80,
+            pow_bits: 10,
+            round_log_inv_rates: vec![],
+            folding_factor: FoldingFactor::Constant(4),
+            soundness_type: soundness,
+            starting_log_inv_rate: 1,
+        };
+        let config = WhirConfig::<EF4, F, MyChallenger>::new(24, params).unwrap();
+        let field_bits = EF4::bits() - 1;
+        let mut old_rate = config.params.starting_log_inv_rate;
+        for round in &config.round_parameters {
+            let summed = ErrorBits::sum(&[
+                ErrorBits::from_log2(soundness.queries_error(old_rate, round.num_queries)),
+                ErrorBits::from_log2(soundness.queries_combination_error(
+                    field_bits,
+                    round.num_variables,
+                    round.log_inv_rate,
+                    round.ood_samples,
+                    round.num_queries,
+                )),
+            ])
+            .bits();
+            assert!(
+                summed + round.pow_bits as f64 >= 80.0 - 1e-9,
+                "round reaches {}",
+                summed + round.pow_bits as f64
+            );
+            old_rate = round.log_inv_rate;
+        }
+    }
+
+    #[test]
+    fn derived_schedule_meets_every_term_the_security_report_prices() {
+        // Invariant: each term the opening security report prices reaches the target on its own.
+        //
+        // The report prices with one bit below the bit length, a lower bound on log_2(|EF|).
+        // Johnson also takes a one-bit reserve off every proximity gap.
+        // A derivation priced with the rounded-up bit length buys up to that much too little PoW.
+        //
+        // Fixture state: BabyBear^4, whose order has bit length 124 but is below 2^124.
+        let field_bits = EF4::bits() - 1;
+        let mut checked = 0;
+        for soundness in [
+            SecurityAssumption::UniqueDecoding,
+            SecurityAssumption::JohnsonBound,
+            SecurityAssumption::CapacityBound,
+        ] {
+            let reserve = if soundness == SecurityAssumption::JohnsonBound {
+                1.
+            } else {
+                0.
+            };
+            for security_level in 80..=112 {
+                let params = ProtocolParameters {
+                    security_level,
+                    pow_bits: 16,
+                    round_log_inv_rates: vec![],
+                    folding_factor: FoldingFactor::Constant(4),
+                    soundness_type: soundness,
+                    starting_log_inv_rate: 1,
+                };
+                let Ok(config) = WhirConfig::<EF4, F, MyChallenger>::new(20, params) else {
+                    continue;
+                };
+                let target = security_level as f64;
+                let meets = |bits: f64, term: &str| {
+                    assert!(
+                        bits >= target,
+                        "{soundness:?} at {security_level} bits: {term} reaches only {bits}"
+                    );
+                };
+                let folds = |num_variables, rate, pow: usize, phase: &str| {
+                    let gap =
+                        soundness.prox_gaps_error(num_variables, rate, field_bits, 2) - reserve;
+                    let sumcheck = soundness.fold_sumcheck_error(field_bits, num_variables, rate);
+                    meets(gap + pow as f64, &alloc::format!("{phase} proximity gap"));
+                    meets(
+                        sumcheck + pow as f64,
+                        &alloc::format!("{phase} fold sumcheck"),
+                    );
+                };
+                let ood = |num_variables, rate, samples, phase: &str| {
+                    if soundness != SecurityAssumption::UniqueDecoding {
+                        let bits = soundness.ood_error(num_variables, rate, field_bits, samples);
+                        meets(bits, &alloc::format!("{phase} OOD"));
+                    }
+                };
+
+                ood(
+                    config.num_variables,
+                    config.starting_log_inv_rate,
+                    config.commitment_ood_samples,
+                    "commitment",
+                );
+                folds(
+                    config.num_variables,
+                    config.starting_log_inv_rate,
+                    config.starting_folding_pow_bits,
+                    "starting",
+                );
+                let mut old_rate = config.starting_log_inv_rate;
+                for round in &config.round_parameters {
+                    ood(
+                        round.num_variables,
+                        round.log_inv_rate,
+                        round.ood_samples,
+                        "round",
+                    );
+                    let query = soundness.queries_error(old_rate, round.num_queries);
+                    let combination = soundness.queries_combination_error(
+                        field_bits,
+                        round.num_variables,
+                        round.log_inv_rate,
+                        round.ood_samples,
+                        round.num_queries,
+                    );
+                    meets(query + round.pow_bits as f64, "round query");
+                    meets(combination + round.pow_bits as f64, "round combination");
+                    folds(
+                        round.num_variables,
+                        round.log_inv_rate,
+                        round.folding_pow_bits,
+                        "round",
+                    );
+                    old_rate = round.log_inv_rate;
+                }
+                // The terminal queries test the last committed codeword at its own rate.
+                meets(
+                    soundness.queries_error(old_rate, config.terminal.num_queries)
+                        + config.terminal.pow_bits as f64,
+                    "terminal query",
+                );
+                if config.final_sumcheck_rounds != 0 {
+                    meets(
+                        field_bits as f64 - 1. + config.final_folding_pow_bits as f64,
+                        "final sumcheck",
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn new_rejects_pow_the_base_field_cannot_grind() {
+        // Invariant: a derived difficulty the challenger cannot sample is a construction error.
+        //
+        // The duplex challenger checks a witness by sampling that many bits of one field element.
+        //
+        // BabyBear has 31 bits and 2^31 exceeds its order, so grinding 31 or more bits panics.
+        //
+        // Fixture state: a 2^27 trace at unique decoding and 128 bits, with a 40-bit budget.
+        //
+        // The schedule fits the budget but grinds beyond the field.
+        let params = ProtocolParameters {
+            security_level: 128,
+            pow_bits: 40,
+            round_log_inv_rates: vec![],
+            folding_factor: FoldingFactor::Constant(4),
+            soundness_type: SecurityAssumption::UniqueDecoding,
+            starting_log_inv_rate: 3,
+        };
+        let err = WhirConfig::<EF4, F, MyChallenger>::new(27, params).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WhirConfigError::PowBitsExceedField {
+                    bits: 31..=40,
+                    field_bits: 31,
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_pow_above_budget() {
+        // Invariant: a derived PoW above the budget fails construction.
+        //
+        //     BabyBear as its own field is 31 bits.
+        //     The final folding sumcheck error is bounded by 1/|F| ~ 2^-30.
+        //     Reaching 100-bit security needs ~70 PoW bits, far above budget 20.
+        //
+        // Unique decoding needs no out-of-domain samples, so the small field is
+        // otherwise feasible and the failure is purely the budget.
+        let params = ProtocolParameters {
+            security_level: 100,
+            pow_bits: 20,
+            round_log_inv_rates: vec![],
+            folding_factor: FoldingFactor::Constant(4),
+            soundness_type: SecurityAssumption::UniqueDecoding,
+            starting_log_inv_rate: 1,
+        };
+
+        let err = WhirConfig::<F, F, MyChallenger>::new(20, params)
+            .expect_err("derived PoW exceeds the budget; construction must fail");
+        match err {
+            WhirConfigError::PowBitsExceedBudget { required, budget } => {
+                // The cap is the configured budget; the demand exceeds it.
+                assert_eq!(budget, 20);
+                assert!(
+                    required > budget,
+                    "required {required} should exceed {budget}"
+                );
+            }
+            other => panic!("expected PowBitsExceedBudget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_pow_bits_reports_largest_phase() {
+        // The reported maximum is the largest PoW demanded by any phase.
+        let params = default_whir_params();
+        let mut config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+        // Force one phase to dominate, then confirm it is the reported max.
+        config.starting_folding_pow_bits = 7;
+        config.terminal.pow_bits = 31;
+        config.final_folding_pow_bits = 5;
+        config.round_parameters = vec![RoundConfig {
+            pow_bits: 11,
+            folding_pow_bits: 13,
+            num_queries: 5,
+            ood_samples: 2,
+            num_variables: 10,
+            folding_factor: 2,
+            log_inv_rate: 1,
+            domain_size: 10,
+            log_folded_domain_size: 1,
+        }];
+
+        assert_eq!(config.max_pow_bits(), 31);
+    }
+
+    #[test]
+    fn new_errors_when_field_too_small_for_security() {
+        // Invariant: an infeasible field/security pair errors instead of panicking.
+        //
+        // BabyBear used as its own extension field is 31 bits.
+        // At 31 variables the OOD term gains ~0 bits per sample.
+        // No sample count then reaches 100-bit security.
+        //
+        // Folding factor 5 keeps the folded domain at 2^27 = BabyBear two-adicity.
+        // So the two-adicity guard passes and the OOD feasibility check is reached.
+        let params = ProtocolParameters {
+            security_level: 100,
+            pow_bits: 20,
+            round_log_inv_rates: vec![],
+            folding_factor: FoldingFactor::Constant(5),
+            soundness_type: SecurityAssumption::CapacityBound,
+            starting_log_inv_rate: 1,
+        };
+
+        let err = WhirConfig::<F, F, MyChallenger>::new(31, params)
+            .expect_err("31-bit field cannot reach 100-bit security");
+        assert!(
+            matches!(err, WhirConfigError::OodSamplesInfeasible { .. }),
+            "expected OodSamplesInfeasible, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn new_errors_when_initial_domain_exponent_exceeds_usize_bits() {
+        // Invariant: `WhirConfig::new` must reject an initial domain that cannot
+        // be represented as a `usize` length before computing `1 << exponent`.
+        let num_variables = usize::BITS as usize;
+        let params = ProtocolParameters {
+            security_level: 32,
+            pow_bits: 0,
+            round_log_inv_rates: vec![],
+            folding_factor: FoldingFactor::Constant(num_variables),
+            soundness_type: SecurityAssumption::CapacityBound,
+            starting_log_inv_rate: 1,
+        };
+
+        let err = WhirConfig::<F, F, MyChallenger>::new(num_variables, params)
+            .expect_err("oversized initial domain must be rejected");
+        match err {
+            WhirConfigError::InitialDomainExceedsUsize {
+                num_variables: got_num_variables,
+                starting_log_inv_rate,
+                usize_bits,
+            } => {
+                assert_eq!(got_num_variables, num_variables);
+                assert_eq!(starting_log_inv_rate, 1);
+                assert_eq!(usize_bits, usize::BITS as usize);
+            }
+            other => panic!("expected InitialDomainExceedsUsize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_rejects_a_later_folded_domain_above_the_capacity() {
+        // Fixture state: BabyBear, two-adicity 27, 28 variables, schedule [8, 2, 18], rates [10, 10].
+        //
+        //     round 0:  domain 2^30, fold 8  ->  folded 2^22
+        //     round 1:  domain 2^30, fold 2  ->  folded 2^28 > 2^27
+        //
+        // Mutation: checking only the first fold accepts this schedule.
+        let params = ProtocolParameters {
+            security_level: 32,
+            pow_bits: 0,
+            round_log_inv_rates: vec![10, 10],
+            folding_factor: FoldingFactor::PerRound(vec![8, 2, 18]),
+            soundness_type: SecurityAssumption::UniqueDecoding,
+            starting_log_inv_rate: 2,
+        };
+        let err = WhirConfig::<EF4, F, MyChallenger>::new(28, params)
+            .expect_err("a later folded domain above the two-adicity must be rejected");
+        match err {
+            WhirConfigError::FoldedDomainExceedsCapacity {
+                log_folded_domain_size,
+                max_log_domain_size,
+            } => {
+                assert_eq!(log_folded_domain_size, 28);
+                assert_eq!(max_log_domain_size, 27);
+            }
+            other => panic!("expected FoldedDomainExceedsCapacity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_errors_when_initial_domain_exponent_addition_overflows() {
+        // Invariant: the exponent addition itself must be checked. In release
+        // builds unchecked addition would wrap and could derive a nonsensical
+        // small domain.
+        let params = ProtocolParameters {
+            security_level: 32,
+            pow_bits: 0,
+            round_log_inv_rates: vec![],
+            folding_factor: FoldingFactor::Constant(usize::MAX),
+            soundness_type: SecurityAssumption::CapacityBound,
+            starting_log_inv_rate: 1,
+        };
+
+        let err = WhirConfig::<F, F, MyChallenger>::new(usize::MAX, params)
+            .expect_err("overflowing initial domain exponent must be rejected");
+        assert!(
+            matches!(err, WhirConfigError::InitialDomainExceedsUsize { .. }),
+            "expected InitialDomainExceedsUsize, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_per_round_factors_that_under_fold() {
+        // Invariant: a per-round schedule that under-folds is rejected at config construction.
+        //
+        // Fixture state:
+        //   num_variables = 20, direct-send threshold = 6
+        //   PerRound([3, 2]) folds only 3 + 2 = 5 variables
+        //
+        //     remaining = 20 - 5 = 15 > 6  ->  under-folds
+        let mut params = default_whir_params();
+        params.folding_factor = FoldingFactor::PerRound(vec![3, 2]);
+
+        let err = WhirConfig::<F, F, MyChallenger>::new(20, params)
+            .expect_err("per-round factors under-fold; config must be rejected");
+
+        // The folding-factor error is forwarded through the config error type,
+        // carrying the variable accounting that explains the rejection.
+        match err {
+            WhirConfigError::FoldingFactor(FoldingFactorError::InsufficientFolding {
+                num_variables,
+                remaining,
+                threshold,
+            }) => {
+                assert_eq!(num_variables, 20);
+                // 20 variables minus the 3 + 2 folded by the schedule.
+                assert_eq!(remaining, 15);
+                // The direct-send threshold the schedule fails to reach.
+                assert_eq!(threshold, 6);
+            }
+            other => panic!("expected InsufficientFolding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_rejects_a_schedule_that_opens_no_position() {
+        // Invariant: a schedule must open at least one position.
+        //
+        // Queries alone test proximity, so opening none accepts any committed function.
+        //
+        // A redundant rate rules out the usual route to zero.
+        //
+        // Crediting grinding with the whole target reaches it anyway.
+        //
+        // The protocol level is a saturating difference.
+        //
+        // So the trigger is the budget reaching the target, not the target being zero:
+        //
+        //     - security_level 0,   pow_bits 0     ->  nothing to cover
+        //     - security_level 0,   pow_bits 20    ->  nothing to cover
+        //     - security_level 20,  pow_bits 20    ->  the credit covers all of it
+        //     - security_level 128, pow_bits 128   ->  likewise, at a realistic target
+        //
+        // The last two are why the wording matters.
+        //
+        // Read as "a zero target", the guard looks inapplicable to a realistic fixture.
+        //
+        // The floor lives here rather than in a caller, so both construction routes meet it.
+        //
+        // Fixture state: 10 variables, folding 4, a redundant rate.
+        for (security_level, pow_bits) in [(0, 0), (0, 20), (20, 20), (128, 128)] {
+            let mut params = default_whir_params();
+            params.security_level = security_level;
+            params.pow_bits = pow_bits;
+
+            let err = WhirConfig::<F, F, MyChallenger>::new(10, params)
+                .expect_err("a schedule opening nothing must be rejected");
+            assert!(
+                matches!(err, WhirConfigError::ZeroQueries),
+                "expected ZeroQueries at {security_level}/{pow_bits}, got {err:?}"
+            );
+        }
+
+        // A positive target still buys queries, so the floor does not disturb it.
+        let config = WhirConfig::<EF4, F, MyChallenger>::new(10, default_whir_params()).unwrap();
+        assert!(config.terminal.num_queries > 0);
+    }
+
+    #[test]
+    fn new_rejects_zero_starting_rate() {
+        // Invariant: a code rate of 2^-0 = 1 has no Reed-Solomon redundancy.
+        //
+        //     rate 1 -> delta <= 0 -> zero queries -> proximity test checks nothing
+        //
+        // Mutation: drop the starting rate to 0.
+        let mut params = default_whir_params();
+        params.starting_log_inv_rate = 0;
+
+        // Construction must reject a zero starting rate before deriving rounds.
+        let err = WhirConfig::<F, F, MyChallenger>::new(10, params)
+            .expect_err("rate 2^-0 = 1 must be rejected");
+        assert!(
+            matches!(
+                err,
+                WhirConfigError::NonRedundantStartingRate { log_inv_rate: 0 }
+            ),
+            "expected NonRedundantStartingRate, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_zero_explicit_round_rate() {
+        // Invariant: an explicit per-round rate of 2^-0 = 1 is rejected.
+        //
+        //     16 variables, fold 4 per round -> 2 intermediate rounds
+        //     per-round rates [3, 0]         -> round 1 gets rate 1
+        //
+        // Mutation: set the second round's rate to 0.
+        let mut params = default_whir_params();
+        params.folding_factor = FoldingFactor::Constant(4);
+        params.round_log_inv_rates = vec![3, 0];
+
+        // Rejection names the offending round and its rate.
+        let err = WhirConfig::<F, F, MyChallenger>::new(16, params)
+            .expect_err("explicit round rate 2^-0 = 1 must be rejected");
+        assert!(
+            matches!(
+                err,
+                WhirConfigError::NonRedundantRoundRate {
+                    round: 1,
+                    log_inv_rate: 0
+                }
+            ),
+            "expected NonRedundantRoundRate at round 1, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn valid_rates_yield_positive_query_counts() {
+        // Invariant: a redundant rate keeps delta > 0, so every phase queries.
+        //
+        //     rate <= 1/2 -> delta > 0 -> positive query count per phase
+        //
+        // A quartic extension keeps out-of-domain sampling feasible.
+        // So all three soundness regimes reach the query derivation.
+        for soundness_type in [
+            SecurityAssumption::UniqueDecoding,
+            SecurityAssumption::JohnsonBound,
+            SecurityAssumption::CapacityBound,
+        ] {
+            // Valid, redundant config at rate 2^-1 = 1/2.
+            let params = ProtocolParameters {
+                security_level: 100,
+                pow_bits: 20,
+                round_log_inv_rates: vec![],
+                folding_factor: FoldingFactor::Constant(4),
+                soundness_type,
+                starting_log_inv_rate: 1,
+            };
+            let config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+            // Final proximity phase must spot-check at least one position.
+            assert!(
+                config.terminal.num_queries > 0,
+                "{soundness_type:?}: terminal.num_queries must be positive"
+            );
+            // Every intermediate round must spot-check at least one position.
+            for (round, cfg) in config.round_parameters.iter().enumerate() {
+                assert!(
+                    cfg.num_queries > 0,
+                    "{soundness_type:?} round {round}: num_queries must be positive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_n_rounds() {
+        let params = default_whir_params();
+        let config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+        assert_eq!(config.n_rounds(), config.round_parameters.len());
+    }
+
+    #[test]
+    fn final_round_config_num_variables_equals_final_sumcheck_rounds() {
+        // Invariant: the final-round config exposes exactly `final_sumcheck_rounds` variables.
+        //
+        // Three places key off this single count and must agree:
+        //
+        //     prover     : sends 2^count final evaluations in the clear
+        //     verifier   : length-checks the final polynomial against 2^count
+        //     transcript : absorbs 2^count final coefficients
+        //
+        // Sweep every folding strategy across the direct-send threshold so both branches are hit.
+        fn check(num_variables: usize, folding_factor: FoldingFactor) {
+            // UniqueDecoding needs no out-of-domain samples, so construction always succeeds here.
+            let params = ProtocolParameters {
+                security_level: 100,
+                pow_bits: 20,
+                round_log_inv_rates: vec![],
+                folding_factor,
+                soundness_type: SecurityAssumption::UniqueDecoding,
+                starting_log_inv_rate: 1,
+            };
+            // Construction runs the same assertion internally.
+            // This explicit check documents and pins the invariant.
+            let config = WhirConfig::<EF4, F, MyChallenger>::new(num_variables, params).unwrap();
+            assert_eq!(
+                config.final_round_config().num_variables,
+                config.final_sumcheck_rounds,
+                "num_variables = {num_variables}"
+            );
+        }
+
+        // Constant: small sizes stay in the empty branch, larger ones reach the non-empty branch.
+        for nv in 4..=24 {
+            check(nv, FoldingFactor::Constant(4));
+        }
+        for nv in 2..=24 {
+            check(nv, FoldingFactor::Constant(2));
+        }
+
+        // ConstantFromSecondRound: a larger first fold, then smaller folds.
+        for nv in 5..=24 {
+            check(nv, FoldingFactor::ConstantFromSecondRound(3, 2));
+        }
+
+        // PerRound: explicit schedules whose length is num_rounds + 1.
+        //
+        //     [3, 2]    @ 10  ->  1 intermediate round
+        //     [4, 3, 2] @ 14  ->  2 intermediate rounds
+        check(10, FoldingFactor::PerRound(vec![3, 2]));
+        check(14, FoldingFactor::PerRound(vec![4, 3, 2]));
+    }
+
+    #[test]
+    fn constant_schedule_uses_smaller_final_pre_direct_fold() {
+        // Thomas's motivating case:
+        //
+        //     m = 15, Constant(8)  ->  concrete schedule [8, 7]
+        //
+        // Rejecting this would forbid a valid WHIR instance. The derived
+        // schedule must be used everywhere downstream, not only in validation.
+        let params = ProtocolParameters {
+            security_level: 100,
+            pow_bits: 20,
+            round_log_inv_rates: vec![],
+            folding_factor: FoldingFactor::Constant(8),
+            soundness_type: SecurityAssumption::UniqueDecoding,
+            starting_log_inv_rate: 1,
+        };
+
+        let config = WhirConfig::<EF4, F, MyChallenger>::new(15, params).unwrap();
+
+        assert_eq!(config.folding_schedule, vec![8, 7]);
+        assert_eq!(config.n_rounds(), 1);
+        assert_eq!(config.round_folding_factor(0), 8);
+        assert_eq!(config.round_folding_factor(1), 7);
+        assert_eq!(config.total_folded_through(0), 8);
+        assert_eq!(config.total_folded_through(1), 15);
+        assert_eq!(config.round_parameters[0].folding_factor, 8);
+        assert_eq!(config.final_sumcheck_rounds, 0);
+        assert_eq!(config.final_round_config().folding_factor, 7);
+        assert_eq!(config.final_round_config().num_variables, 0);
+    }
+
+    #[test]
+    fn test_explicit_round_log_inv_rates() {
+        let mut params = default_whir_params();
+        params.folding_factor = FoldingFactor::Constant(4);
+        params.round_log_inv_rates = vec![3, 2];
+
+        let config = WhirConfig::<EF4, F, MyChallenger>::new(16, params).unwrap();
+
+        assert_eq!(config.round_parameters[0].log_inv_rate, 3);
+        assert_eq!(config.round_parameters[1].log_inv_rate, 2);
+        assert_eq!(config.rs_reduction_factor(0), 2);
+        assert_eq!(config.rs_reduction_factor(1), 5);
+        assert_eq!(config.inv_rate(0), 1 << 3);
+        assert_eq!(config.inv_rate(1), 1 << 2);
+    }
+
+    #[test]
+    fn test_check_pow_bits_within_limits() {
+        let params = default_whir_params();
+        let mut config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+        // Set all values within limits
+        config.params.pow_bits = 20;
+        config.starting_folding_pow_bits = 15;
+        config.terminal.pow_bits = 18;
+        config.final_folding_pow_bits = 19;
+
+        // Ensure all rounds are within limits
+        config.round_parameters = vec![
+            RoundConfig {
+                pow_bits: 17,
+                folding_pow_bits: 19,
+                num_queries: 5,
+                ood_samples: 2,
+                num_variables: 10,
+                folding_factor: 2,
+                log_inv_rate: 1,
+                domain_size: 10,
+                log_folded_domain_size: 1,
+            },
+            RoundConfig {
+                pow_bits: 18,
+                folding_pow_bits: 19,
+                num_queries: 6,
+                ood_samples: 2,
+                num_variables: 10,
+                folding_factor: 2,
+                log_inv_rate: 1,
+                domain_size: 10,
+                log_folded_domain_size: 1,
+            },
+        ];
+
+        assert!(
+            config.check_pow_bits(),
+            "All values are within limits, check_pow_bits should return true."
+        );
+    }
+
+    #[test]
+    fn test_check_pow_bits_starting_folding_exceeds() {
+        let params = default_whir_params();
+        let mut config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+        config.params.pow_bits = 20;
+        config.starting_folding_pow_bits = 21; // Exceeds max_pow_bits
+        config.terminal.pow_bits = 18;
+        config.final_folding_pow_bits = 19;
+
+        assert!(
+            !config.check_pow_bits(),
+            "Starting folding pow bits exceeds max_pow_bits, should return false."
+        );
+    }
+
+    #[test]
+    fn test_check_pow_bits_final_pow_exceeds() {
+        let params = default_whir_params();
+        let mut config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+        config.params.pow_bits = 20;
+        config.starting_folding_pow_bits = 15;
+        config.terminal.pow_bits = 21; // Exceeds max_pow_bits
+        config.final_folding_pow_bits = 19;
+
+        assert!(
+            !config.check_pow_bits(),
+            "Final pow bits exceeds max_pow_bits, should return false."
+        );
+    }
+
+    #[test]
+    fn test_check_pow_bits_round_pow_exceeds() {
+        let params = default_whir_params();
+        let mut config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+        config.params.pow_bits = 20;
+        config.starting_folding_pow_bits = 15;
+        config.terminal.pow_bits = 18;
+        config.final_folding_pow_bits = 19;
+
+        // One round's pow_bits exceeds limit
+        config.round_parameters = vec![RoundConfig {
+            pow_bits: 21, // Exceeds pow_bits
+            folding_pow_bits: 19,
+            num_queries: 5,
+            ood_samples: 2,
+            num_variables: 10,
+            folding_factor: 2,
+            log_inv_rate: 1,
+            domain_size: 10,
+            log_folded_domain_size: 1,
+        }];
+
+        assert!(
+            !config.check_pow_bits(),
+            "A round has pow_bits exceeding pow_bits, should return false."
+        );
+    }
+
+    #[test]
+    fn test_check_pow_bits_round_folding_pow_exceeds() {
+        let params = default_whir_params();
+        let mut config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+        config.params.pow_bits = 20;
+        config.starting_folding_pow_bits = 15;
+        config.terminal.pow_bits = 18;
+        config.final_folding_pow_bits = 19;
+
+        // One round's folding_pow_bits exceeds limit
+        config.round_parameters = vec![RoundConfig {
+            pow_bits: 19,
+            folding_pow_bits: 21, // Exceeds pow_bits
+            num_queries: 5,
+            ood_samples: 2,
+            num_variables: 10,
+            folding_factor: 2,
+            log_inv_rate: 1,
+            domain_size: 10,
+            log_folded_domain_size: 1,
+        }];
+
+        assert!(
+            !config.check_pow_bits(),
+            "A round has folding_pow_bits exceeding pow_bits, should return false."
+        );
+    }
+
+    #[test]
+    fn test_check_pow_bits_exactly_at_limit() {
+        let params = default_whir_params();
+        let mut config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+        config.params.pow_bits = 20;
+        config.starting_folding_pow_bits = 20;
+        config.terminal.pow_bits = 20;
+        config.final_folding_pow_bits = 20;
+
+        config.round_parameters = vec![RoundConfig {
+            pow_bits: 20,
+            folding_pow_bits: 20,
+            num_queries: 5,
+            ood_samples: 2,
+            num_variables: 10,
+            folding_factor: 2,
+            log_inv_rate: 1,
+            domain_size: 10,
+            log_folded_domain_size: 1,
+        }];
+
+        assert!(
+            config.check_pow_bits(),
+            "All pow_bits are exactly at pow_bits, should return true."
+        );
+    }
+
+    #[test]
+    fn test_check_pow_bits_all_exceed() {
+        let params = default_whir_params();
+        let mut config = WhirConfig::<EF4, F, MyChallenger>::new(10, params).unwrap();
+
+        config.params.pow_bits = 20;
+        config.starting_folding_pow_bits = 22;
+        config.terminal.pow_bits = 23;
+        config.final_folding_pow_bits = 24;
+
+        config.round_parameters = vec![RoundConfig {
+            pow_bits: 25,
+            folding_pow_bits: 26,
+            num_queries: 5,
+            ood_samples: 2,
+            num_variables: 10,
+            folding_factor: 2,
+            log_inv_rate: 1,
+            domain_size: 10,
+            log_folded_domain_size: 1,
+        }];
+
+        assert!(
+            !config.check_pow_bits(),
+            "All values exceed max_pow_bits, should return false."
+        );
+    }
+}

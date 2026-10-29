@@ -1,26 +1,42 @@
 [package]
 name = "p3-keccak"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "An optimized implementation of the Keccak-f permutation and the Keccak-256 and SHA3-256 hash functions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
-[features]
-nightly-features = []
+# Criterion pulls Rayon transitively, which does not build for WASI.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion.workspace = true
+
+# Picks the widest x86-64 backend the running CPU has, without `std`.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+cpufeatures.workspace = true
 
 [dependencies]
-p3-field.workspace = true
 p3-symmetric.workspace = true
 p3-util.workspace = true
-itertools.workspace = true
-tiny-keccak = { workspace = true, features = ["keccak"] }
+
+tiny-keccak = { workspace = true, features = ["keccak", "sha3"] }
 
 [dev-dependencies]
-p3-mersenne-31.workspace = true
-criterion.workspace = true
+p3-field = { path = "../field" }
+p3-mersenne-31 = { path = "../mersenne-31" }
+
+hex-literal.workspace = true
+proptest.workspace = true
+sha3.workspace = true
 
 [[bench]]
 name = "bench_keccak"
 harness = false
+
+[lints]
+workspace = true
 
 #[[bench]]
 #name = "bench_avx512"
@@ -33,4 +49,3 @@ harness = false
 #[[bench]]
 #name = "bench_avx2split"
 #harness = false
-

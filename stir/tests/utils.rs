@@ -1,0 +1,696 @@
+//! Unit tests for STIR polynomial arithmetic utilities.
+
+use p3_baby_bear::BabyBear;
+use p3_dft::Radix2DitParallel;
+use p3_field::extension::BinomialExtensionField;
+use p3_field::{Field, PrimeCharacteristicRing};
+use p3_stir::prover::{codeword_from_coeffs, coeffs_from_codeword};
+use p3_stir::utils::{
+    add_polys, check_ans_interpolates, divide_by_linear, eval_poly, fold_codeword,
+    fold_poly_coeffs, interpolate_poly,
+};
+use proptest::prelude::*;
+use rand::rngs::SmallRng;
+use rand::{RngExt, SeedableRng};
+
+type F = BabyBear;
+type EF = BinomialExtensionField<F, 4>;
+
+fn f(n: u64) -> F {
+    F::from_u64(n)
+}
+
+fn ef(n: u64) -> EF {
+    EF::from(f(n))
+}
+
+#[test]
+fn test_codeword_from_coeffs_matches_horner_across_shapes() {
+    use p3_field::TwoAdicField;
+
+    let dft = Radix2DitParallel::<F>::default();
+    let mut rng = SmallRng::seed_from_u64(0xdecaf);
+    for log_size in [0usize, 1, 4, 8] {
+        let size = 1usize << log_size;
+        // Cover empty/constant inputs, ragged lengths, both sides of the degree-aware
+        // crossover, a full domain, and truncation of coefficients beyond the domain.
+        for len in [
+            0,
+            1,
+            2,
+            3,
+            size / 16,
+            size / 8,
+            size / 8 + 1,
+            size,
+            size + 3,
+        ] {
+            let coeffs: Vec<EF> = (0..len).map(|_| rng.random()).collect();
+            for shift in [F::ZERO, F::ONE, F::GENERATOR, f(7)] {
+                let actual = codeword_from_coeffs(&dft, coeffs.clone(), shift, log_size);
+                assert_eq!(actual.len(), size);
+                let mut point = shift;
+                let generator = F::two_adic_generator(log_size);
+                for (i, value) in actual.into_iter().enumerate() {
+                    let expected = coeffs[..len.min(size)]
+                        .iter()
+                        .rev()
+                        .fold(EF::ZERO, |acc, &coeff| acc * point + coeff);
+                    assert_eq!(value, expected, "log_size={log_size}, len={len}, i={i}");
+                    point *= generator;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// eval_poly
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_eval_poly_constant() {
+    // p(x) = 7
+    let poly = vec![f(7)];
+    assert_eq!(eval_poly(&poly, f(3)), f(7));
+    assert_eq!(eval_poly(&poly, f(0)), f(7));
+}
+
+#[test]
+fn test_eval_poly_linear() {
+    // p(x) = 2 + 3x  →  p(5) = 2 + 15 = 17
+    let poly = vec![f(2), f(3)];
+    assert_eq!(eval_poly(&poly, f(5)), f(17));
+    assert_eq!(eval_poly(&poly, f(0)), f(2));
+}
+
+#[test]
+fn test_eval_poly_quadratic() {
+    // p(x) = 1 + 2x + 3x²  →  p(4) = 1 + 8 + 48 = 57
+    let poly = vec![f(1), f(2), f(3)];
+    assert_eq!(eval_poly(&poly, f(4)), f(57));
+}
+
+#[test]
+fn test_eval_poly_empty() {
+    let poly: Vec<F> = vec![];
+    assert_eq!(eval_poly(&poly, f(5)), F::ZERO);
+}
+
+// ---------------------------------------------------------------------------
+// divide_by_linear
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_divide_by_linear_remainder_equals_eval() {
+    // p(x) = 1 + 2x + 3x²
+    let poly = vec![f(1), f(2), f(3)];
+    let point = f(4);
+    let (q, r) = divide_by_linear(&poly, point);
+    // Remainder must equal p(point)
+    assert_eq!(r, eval_poly(&poly, point));
+    // Verify p(x) = (x - point) * q(x) + r at x = 10
+    let x = f(10);
+    let qx = eval_poly(&q, x);
+    let px = eval_poly(&poly, x);
+    let reconstructed = (x - point) * qx + r;
+    assert_eq!(px, reconstructed);
+}
+
+#[test]
+fn test_divide_by_linear_exact_divisor() {
+    // p(x) = x² - 1 = (x-1)(x+1); dividing by (x - 1) should give remainder 0.
+    // p(x) = -1 + 0*x + 1*x²  → root at x=1: p(1) = -1 + 0 + 1 = 0
+    let neg_one = F::ZERO - F::ONE;
+    let poly = vec![neg_one, F::ZERO, F::ONE];
+    let (_q, r) = divide_by_linear(&poly, F::ONE);
+    assert_eq!(r, F::ZERO);
+}
+
+#[test]
+#[should_panic(expected = "cannot divide an empty polynomial")]
+fn test_divide_by_linear_empty_panics() {
+    let poly: Vec<F> = vec![];
+    let _ = divide_by_linear(&poly, f(5));
+}
+
+// ---------------------------------------------------------------------------
+// add_polys
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_add_polys_same_degree() {
+    // (1 + 2x) + (3 + 4x) = 4 + 6x
+    let a = vec![f(1), f(2)];
+    let b = vec![f(3), f(4)];
+    let c = add_polys(&a, &b);
+    assert_eq!(c, vec![f(4), f(6)]);
+}
+
+#[test]
+fn test_add_polys_different_degree() {
+    // (1 + 2x + 3x²) + (5 + 6x) = 6 + 8x + 3x²
+    let a = vec![f(1), f(2), f(3)];
+    let b = vec![f(5), f(6)];
+    let c = add_polys(&a, &b);
+    assert_eq!(c, vec![f(6), f(8), f(3)]);
+}
+
+// ---------------------------------------------------------------------------
+// interpolate_poly
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_interpolate_poly_degree_0() {
+    // Single point: p(7) = 42  →  p(x) = 42
+    let poly = interpolate_poly(&[f(7)], &[f(42)]);
+    assert_eq!(eval_poly(&poly, f(7)), f(42));
+    assert_eq!(eval_poly(&poly, f(0)), f(42));
+}
+
+#[test]
+fn test_interpolate_poly_linear() {
+    // Two points: p(0)=2, p(1)=5  →  p(x) = 2 + 3x
+    let poly = interpolate_poly(&[f(0), f(1)], &[f(2), f(5)]);
+    assert_eq!(eval_poly(&poly, f(0)), f(2));
+    assert_eq!(eval_poly(&poly, f(1)), f(5));
+    assert_eq!(eval_poly(&poly, f(2)), f(8));
+}
+
+#[test]
+#[should_panic(expected = "all interpolation points must be distinct")]
+fn test_interpolate_poly_rejects_duplicate_points() {
+    let _ = interpolate_poly(&[f(1), f(1)], &[f(2), f(3)]);
+}
+
+#[test]
+fn test_interpolate_poly_quadratic() {
+    // Three points: p(0)=1, p(1)=3, p(2)=9  →  p(x) = 1 + x + x²
+    let poly = interpolate_poly(&[f(0), f(1), f(2)], &[f(1), f(3), f(7)]);
+    // p(x) = 1 + x + x²: p(0)=1, p(1)=3, p(2)=7
+    assert_eq!(eval_poly(&poly, f(0)), f(1));
+    assert_eq!(eval_poly(&poly, f(1)), f(3));
+    assert_eq!(eval_poly(&poly, f(2)), f(7));
+    // Degree-2 polynomial, check at a new point x=3: p(3)=1+3+9=13
+    assert_eq!(eval_poly(&poly, f(3)), f(13));
+}
+
+#[test]
+fn test_interpolate_poly_roundtrip() {
+    // Choose a known polynomial p(x) = x³ + 2x + 1, sample 4 points, interpolate, verify.
+    // p(x) = 1 + 2x + 0x² + x³
+    let known_poly = vec![f(1), f(2), F::ZERO, F::ONE];
+    let xs: Vec<F> = (0u64..4).map(f).collect();
+    let ys: Vec<F> = xs.iter().map(|&x| eval_poly(&known_poly, x)).collect();
+    let recovered = interpolate_poly(&xs, &ys);
+    // Must agree at the interpolation points and a new one
+    for (&x, &y) in xs.iter().zip(ys.iter()) {
+        assert_eq!(eval_poly(&recovered, x), y);
+    }
+    assert_eq!(eval_poly(&recovered, f(5)), eval_poly(&known_poly, f(5)));
+}
+
+// ---------------------------------------------------------------------------
+// check_ans_interpolates
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ans_interpolates_accepts_the_interpolant() {
+    let points = vec![ef(1), ef(2), ef(3)];
+    let values = vec![ef(5), ef(11), ef(23)];
+    let ans = interpolate_poly(&points, &values);
+
+    // Any rho outside the points should pass.
+    let rho = ef(100);
+    assert!(check_ans_interpolates(&ans, &points, &values, rho));
+}
+
+#[test]
+fn test_ans_interpolates_mismatched_lengths_returns_false() {
+    let points = vec![ef(1), ef(2), ef(3)];
+    let values = vec![ef(5), ef(11), ef(23)];
+    let ans = interpolate_poly(&points, &values);
+
+    let truncated_values = vec![ef(5), ef(11)];
+    assert!(!check_ans_interpolates(
+        &ans,
+        &points,
+        &truncated_values,
+        ef(100)
+    ));
+}
+
+#[test]
+fn test_ans_interpolates_tampered_answer_fails() {
+    let points = vec![ef(1), ef(2), ef(3)];
+    let values = vec![ef(5), ef(11), ef(23)];
+    let mut bad_ans = interpolate_poly(&points, &values);
+
+    bad_ans[0] += ef(1);
+    let rho = ef(42);
+    assert!(!check_ans_interpolates(&bad_ans, &points, &values, rho));
+}
+
+#[test]
+fn test_ans_interpolates_perturbed_value_fails() {
+    // `ans` is built from the honest values, but the verifier reconstructs the interpolant
+    // from the values it derived itself, so a single perturbed value must be caught.
+    let points = vec![ef(1), ef(2), ef(3)];
+    let values = vec![ef(5), ef(11), ef(23)];
+    let ans = interpolate_poly(&points, &values);
+
+    let rho = ef(42);
+    for i in 0..values.len() {
+        let mut bad_values = values.clone();
+        bad_values[i] = ef(999);
+        assert!(
+            !check_ans_interpolates(&ans, &points, &bad_values, rho),
+            "perturbing value {i} must fail the identity"
+        );
+    }
+}
+
+#[test]
+fn test_ans_interpolates_rejects_rho_on_a_node() {
+    let points = vec![ef(1), ef(2), ef(3)];
+    let values = vec![ef(5), ef(11), ef(23)];
+    let ans = interpolate_poly(&points, &values);
+
+    // The barycentric denominators are undefined on a node, so the identity says nothing.
+    assert!(!check_ans_interpolates(&ans, &points, &values, points[1]));
+}
+
+#[test]
+fn test_ans_interpolates_single_node() {
+    // n == 1 is the only input that exercises the empty-`product()` weight path.
+    assert!(check_ans_interpolates(&[ef(7)], &[ef(3)], &[ef(7)], ef(9)));
+    assert!(!check_ans_interpolates(&[ef(8)], &[ef(3)], &[ef(7)], ef(9)));
+}
+
+// ---------------------------------------------------------------------------
+// fold_codeword correctness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fold_codeword_arity2_constant_polynomial() {
+    use p3_dft::Radix2DitParallel;
+    use p3_stir::prover::codeword_from_coeffs;
+    use p3_stir::utils::fold_codeword;
+
+    // A constant polynomial p(x) = 5 should fold to p(x) = 5 regardless of gamma.
+    let log_domain = 4;
+    let domain_size = 1 << log_domain;
+    let dft = Radix2DitParallel::<F>::default();
+    let shift = F::GENERATOR;
+
+    let coeffs: Vec<EF> = {
+        let mut c = vec![EF::ZERO; domain_size];
+        c[0] = ef(5);
+        c
+    };
+
+    // DFT to get codeword.
+    let codeword = codeword_from_coeffs(&dft, coeffs, shift, log_domain);
+
+    let gamma = ef(7);
+    let folded = fold_codeword::<F, EF>(&codeword, gamma, 1, log_domain);
+
+    // Folded codeword should have all entries equal to 5 (constant polynomial).
+    for &v in &folded {
+        assert_eq!(v, ef(5), "folded constant polynomial must stay constant");
+    }
+}
+
+#[test]
+fn test_fold_codeword_zero_arity_is_identity() {
+    use p3_stir::utils::fold_codeword;
+
+    let codeword: Vec<EF> = (1..=16u64).map(ef).collect();
+    let beta = ef(11);
+    assert_eq!(
+        fold_codeword::<F, EF>(&codeword, beta, 0, 4),
+        codeword,
+        "arity-1 fold (log_arity = 0) must return the codeword unchanged"
+    );
+}
+
+#[test]
+fn test_fold_codeword_agrees_with_fold_fiber() {
+    use p3_dft::Radix2DitParallel;
+    use p3_stir::utils::{fold_codeword, fold_fiber};
+
+    let log_domain = 4;
+    let log_arity = 1;
+    let domain_size = 1 << log_domain;
+    let dft = Radix2DitParallel::<F>::default();
+    let shift = F::GENERATOR;
+
+    // Random-ish coefficients using field arithmetic.
+    let coeffs: Vec<EF> = (1..=domain_size).map(|i| ef(i as u64)).collect();
+
+    use p3_stir::prover::codeword_from_coeffs;
+    let codeword = codeword_from_coeffs(&dft, coeffs, shift, log_domain);
+
+    let gamma = ef(42);
+    let folded = fold_codeword::<F, EF>(&codeword, gamma, log_arity, log_domain);
+
+    let new_height = codeword.len() >> log_arity;
+    let log_new_height = log_domain - log_arity;
+
+    // For each new-domain index j, fold_fiber should give the same result as folded[j].
+    for j in 0..new_height {
+        let fiber: Vec<EF> = (0..(1 << log_arity))
+            .map(|k| codeword[j + k * new_height])
+            .collect();
+        let expected = fold_fiber::<F, EF>(&fiber, j, log_new_height, log_arity, gamma);
+        assert_eq!(
+            folded[j], expected,
+            "fold_codeword and fold_fiber disagree at j={j}"
+        );
+    }
+}
+
+#[test]
+fn test_fold_codeword_higher_arity_agrees_with_fold_fiber() {
+    use p3_dft::Radix2DitParallel;
+    use p3_stir::prover::codeword_from_coeffs;
+    use p3_stir::utils::{fold_codeword, fold_fiber};
+
+    let log_domain = 6;
+    let domain_size = 1 << log_domain;
+    let dft = Radix2DitParallel::<F>::default();
+    let shift = F::GENERATOR;
+
+    let coeffs: Vec<EF> = (1..=domain_size).map(|i| ef(i as u64)).collect();
+    let codeword = codeword_from_coeffs(&dft, coeffs, shift, log_domain);
+
+    // Binary-pass decomposition kicks in for log_arity >= 2; check arity 4 and arity 8.
+    for log_arity in [2usize, 3usize] {
+        let gamma = ef(1000 + log_arity as u64);
+        let folded = fold_codeword::<F, EF>(&codeword, gamma, log_arity, log_domain);
+
+        let new_height = codeword.len() >> log_arity;
+        let log_new_height = log_domain - log_arity;
+
+        for j in 0..new_height {
+            let fiber: Vec<EF> = (0..(1 << log_arity))
+                .map(|k| codeword[j + k * new_height])
+                .collect();
+            let expected = fold_fiber::<F, EF>(&fiber, j, log_new_height, log_arity, gamma);
+            assert_eq!(
+                folded[j], expected,
+                "fold_codeword and fold_fiber disagree at log_arity={log_arity}, j={j}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_fold_poly_coeffs_agrees_with_the_evaluation_form_fold() {
+    use p3_dft::Radix2DitParallel;
+    use p3_stir::prover::{codeword_from_coeffs, coeffs_from_codeword};
+    use p3_stir::utils::{fold_codeword, fold_poly_coeffs};
+
+    let log_domain = 6;
+    let domain_size = 1usize << log_domain;
+    let dft = Radix2DitParallel::<F>::default();
+    let shift = F::GENERATOR;
+    let gamma = ef(31);
+
+    // Degree `domain_size - 1`, so each fold lands at degree `domain_size / k - 1` and the
+    // inverse DFT over the fold domain recovers the folded polynomial exactly.
+    let coeffs: Vec<EF> = (1..=domain_size).map(|i| ef(i as u64)).collect();
+    let codeword = codeword_from_coeffs(&dft, coeffs.clone(), shift, log_domain);
+
+    for log_arity in [1usize, 2, 3] {
+        // `fold_codeword` interpolates at subgroup coordinates, so the coset fold at `gamma`
+        // is reached through `gamma / shift`; `fold_poly_coeffs` takes `gamma` directly.
+        let beta = gamma * EF::from(shift.inverse());
+        let folded = fold_codeword::<F, EF>(&codeword, beta, log_arity, log_domain);
+        let fold_shift = shift.exp_power_of_2(log_arity);
+
+        assert_eq!(
+            fold_poly_coeffs(&coeffs, gamma, log_arity),
+            coeffs_from_codeword(&dft, &folded, fold_shift),
+            "coefficient and evaluation folds disagree at log_arity={log_arity}"
+        );
+    }
+}
+
+#[test]
+fn test_folded_coeffs_recover_from_degree_sized_subcosets() {
+    let log_degree = 6;
+    let degree = 1usize << log_degree;
+    let dft = Radix2DitParallel::<F>::default();
+    let shift = f(7);
+    let gamma = ef(31);
+    let native_coeffs: Vec<EF> = (1..=degree).map(|i| ef(i as u64)).collect();
+
+    // Vary both the LDE blowup and fold arity, including distinct k0/k-style arities. The
+    // expected coefficients come from the independent coefficient-form fold.
+    for log_blowup in [0usize, 1, 2] {
+        let log_domain = log_degree + log_blowup;
+        let mut domain_coeffs = native_coeffs.clone();
+        domain_coeffs.resize(1usize << log_domain, EF::ZERO);
+        let codeword = codeword_from_coeffs(&dft, domain_coeffs, shift, log_domain);
+
+        for log_arity in [1usize, 2, 3] {
+            let beta = gamma * EF::from(shift.inverse());
+            let folded = fold_codeword::<F, EF>(&codeword, beta, log_arity, log_domain);
+            let folded_degree_bound = degree >> log_arity;
+            let stride = folded.len() / folded_degree_bound;
+            let subcoset: Vec<EF> = (0..folded_degree_bound)
+                .map(|i| folded[i * stride])
+                .collect();
+            let fold_shift = shift.exp_power_of_2(log_arity);
+
+            assert_eq!(
+                coeffs_from_codeword(&dft, &subcoset, fold_shift),
+                fold_poly_coeffs(&native_coeffs, gamma, log_arity),
+                "subcoset recovery disagrees at log_blowup={log_blowup}, \
+                 log_arity={log_arity}"
+            );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// The lemma the whole `Oracle::Coeffs` prover path rests on: `fold_poly_coeffs` and
+    /// `fold_codeword` (composed with `coeffs_from_codeword`) must agree, not just at the one
+    /// dense-degree, `GENERATOR`-shift shape above. `true_deg` is drawn independently of
+    /// `log_domain` so the coefficient tail past the true degree — and, once folded, past
+    /// `log_sub_coset`'s width — is genuinely zero rather than incidentally full, and `shift`
+    /// varies since it is never `GENERATOR` past round 0 in the real prover.
+    #[test]
+    fn test_fold_poly_coeffs_agrees_with_fold_codeword_over_shapes(
+        log_domain in 3usize..=8,
+        log_arity in 1usize..=3,
+        true_deg_seed in 0usize..(1 << 8),
+        shift_seed in 1u64..(1 << 20),
+        seed: u64,
+    ) {
+        prop_assume!(log_arity <= log_domain);
+
+        let domain_size = 1usize << log_domain;
+        let true_deg = 1 + (true_deg_seed % domain_size);
+        let shift = F::from_u64(shift_seed);
+
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let mut coeffs: Vec<EF> = (0..true_deg).map(|_| rng.random()).collect();
+        coeffs.resize(domain_size, EF::ZERO);
+        let gamma: EF = rng.random();
+
+        let dft = Radix2DitParallel::<F>::default();
+        let codeword = codeword_from_coeffs(&dft, coeffs.clone(), shift, log_domain);
+
+        // `fold_codeword` interpolates at subgroup coordinates, so the coset fold at `gamma`
+        // is reached through `gamma / shift`; `fold_poly_coeffs` takes `gamma` directly.
+        let beta = gamma * EF::from(shift.inverse());
+        let folded = fold_codeword::<F, EF>(&codeword, beta, log_arity, log_domain);
+        let fold_shift = shift.exp_power_of_2(log_arity);
+
+        prop_assert_eq!(
+            fold_poly_coeffs(&coeffs, gamma, log_arity),
+            coeffs_from_codeword(&dft, &folded, fold_shift),
+        );
+    }
+}
+
+#[test]
+fn test_mixed_answer_check_matches_extension_check_at_boundaries() {
+    use p3_stir::utils::check_ans_interpolates_mixed;
+    let mut rng = SmallRng::seed_from_u64(0xace);
+    for q in [0, 1, 2, 9] {
+        for s in [0, 1, 2, 4] {
+            let queries: Vec<F> = (0..q).map(|i| f(i + 1)).collect();
+            let ood: Vec<EF> = (0..s).map(|_| rng.random()).collect();
+            let points: Vec<EF> = ood
+                .iter()
+                .copied()
+                .chain(queries.iter().copied().map(EF::from))
+                .collect();
+            let values: Vec<EF> = points.iter().map(|_| rng.random()).collect();
+            let ans = interpolate_poly(&points, &values);
+            let mut rhos: Vec<EF> = (0..4).map(|_| rng.random()).collect();
+            rhos.extend_from_slice(&points);
+            for rho in rhos {
+                for candidate in [&ans[..], &[EF::ONE][..], &[][..]] {
+                    assert_eq!(
+                        check_ans_interpolates_mixed(candidate, &ood, &queries, &values, rho),
+                        check_ans_interpolates(candidate, &points, &values, rho)
+                    );
+                }
+            }
+            assert!(!check_ans_interpolates_mixed(
+                &ans,
+                &ood,
+                &queries,
+                &[EF::ZERO; 30],
+                ef(99)
+            ));
+        }
+    }
+    for (ood, queries) in [
+        (vec![], vec![f(1), f(1)]),
+        (vec![ef(1)], vec![f(1)]),
+        (vec![ef(1), ef(1)], vec![]),
+    ] {
+        let values = vec![EF::ONE; ood.len() + queries.len()];
+        assert!(!check_ans_interpolates_mixed(
+            &[EF::ONE],
+            &ood,
+            &queries,
+            &values,
+            ef(99)
+        ));
+    }
+}
+
+#[test]
+fn test_mixed_interpolation_matches_canonical_extension_coefficients() {
+    use p3_stir::utils::interpolate_poly_mixed;
+    let mut rng = SmallRng::seed_from_u64(0xcafe);
+    for q in [0, 1, 2, 9, 32] {
+        for s in [0, 1, 2, 4] {
+            let queries: Vec<F> = (0..q).map(|i| f(i + 1)).collect();
+            let ood: Vec<EF> = (0..s).map(|_| rng.random()).collect();
+            let points: Vec<EF> = ood
+                .iter()
+                .copied()
+                .chain(queries.iter().copied().map(EF::from))
+                .collect();
+            for coeffs in [
+                vec![],
+                vec![EF::ZERO],
+                vec![ef(7)],
+                (0..points.len()).map(|_| rng.random()).collect(),
+            ] {
+                let values: Vec<EF> = points.iter().map(|&x| eval_poly(&coeffs, x)).collect();
+                assert_eq!(
+                    interpolate_poly_mixed(&ood, &queries, &values),
+                    interpolate_poly(&points, &values),
+                    "q={q}, s={s}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "all interpolation points must be distinct")]
+fn test_mixed_interpolation_rejects_query_duplicates() {
+    p3_stir::utils::interpolate_poly_mixed(&[], &[f(1), f(1)], &[ef(2), ef(3)]);
+}
+
+#[test]
+#[should_panic(expected = "all interpolation points must be distinct")]
+fn test_mixed_interpolation_rejects_cross_field_duplicates() {
+    p3_stir::utils::interpolate_poly_mixed(&[ef(1)], &[f(1)], &[ef(2), ef(3)]);
+}
+
+#[test]
+#[should_panic(expected = "all interpolation points must be distinct")]
+fn test_mixed_interpolation_rejects_ood_duplicates() {
+    p3_stir::utils::interpolate_poly_mixed(&[ef(1), ef(1)], &[] as &[F], &[ef(2), ef(3)]);
+}
+
+#[test]
+#[should_panic(expected = "points and values must have the same length")]
+fn test_mixed_interpolation_rejects_wrong_value_count() {
+    p3_stir::utils::interpolate_poly_mixed(&[ef(1)], &[f(2)], &[ef(3)]);
+}
+
+#[test]
+fn test_mixed_vanishing_matches_extension_root_expansion() {
+    use p3_stir::utils::{vanishing_poly_from_roots, vanishing_poly_from_roots_mixed};
+    let mut rng = SmallRng::seed_from_u64(0xcafe);
+    for q in [0, 1, 2, 9, 32] {
+        for s in [0, 1, 2, 4] {
+            // Duplicates are valid roots of a vanishing polynomial too.
+            let queries: Vec<F> = (0..q).map(|i| f(i % 3)).collect();
+            let ood: Vec<EF> = (0..s).map(|_| rng.random()).collect();
+            let points: Vec<EF> = ood
+                .iter()
+                .copied()
+                .chain(queries.iter().copied().map(EF::from))
+                .collect();
+            assert_eq!(
+                vanishing_poly_from_roots_mixed(&ood, &queries),
+                vanishing_poly_from_roots(&points)
+            );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn test_mixed_arithmetic_matches_extension_arithmetic_on_random_nodes(
+        q in 0usize..40,
+        s in 0usize..5,
+        seed: u64,
+    ) {
+        use p3_stir::utils::{
+            check_ans_interpolates_mixed, interpolate_poly_mixed,
+            vanishing_poly_from_roots, vanishing_poly_from_roots_mixed,
+        };
+
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let mut queries: Vec<F> = (0..q).map(|_| rng.random()).collect();
+        queries.sort_unstable();
+        queries.dedup();
+        let mut ood = Vec::with_capacity(s);
+        while ood.len() < s {
+            let point: EF = rng.random();
+            if !ood.contains(&point) && !queries.iter().any(|&y| point == EF::from(y)) {
+                ood.push(point);
+            }
+        }
+        let points: Vec<EF> = ood.iter().copied()
+            .chain(queries.iter().copied().map(EF::from))
+            .collect();
+        let values: Vec<EF> = points.iter().map(|_| rng.random()).collect();
+        let ans = interpolate_poly(&points, &values);
+        prop_assert_eq!(&interpolate_poly_mixed(&ood, &queries, &values), &ans);
+        prop_assert_eq!(
+            vanishing_poly_from_roots_mixed(&ood, &queries),
+            vanishing_poly_from_roots(&points),
+        );
+        let rho: EF = rng.random();
+        let mut incorrect_ans = ans.clone();
+        if incorrect_ans.is_empty() {
+            incorrect_ans.push(EF::ONE);
+        } else {
+            incorrect_ans[0] += EF::ONE;
+        }
+        for candidate in [&ans[..], &incorrect_ans[..]] {
+            prop_assert_eq!(
+                check_ans_interpolates_mixed(candidate, &ood, &queries, &values, rho),
+                check_ans_interpolates(candidate, &points, &values, rho),
+            );
+        }
+    }
+}

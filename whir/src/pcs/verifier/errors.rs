@@ -1,0 +1,178 @@
+//! Verifier error types.
+
+use alloc::string::String;
+
+use p3_sumcheck::SumcheckError;
+use thiserror::Error;
+
+use crate::transcript::TranscriptFailure;
+
+/// Errors during WHIR proof verification.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum VerifierError {
+    /// The public opening batch does not reach the configured security target.
+    #[error(transparent)]
+    Config(#[from] crate::parameters::WhirConfigError),
+    /// Merkle proof verification failed.
+    #[error("Merkle proof verification failed at position {position}: {reason}")]
+    MerkleProofInvalid { position: usize, reason: String },
+
+    /// Sumcheck polynomial evaluation mismatch.
+    #[error("Sumcheck verification failed at round {round}: expected {expected}, got {actual}")]
+    SumcheckFailed {
+        round: usize,
+        expected: String,
+        actual: String,
+    },
+
+    /// STIR challenge response is invalid.
+    #[error("STIR challenge {challenge_id} verification failed: {details}")]
+    StirChallengeFailed {
+        challenge_id: usize,
+        details: String,
+    },
+
+    /// STIR query count does not match the sampled challenge count.
+    #[error("STIR query count mismatch at round {round_index}: expected {expected}, got {actual}")]
+    StirQueryCountMismatch {
+        round_index: usize,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// The proof carries the wrong number of opening evaluation batches.
+    ///
+    /// Raised by the adapter before any sumcheck or Merkle work.
+    #[error("expected {expected} opening evaluation batches, got {actual}")]
+    OpeningBatchCountMismatch { expected: usize, actual: usize },
+
+    /// One opening batch has the wrong number of evaluations for its column list.
+    ///
+    /// Raised by the adapter before any sumcheck or Merkle work.
+    #[error("table {table_idx} opening expected {expected} evaluations, got {actual}")]
+    OpeningBatchSizeMismatch {
+        table_idx: usize,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// Sumcheck verification error.
+    #[error(transparent)]
+    Sumcheck(#[from] SumcheckError),
+
+    /// Invalid round index.
+    #[error("Invalid round index: {index}")]
+    InvalidRoundIndex { index: usize },
+
+    /// Proof-of-work witness verification failed.
+    #[error("round {round}: query grinding witness clears fewer than {bits} bits")]
+    InvalidPowWitness {
+        /// Round whose query grind rejected the witness, `n_rounds` for the final one.
+        round: usize,
+        /// Difficulty the witness must meet.
+        bits: usize,
+    },
+
+    /// A grinding witness is not the value its zero difficulty admits.
+    ///
+    /// Raised with the other shape checks, before any transcript work.
+    ///
+    /// The final round is labelled by the intermediate round count.
+    //
+    // Why: at `pow_bits = 0` neither side touches the sponge.
+    //
+    //     prover  : grind is skipped     -> zero on the wire
+    //     verifier: check_witness(0, w)  -> returns true, absorbs nothing
+    //
+    // The field is then bound to nothing: any value rides along and still verifies.
+    #[error("Non-canonical proof-of-work witness in round {round} at zero difficulty")]
+    NonCanonicalPowWitness { round: usize },
+
+    /// Final sumcheck data is present, but the folding schedule leaves no closing rounds.
+    ///
+    /// Raised with the other shape checks, before any transcript work.
+    //
+    // Why: with no closing rounds the final fold delegates nothing.
+    //
+    //     prover  : no closing fold -> None on the wire
+    //     verifier: no closing fold -> the field is never read
+    //
+    // The field is then bound to nothing: any value rides along and still verifies.
+    #[error("Unexpected final sumcheck data: the folding schedule leaves no closing rounds")]
+    UnexpectedFinalSumcheck,
+
+    /// Proof is missing the Merkle commitment for a round.
+    #[error("Proof is missing the Merkle commitment for round {round}")]
+    MissingRoundCommitment { round: usize },
+
+    /// Round OOD answers do not match the verifier's expected count.
+    #[error("Round {round} OOD answer count mismatch: expected {expected}, got {actual}")]
+    RoundOodAnswerCountMismatch {
+        round: usize,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// Initial OOD answers do not match the verifier's expected count.
+    ///
+    /// - The commitment fixes how many out-of-domain answers must be absorbed.
+    /// - A wrong count would desync the transcript instead of failing cleanly.
+    #[error("Initial OOD answer count mismatch: expected {expected}, got {actual}")]
+    InitialOodAnswerCountMismatch { expected: usize, actual: usize },
+
+    /// Folding randomness is unexpectedly absent before a STIR check.
+    #[error("Missing folding randomness before STIR verification at round {round}")]
+    MissingFoldingRandomness { round: usize },
+
+    /// Proof contains an unexpected number of rounds.
+    #[error("Proof has {actual} rounds, expected {expected}")]
+    RoundCountMismatch { expected: usize, actual: usize },
+
+    /// Proof is missing the final polynomial evaluations.
+    #[error("Proof is missing the final polynomial evaluations")]
+    MissingFinalPoly,
+
+    /// Final polynomial has the wrong number of evaluations.
+    #[error("Final polynomial length mismatch: expected {expected}, got {actual}")]
+    FinalPolyLengthMismatch { expected: usize, actual: usize },
+}
+
+impl From<TranscriptFailure> for VerifierError {
+    fn from(failure: TranscriptFailure) -> Self {
+        match failure {
+            TranscriptFailure::PowWitness { round, bits } => {
+                Self::InvalidPowWitness { round, bits }
+            }
+            TranscriptFailure::NonCanonicalPowWitness { round } => {
+                Self::NonCanonicalPowWitness { round }
+            }
+            TranscriptFailure::FinalPolyLength { expected, got } => Self::FinalPolyLengthMismatch {
+                expected,
+                actual: got,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+
+    use super::VerifierError;
+    use crate::transcript::TranscriptFailure;
+
+    #[test]
+    fn pow_witness_failure_preserves_round_and_difficulty() {
+        let error = VerifierError::from(TranscriptFailure::PowWitness { round: 3, bits: 17 });
+
+        assert!(matches!(
+            error,
+            VerifierError::InvalidPowWitness { round: 3, bits: 17 }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "round 3: query grinding witness clears fewer than 17 bits"
+        );
+    }
+}

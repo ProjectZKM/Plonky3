@@ -1,15 +1,17 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use itertools::{iterate, Itertools};
+use itertools::{Itertools, iterate};
 use p3_commit::{LagrangeSelectors, PolynomialSpace};
 use p3_field::extension::ComplexExtendable;
-use p3_field::ExtensionField;
-use p3_matrix::dense::RowMajorMatrix;
+use p3_field::{ExtensionField, batch_multiplicative_inverse};
 use p3_matrix::Matrix;
+use p3_matrix::dense::RowMajorMatrix;
+use p3_maybe_rayon::prelude::*;
 use p3_util::{log2_ceil_usize, log2_strict_usize};
 use tracing::instrument;
 
+use crate::cfft::CircleEvaluations;
 use crate::point::Point;
 
 /// A twin-coset of the circle group on F. It has a power-of-two size and an arbitrary shift.
@@ -57,40 +59,87 @@ impl<F: ComplexExtendable> CircleDomain<F> {
     fn is_standard(&self) -> bool {
         self.shift == Point::generator(self.log_n + 1)
     }
-    pub(crate) fn gen(&self) -> Point<F> {
+    pub(crate) fn subgroup_generator(&self) -> Point<F> {
         Point::generator(self.log_n - 1)
     }
     pub(crate) fn coset0(&self) -> impl Iterator<Item = Point<F>> {
-        let g = self.gen();
+        let g = self.subgroup_generator();
         iterate(self.shift, move |&p| p + g).take(1 << (self.log_n - 1))
     }
     fn coset1(&self) -> impl Iterator<Item = Point<F>> {
-        let g = self.gen();
+        let g = self.subgroup_generator();
         iterate(g - self.shift, move |&p| p + g).take(1 << (self.log_n - 1))
     }
     pub(crate) fn points(&self) -> impl Iterator<Item = Point<F>> {
         self.coset0().interleave(self.coset1())
     }
+    /// Same points as [`Self::points`], materialized eagerly. Each half-coset's sequential
+    /// point-addition chain is split into chunks (reseeded via a scalar multiplication) that
+    /// run in parallel, instead of walking the whole chain on a single thread.
+    pub(crate) fn points_vec(&self) -> Vec<Point<F>> {
+        let half = 1usize << (self.log_n - 1);
+        let g = self.subgroup_generator();
+        let c0 = parallel_point_chain(self.shift, g, half);
+        let c1 = parallel_point_chain(g - self.shift, g, half);
+        c0.into_iter().interleave(c1).collect()
+    }
     pub(crate) fn nth_point(&self, idx: usize) -> Point<F> {
         let (idx, lsb) = (idx >> 1, idx & 1);
         if lsb == 0 {
-            self.shift + self.gen() * idx
+            self.shift + self.subgroup_generator() * idx
         } else {
-            -self.shift + self.gen() * (idx + 1)
+            -self.shift + self.subgroup_generator() * (idx + 1)
         }
     }
 
-    pub(crate) fn zeroifier<EF: ExtensionField<F>>(&self, at: Point<EF>) -> EF {
+    pub(crate) fn vanishing_poly<EF: ExtensionField<F>>(&self, at: Point<EF>) -> EF {
         at.v_n(self.log_n) - self.shift.v_n(self.log_n)
     }
 
-    pub(crate) fn s_p<EF: ExtensionField<F>>(&self, p: Point<F>, at: Point<EF>) -> EF {
-        self.zeroifier(at) / p.v_tilde_p(at)
+    /// `log_period`, `log_repetitions` with `trace_len / period = 2^log_repetitions`.
+    fn periodic_column_fold_params(&self, period: usize) -> (usize, usize) {
+        debug_assert!(period.is_power_of_two());
+        let trace_len = self.size();
+        assert_eq!(
+            trace_len % period,
+            0,
+            "trace length must be divisible by periodic column length"
+        );
+        let log_period = log2_strict_usize(period);
+        let log_repetitions = log2_strict_usize(trace_len / period);
+        (log_period, log_repetitions)
     }
+}
 
-    pub(crate) fn s_p_normalized<EF: ExtensionField<F>>(&self, p: Point<F>, at: Point<EF>) -> EF {
-        self.zeroifier(at) / (p.v_tilde_p(at) * p.s_p_at_p(self.log_n))
+/// Below this length, chunking overhead (each chunk reseeds via a scalar multiplication costing
+/// `O(log len)` point operations) outweighs the benefit of splitting the chain across threads.
+const PARALLEL_THRESHOLD: usize = 1 << 10;
+
+/// Materialize `len` points of the sequential chain `iterate(seed, |&p| p + g)`, splitting it
+/// into chunks that run in parallel. Each chunk reseeds itself with one scalar multiplication
+/// (`g * chunk_start`) instead of walking the prefix of the chain that precedes it.
+fn parallel_point_chain<F: ComplexExtendable>(
+    seed: Point<F>,
+    g: Point<F>,
+    len: usize,
+) -> Vec<Point<F>> {
+    if len < PARALLEL_THRESHOLD {
+        return iterate(seed, move |&p| p + g).take(len).collect_vec();
     }
+    let num_chunks = current_num_threads().max(1).min(len);
+    let chunk_len = len.div_ceil(num_chunks);
+    (0..len.div_ceil(chunk_len))
+        .into_par_iter()
+        .map(|c| {
+            let chunk_start = c * chunk_len;
+            let this_len = chunk_len.min(len - chunk_start);
+            let chunk_seed = seed + g * chunk_start;
+            iterate(chunk_seed, move |&p| p + g)
+                .take(this_len)
+                .collect_vec()
+        })
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 impl<F: ComplexExtendable> PolynomialSpace for CircleDomain<F> {
@@ -100,6 +149,12 @@ impl<F: ComplexExtendable> PolynomialSpace for CircleDomain<F> {
         1 << self.log_n
     }
 
+    fn transition_degree_multiple(&self) -> usize {
+        // `1 - normalized_last_selector` lies in the same FFT space as a trace
+        // column; unlike the two-adic selector its degree grows with the trace.
+        1
+    }
+
     fn first_point(&self) -> Self::Val {
         self.shift.to_projective_line().unwrap()
     }
@@ -107,41 +162,46 @@ impl<F: ComplexExtendable> PolynomialSpace for CircleDomain<F> {
     fn next_point<Ext: ExtensionField<Self::Val>>(&self, x: Ext) -> Option<Ext> {
         // Only in standard position do we have an algebraic expression to access the next point.
         if self.is_standard() {
-            Some(
-                (Point::from_projective_line(x) + Point::generator(self.log_n))
-                    .to_projective_line()
-                    .unwrap(),
-            )
+            (Point::from_projective_line(x) + Point::generator(self.log_n)).to_projective_line()
         } else {
             None
         }
     }
 
-    fn create_disjoint_domain(&self, min_size: usize) -> Self {
+    fn try_create_disjoint_domain(&self, min_size: usize) -> Option<Self> {
         // Right now we simply guarantee the domain is disjoint by returning a
         // larger standard position coset, which is fine because we always ask for a larger
         // domain. If we wanted good performance for a disjoint domain of the same size,
         // we could change the shift. Also we could support nonstandard twin cosets.
-        assert!(
-            self.is_standard(),
-            "create_disjoint_domain not currently supported for nonstandard twin cosets"
-        );
+        if !self.is_standard() {
+            return None;
+        }
         let log_n = log2_ceil_usize(min_size);
         // Any standard position coset that is not the same size as us will be disjoint.
-        Self::standard(if log_n == self.log_n {
+        let log_n = if log_n == self.log_n {
             log_n + 1
         } else {
             log_n
-        })
+        };
+        // A standard domain of size 2^n is shifted by a point of order 2^(n + 1).
+        //
+        // The circle group has no such point once n reaches its two-adicity.
+        //
+        // The verifier derives this size from an untrusted trace height, so it must not panic.
+        if log_n >= F::CIRCLE_TWO_ADICITY {
+            return None;
+        }
+        Some(Self::standard(log_n))
     }
 
     /// Decompose a domain into disjoint twin-cosets.
     fn split_domains(&self, num_chunks: usize) -> Vec<Self> {
         assert!(self.is_standard());
         let log_chunks = log2_strict_usize(num_chunks);
+        assert!(log_chunks <= self.log_n);
         self.points()
             .take(num_chunks)
-            .map(|shift| CircleDomain {
+            .map(|shift| Self {
                 log_n: self.log_n - log_chunks,
                 shift,
             })
@@ -167,8 +227,8 @@ impl<F: ComplexExtendable> PolynomialSpace for CircleDomain<F> {
             .collect()
     }
 
-    fn zp_at_point<Ext: ExtensionField<Self::Val>>(&self, point: Ext) -> Ext {
-        self.zeroifier(Point::from_projective_line(point))
+    fn vanishing_poly_at_point<Ext: ExtensionField<Self::Val>>(&self, point: Ext) -> Ext {
+        self.vanishing_poly(Point::from_projective_line(point))
     }
 
     fn selectors_at_point<Ext: ExtensionField<Self::Val>>(
@@ -176,11 +236,26 @@ impl<F: ComplexExtendable> PolynomialSpace for CircleDomain<F> {
         point: Ext,
     ) -> LagrangeSelectors<Ext> {
         let point = Point::from_projective_line(point);
+
+        // Single-point specialization of the fused pass in `selectors_on_coset`: one
+        // shared `vanishing_poly` evaluation and one batch inversion instead of four
+        // separate `log_n`-step squaring chains and three separate inversions.
+        let neg_shift = -self.shift;
+        let k = neg_shift.s_p_at_p(self.log_n);
+        let z = self.vanishing_poly(point);
+        let (num_shift, den_shift) = self.shift.recip_v_tilde_p_num_den(point);
+        let (num_negshift, den_negshift) = neg_shift.recip_v_tilde_p_num_den(point);
+        let den_negshift_k = den_negshift * k;
+
+        let inv = batch_multiplicative_inverse(&[den_shift, den_negshift_k, z]);
+        let (inv_den_shift, inv_den_negshift_k, inv_z) = (inv[0], inv[1], inv[2]);
+
+        let z_inv_dk = z * num_negshift * inv_den_negshift_k;
         LagrangeSelectors {
-            is_first_row: self.s_p(self.shift, point),
-            is_last_row: self.s_p(-self.shift, point),
-            is_transition: Ext::ONE - self.s_p_normalized(-self.shift, point),
-            inv_zeroifier: self.zeroifier(point).inverse(),
+            is_first_row: z * num_shift * inv_den_shift,
+            is_last_row: z_inv_dk * k,
+            is_transition: Ext::ONE - z_inv_dk,
+            inv_vanishing: inv_z,
         }
     }
 
@@ -200,31 +275,158 @@ impl<F: ComplexExtendable> PolynomialSpace for CircleDomain<F> {
     chunks=2: 0 1 1 0 0 1 1 0 0 1 1 0 0 1 1 0
     chunks=4: 0 1 2 3 3 2 1 0 0 1 2 3 3 2 1 0
     */
-    // wow, really slow!
-    // todo: batch inverses
-    #[instrument(skip_all, fields(log_n = %coset.log_n))]
+    #[instrument(skip_all, level = "debug", fields(log_n = %coset.log_n))]
     fn selectors_on_coset(&self, coset: Self) -> LagrangeSelectors<Vec<Self::Val>> {
-        let sels = coset
-            .points()
-            .map(|p| self.selectors_at_point(p.to_projective_line().unwrap()))
-            .collect_vec();
+        let pts = coset.points().collect_vec();
+        let n = pts.len();
+
+        let neg_shift = -self.shift;
+        let k = neg_shift.s_p_at_p(self.log_n);
+        // `vanishing_poly(at) = at.v_n(log_n) - shift.v_n(log_n)`; the second term is the
+        // same constant for every point in the coset, so it is hoisted out of the loop
+        // below instead of being recomputed (as a `log_n`-step squaring chain) per point.
+        let shift_v_n = self.shift.v_n(self.log_n);
+
+        // On larger standard domains, the vanishing values have a reflected period:
+        // for B = |coset| / |self|, the indices are 0..B, then B-1..0.
+        // Only those B distinct values need squaring chains and inversions.
+        let standard_z = (self.is_standard() && coset.is_standard() && coset.log_n > self.log_n)
+            .then(|| {
+                let blowup = 1 << (coset.log_n - self.log_n);
+                pts[..blowup]
+                    .iter()
+                    .map(|at| at.v_n(self.log_n) - shift_v_n)
+                    .collect_vec()
+            });
+        // Standard coset points are (2i + 1)h with h = gen(m + 1), where m = coset.log_n.
+        // v_n takes the x-coordinate after n - 1 doublings, so it depends on (2i + 1)
+        // modulo 4B up to sign, with n = self.log_n and B = |coset| / |self|.
+        // t and 2B - 1 - t give opposite residues, hence min(t, mask - t).
+        let reflected_index = |i: usize, distinct: usize| {
+            let mask = 2 * distinct - 1;
+            let t = i & mask;
+            t.min(mask - t)
+        };
+
+        // Fused parallel pass over the coset points: `vanishing_poly` and the
+        // denominators of the two reciprocal selectors are independent per point.
+        // Keeping the selectors as numerators over denominators avoids two individual
+        // inversions per point before the batch inversion below.
+        let mut z_vals = Self::Val::zero_vec(n);
+        let mut den_shift = Self::Val::zero_vec(n);
+        let mut den_negshift_k = Self::Val::zero_vec(n);
+        z_vals
+            .par_iter_mut()
+            .zip(den_shift.par_iter_mut())
+            .zip(den_negshift_k.par_iter_mut())
+            .zip(pts.par_iter())
+            .enumerate()
+            .for_each(|(i, (((z, ds), dnk), &at))| {
+                *z = standard_z.as_ref().map_or_else(
+                    || at.v_n(self.log_n) - shift_v_n,
+                    |values| values[reflected_index(i, values.len())],
+                );
+                let (_, den_shift) = self.shift.recip_v_tilde_p_num_den(at);
+                let (_, den_negshift) = neg_shift.recip_v_tilde_p_num_den(at);
+                *ds = den_shift;
+                *dnk = den_negshift * k;
+            });
+
+        // Batch inverses (already internally parallel).
+        let inv_vanishing = standard_z.map_or_else(
+            || batch_multiplicative_inverse(&z_vals),
+            |values| {
+                let inverses = batch_multiplicative_inverse(&values);
+                (0..n)
+                    .into_par_iter()
+                    .map(|i| inverses[reflected_index(i, inverses.len())])
+                    .collect()
+            },
+        );
+        let inv_den_shift = batch_multiplicative_inverse(&den_shift);
+        let inv_den_negshift_k = batch_multiplicative_inverse(&den_negshift_k);
+
+        // Fused parallel selector build:
+        let mut is_first_row = Self::Val::zero_vec(n);
+        let mut is_last_row = Self::Val::zero_vec(n);
+        let mut is_transition = Self::Val::zero_vec(n);
+        is_first_row
+            .par_iter_mut()
+            .zip(is_last_row.par_iter_mut())
+            .zip(is_transition.par_iter_mut())
+            .zip(z_vals.par_iter())
+            .zip(inv_den_shift.par_iter())
+            .zip(inv_den_negshift_k.par_iter())
+            .zip(pts.par_iter())
+            .for_each(|((((((ifr, ilr), itr), &z), &inv_d), &inv_dk), &at)| {
+                // The numerators are recomputed rather than stored by the first pass: two more
+                // `n`-element buffers cost at least as much as the point subtractions they save.
+                let (num_shift, _) = self.shift.recip_v_tilde_p_num_den(at);
+                let (num_negshift, _) = neg_shift.recip_v_tilde_p_num_den(at);
+                let z_inv_dk = z * num_negshift * inv_dk;
+                *ifr = z * num_shift * inv_d;
+                *ilr = z_inv_dk * k;
+                *itr = Self::Val::ONE - z_inv_dk;
+            });
+
         LagrangeSelectors {
-            is_first_row: sels.iter().map(|s| s.is_first_row).collect(),
-            is_last_row: sels.iter().map(|s| s.is_last_row).collect(),
-            is_transition: sels.iter().map(|s| s.is_transition).collect(),
-            inv_zeroifier: sels.iter().map(|s| s.inv_zeroifier).collect(),
+            is_first_row,
+            is_last_row,
+            is_transition,
+            inv_vanishing,
         }
+    }
+
+    fn evaluate_polynomial_at<Ext: ExtensionField<F>>(&self, evals: &[F], point: Ext) -> Ext {
+        assert!(
+            self.is_standard(),
+            "evaluate_polynomial_at requires standard position"
+        );
+        assert_eq!(evals.len(), self.size());
+        let values = RowMajorMatrix::new(evals.to_vec(), 1);
+        let circle_evals = CircleEvaluations::from_natural_order(*self, values);
+        let circle_point = Point::from_projective_line(point);
+        circle_evals.evaluate_at_point(circle_point)[0]
+    }
+
+    fn evaluate_periodic_column_at<Ext: ExtensionField<F>>(&self, col: &[F], point: Ext) -> Ext {
+        if col.is_empty() {
+            return Ext::ZERO;
+        }
+        assert!(
+            self.is_standard(),
+            "evaluate_periodic_column_at requires standard position"
+        );
+        assert!(
+            col.len().is_power_of_two(),
+            "periodic column length must be a power of 2"
+        );
+
+        // A column of period 1 is the constant polynomial.
+        //
+        // Its periodic domain would have a single point, and a twin coset has at least two.
+        if let [value] = col {
+            return Ext::from(*value);
+        }
+
+        let (log_period, log_repetitions) = self.periodic_column_fold_params(col.len());
+        let periodic_domain = Self::standard(log_period);
+
+        let evals = CircleEvaluations::from_natural_order(
+            periodic_domain,
+            RowMajorMatrix::new_col(col.to_vec()),
+        );
+
+        let query_point = Point::<Ext>::from_projective_line(point);
+        let periodic_point = query_point.repeated_double(log_repetitions);
+        evals.evaluate_at_point(periodic_point)[0]
     }
 }
 
 // 0 1 2 .. len-1 len len len-1 .. 1 0 0 1 ..
-fn forward_backward_index(mut i: usize, len: usize) -> usize {
+const fn forward_backward_index(mut i: usize, len: usize) -> usize {
     i %= 2 * len;
-    if i < len {
-        i
-    } else {
-        2 * len - 1 - i
-    }
+    if i < len { i } else { 2 * len - 1 - i }
 }
 
 #[cfg(test)]
@@ -233,12 +435,32 @@ mod tests {
 
     use hashbrown::HashSet;
     use itertools::izip;
-    use p3_field::{batch_multiplicative_inverse, FieldAlgebra};
+    use p3_field::{PrimeCharacteristicRing, batch_multiplicative_inverse};
     use p3_mersenne_31::Mersenne31;
-    use rand::thread_rng;
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
 
     use super::*;
     use crate::CircleEvaluations;
+
+    #[test]
+    fn disjoint_domain_beyond_the_circle_group_is_none() {
+        // Fixture state: the Mersenne31 circle group has order 2^31.
+        //
+        // The largest standard domain has size 2^30, shifted by a point of order 2^31.
+        let top = Mersenne31::CIRCLE_TWO_ADICITY;
+        // A smaller request gets a disjoint standard domain of size 2^29.
+        let largest = CircleDomain::<Mersenne31>::standard(top - 1);
+        assert_eq!(
+            largest.try_create_disjoint_domain(1 << (top - 2)),
+            Some(CircleDomain::standard(top - 2))
+        );
+        // A same-size or larger request needs a domain of size 2^31.
+        //
+        // Its shift would need order 2^32, which the group lacks.
+        assert_eq!(largest.try_create_disjoint_domain(1 << (top - 1)), None);
+        assert_eq!(largest.try_create_disjoint_domain(1 << top), None);
+    }
 
     fn assert_is_twin_coset<F: ComplexExtendable>(d: CircleDomain<F>) {
         let pts = d.points().collect_vec();
@@ -284,11 +506,16 @@ mod tests {
 
         // zp is zero
         for p in d.points() {
-            assert_eq!(d.zp_at_point(p.to_projective_line().unwrap()), F::ZERO);
+            assert_eq!(
+                d.vanishing_poly_at_point(p.to_projective_line().unwrap()),
+                F::ZERO
+            );
         }
 
+        let mut rng = SmallRng::seed_from_u64(1);
+
         // split domains
-        let evals = RowMajorMatrix::rand(&mut thread_rng(), n, width);
+        let evals = RowMajorMatrix::rand(&mut rng, n, width);
         let orig: Vec<(Point<F>, Vec<F>)> = d
             .points()
             .zip(evals.rows().map(|r| r.collect_vec()))
@@ -345,7 +572,7 @@ mod tests {
             assert_eq!(sels.is_first_row[i], pt_sels.is_first_row);
             assert_eq!(sels.is_last_row[i], pt_sels.is_last_row);
             assert_eq!(sels.is_transition[i], pt_sels.is_transition);
-            assert_eq!(sels.inv_zeroifier[i], pt_sels.inv_zeroifier);
+            assert_eq!(sels.inv_vanishing[i], pt_sels.inv_vanishing);
             pt = coset.next_point(pt).unwrap();
         }
 
@@ -356,7 +583,7 @@ mod tests {
             );
             let coeffs = evals.interpolate().to_row_major_matrix();
             let (lo, hi) = coeffs.split_rows(n);
-            assert_eq!(hi.values, vec![F::ZERO; n]);
+            assert_eq!(hi.values, F::zero_vec(n));
             CircleEvaluations::evaluate(d, lo.to_row_major_matrix())
                 .to_natural_order()
                 .to_row_major_matrix()
@@ -366,22 +593,22 @@ mod tests {
         // Nonzero at first point, zero everywhere else on domain
         let is_first_row = coset_to_d(&sels.is_first_row);
         assert_ne!(is_first_row[0], F::ZERO);
-        assert_eq!(&is_first_row[1..], &vec![F::ZERO; n - 1]);
+        assert_eq!(&is_first_row[1..], &F::zero_vec(n - 1));
 
         // Nonzero at last point, zero everywhere else on domain
         let is_last_row = coset_to_d(&sels.is_last_row);
-        assert_eq!(&is_last_row[..n - 1], &vec![F::ZERO; n - 1]);
+        assert_eq!(&is_last_row[..n - 1], &F::zero_vec(n - 1));
         assert_ne!(is_last_row[n - 1], F::ZERO);
 
         // Nonzero everywhere on domain but last point
         let is_transition = coset_to_d(&sels.is_transition);
-        assert_ne!(&is_transition[..n - 1], &vec![F::ZERO; n - 1]);
+        assert_ne!(&is_transition[..n - 1], &F::zero_vec(n - 1));
         assert_eq!(is_transition[n - 1], F::ZERO);
 
-        // Zeroifier coefficients look like [0.. (n times), 1, 0.. (n-1 times)]
+        // Vanishing polynomial coefficients look like [0.. (n times), 1, 0.. (n-1 times)]
         let z_coeffs = CircleEvaluations::from_natural_order(
             coset,
-            RowMajorMatrix::new_col(batch_multiplicative_inverse(&sels.inv_zeroifier)),
+            RowMajorMatrix::new_col(batch_multiplicative_inverse(&sels.inv_vanishing)),
         )
         .interpolate()
         .to_row_major_matrix()
@@ -389,16 +616,75 @@ mod tests {
         assert_eq!(
             z_coeffs,
             iter::empty()
-                .chain(iter::repeat(F::ZERO).take(n))
+                .chain(iter::repeat_n(F::ZERO, n))
                 .chain(iter::once(F::ONE))
-                .chain(iter::repeat(F::ZERO).take(n - 1))
+                .chain(iter::repeat_n(F::ZERO, n - 1))
                 .collect_vec()
         );
+    }
+
+    #[test]
+    fn selectors_on_disjoint_cosets_match_single_point_selectors() {
+        type F = Mersenne31;
+
+        let mut domains = Vec::new();
+        // Exercise the reflected periods, including more than one complete period.
+        for log_n in 1..=6 {
+            for log_blowup in 1..=4 {
+                domains.push((
+                    CircleDomain::<F>::standard(log_n),
+                    CircleDomain::<F>::standard(log_n + log_blowup),
+                ));
+            }
+        }
+        domains.extend([
+            // Equal-size, nonstandard twin cosets remain on the generic path.
+            (
+                CircleDomain::<F>::new(8, Point::generator(31) * 3),
+                CircleDomain::<F>::new(8, Point::generator(31) * 5),
+            ),
+            // Either domain being nonstandard must disable the standard-position shortcut.
+            (
+                CircleDomain::<F>::new(5, Point::generator(31) * 3),
+                CircleDomain::<F>::standard(8),
+            ),
+            (
+                CircleDomain::<F>::standard(5),
+                CircleDomain::<F>::new(8, Point::generator(31) * 5),
+            ),
+            // A smaller evaluation domain is valid too.
+            (
+                CircleDomain::<F>::standard(8),
+                CircleDomain::<F>::standard(5),
+            ),
+        ]);
+
+        for (domain, coset) in domains {
+            let domain_points: HashSet<_> = domain.points().collect();
+            assert!(coset.points().all(|point| !domain_points.contains(&point)));
+            let selectors = domain.selectors_on_coset(coset);
+            for (i, point) in coset.points().enumerate() {
+                let at_point = domain.selectors_at_point(point.to_projective_line().unwrap());
+                assert_eq!(selectors.is_first_row[i], at_point.is_first_row);
+                assert_eq!(selectors.is_last_row[i], at_point.is_last_row);
+                assert_eq!(selectors.is_transition[i], at_point.is_transition);
+                assert_eq!(selectors.inv_vanishing[i], at_point.inv_vanishing);
+            }
+        }
     }
 
     #[test]
     fn test_circle_domain() {
         do_test_circle_domain(4, 8);
         do_test_circle_domain(10, 32);
+    }
+
+    #[test]
+    fn points_vec_matches_points() {
+        type F = Mersenne31;
+        for log_n in 1..8 {
+            let d = CircleDomain::<F>::standard(log_n);
+            assert_eq!(d.points_vec(), d.points().collect_vec());
+        }
     }
 }

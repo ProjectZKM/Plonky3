@@ -1,101 +1,185 @@
 use alloc::vec;
 use alloc::vec::Vec;
-use core::iter;
 
-use itertools::{izip, Itertools};
-use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
+use itertools::{Itertools, izip};
+use p3_challenger::{CanObserve, CanSample, CanSampleBits, GrindingChallenger};
 use p3_commit::Mmcs;
-use p3_field::{ExtensionField, Field};
-use p3_fri::{FriConfig, FriGenericConfig};
+use p3_field::{ExtensionField, Field, PrimeField64};
+use p3_fri::{FriFoldingStrategy, FriParameters, compute_log_arity_for_round};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_util::log2_strict_usize;
 use tracing::{info_span, instrument};
 
-use crate::{CircleCommitPhaseProofStep, CircleFriProof, CircleQueryProof};
+use crate::transcript::CircleProverTranscript;
+use crate::{CircleCommitPhaseMultiStep, CircleFriProof};
 
+/// Run the Circle-FRI low-degree test over the reduced openings.
+///
+/// Every commitment, grinding witness and challenge passes through the transcript.
+/// The caller seeded it, owns it, and closes it once this returns.
+///
+/// # Arguments
+///
+/// - `folding`: the Circle folding strategy.
+/// - `params`: the parameters for this FRI instance.
+/// - `inputs`: the folding inputs, sorted descending by length.
+/// - `transcript`: the described transcript this run plays into.
+/// - `open_inputs`: opens every input commitment at all query indices at once,
+///   so the shared authentication paths can be deduplicated.
 #[instrument(name = "FRI prover", skip_all)]
-pub fn prove<G, Val, Challenge, M, Challenger>(
-    g: &G,
-    config: &FriConfig<M>,
+pub(crate) fn prove<Folding, Val, Challenge, M, Challenger>(
+    folding: &Folding,
+    params: &FriParameters<M>,
     inputs: Vec<Vec<Challenge>>,
-    challenger: &mut Challenger,
-    open_input: impl Fn(usize) -> G::InputProof,
-) -> CircleFriProof<Challenge, M, Challenger::Witness, G::InputProof>
+    transcript: &mut CircleProverTranscript<'_, Challenger, Val, Challenge>,
+    open_inputs: impl FnOnce(&[usize]) -> Folding::InputProof,
+) -> CircleFriProof<Challenge, M, Val, Folding::InputProof>
 where
-    Val: Field,
+    Val: PrimeField64,
     Challenge: ExtensionField<Val>,
     M: Mmcs<Challenge>,
-    Challenger: FieldChallenger<Val> + GrindingChallenger + CanObserve<M::Commitment>,
-    G: FriGenericConfig<Challenge>,
+    Challenger: CanObserve<Val>
+        + CanSample<Val>
+        + CanSampleBits<usize>
+        + GrindingChallenger<Witness = Val>
+        + CanObserve<M::Commitment>,
+    Folding: FriFoldingStrategy<Val, Challenge>,
 {
+    // Circle folding halves the domain and nothing else.
+    //
+    // The transcript is described with a round count derived from that.
+    // A larger cap would make the described run and the played one disagree.
+    assert_eq!(
+        params.max_log_arity, 1,
+        "Circle-FRI folds two points at a time, so max_log_arity must be 1"
+    );
+
+    // A zero-query instance performs no low-degree spot checks.
+    // The verifier rejects it, so refuse to emit one locally.
+    assert!(
+        params.num_queries > 0,
+        "num_queries must be at least 1 for Circle-FRI soundness"
+    );
+    // At rate 1 every length-N word is itself a degree-<N codeword, so the folding chain
+    // would accept an arbitrary reduced-opening word. The verifier rejects it.
+    assert!(
+        params.log_blowup > 0,
+        "log_blowup must be at least 1 for Circle-FRI soundness"
+    );
+
     // check sorted descending
-    assert!(inputs
-        .iter()
-        .tuple_windows()
-        .all(|(l, r)| l.len() >= r.len()));
+    assert!(
+        inputs
+            .iter()
+            .tuple_windows()
+            .all(|(l, r)| l.len() >= r.len())
+    );
 
-    let log_max_height = log2_strict_usize(inputs[0].len());
+    let commit_phase_result = commit_phase(folding, params, inputs, transcript);
 
-    let commit_phase_result = commit_phase(g, config, inputs, challenger);
+    // Bind the final constant, grind, and draw every query index.
+    //
+    // Indices are drawn in one block, so the birthday bound applies.
+    let (indices, pow_witness) = transcript.query_phase(commit_phase_result.final_poly);
+    let pow_witness = pow_witness.unwrap_or(Val::ZERO);
 
-    let pow_witness = challenger.grind(config.proof_of_work_bits);
-
-    let query_proofs = info_span!("query phase").in_scope(|| {
-        iter::repeat_with(|| challenger.sample_bits(log_max_height + g.extra_query_index_bits()))
-            .take(config.num_queries)
-            .map(|index| CircleQueryProof {
-                input_proof: open_input(index),
-                commit_phase_openings: answer_query(
-                    config,
-                    &commit_phase_result.data,
-                    index >> g.extra_query_index_bits(),
-                ),
-            })
-            .collect()
+    let (input_openings, commit_phase_openings) = info_span!("query phase").in_scope(|| {
+        // Openings of the inputs and of every commit-phase codeword at all queried
+        // locations. Queries into one tree share a single proof, so overlapping
+        // authentication paths are deduplicated instead of being shipped once per query.
+        let input_openings = open_inputs(&indices);
+        let domain_indices: Vec<usize> = indices
+            .iter()
+            .map(|&index| index >> folding.extra_query_index_bits())
+            .collect();
+        let commit_phase_openings = answer_queries(
+            params,
+            &commit_phase_result.log_arities,
+            &commit_phase_result.data,
+            &domain_indices,
+        );
+        (input_openings, commit_phase_openings)
     });
 
     CircleFriProof {
         commit_phase_commits: commit_phase_result.commits,
-        query_proofs,
+        commit_pow_witnesses: commit_phase_result.pow_witnesses,
+        input_openings,
+        commit_phase_openings,
         final_poly: commit_phase_result.final_poly,
         pow_witness,
     }
 }
 
-struct CommitPhaseResult<F: Field, M: Mmcs<F>> {
+struct CommitPhaseResult<F: Field, M: Mmcs<F>, Witness> {
     commits: Vec<M::Commitment>,
     data: Vec<M::ProverData<RowMajorMatrix<F>>>,
+    log_arities: Vec<usize>,
+    pow_witnesses: Vec<Witness>,
     final_poly: F,
 }
 
+/// Fold the inputs down to a constant, committing to every intermediate codeword.
+///
+/// # Arguments
+///
+/// - `folding`: the Circle folding strategy.
+/// - `params`: the parameters for this FRI instance.
+/// - `inputs`: the folding inputs, sorted descending by length.
+/// - `transcript`: the described transcript every commitment and challenge passes through.
 #[instrument(name = "commit phase", skip_all)]
-fn commit_phase<G, Val, Challenge, M, Challenger>(
-    g: &G,
-    config: &FriConfig<M>,
+fn commit_phase<Folding, Val, Challenge, M, Challenger>(
+    folding: &Folding,
+    params: &FriParameters<M>,
     inputs: Vec<Vec<Challenge>>,
-    challenger: &mut Challenger,
-) -> CommitPhaseResult<Challenge, M>
+    transcript: &mut CircleProverTranscript<'_, Challenger, Val, Challenge>,
+) -> CommitPhaseResult<Challenge, M, Val>
 where
-    Val: Field,
+    Val: PrimeField64,
     Challenge: ExtensionField<Val>,
     M: Mmcs<Challenge>,
-    Challenger: FieldChallenger<Val> + CanObserve<M::Commitment>,
-    G: FriGenericConfig<Challenge>,
+    Challenger: CanObserve<Val>
+        + CanSample<Val>
+        + CanSampleBits<usize>
+        + GrindingChallenger<Witness = Val>
+        + CanObserve<M::Commitment>,
+    Folding: FriFoldingStrategy<Val, Challenge>,
 {
     let mut inputs_iter = inputs.into_iter().peekable();
     let mut folded = inputs_iter.next().unwrap();
     let mut commits = vec![];
     let mut data = vec![];
+    let mut log_arities = vec![];
+    let mut pow_witnesses = vec![];
 
-    while folded.len() > config.blowup() {
-        let leaves = RowMajorMatrix::new(folded, 2);
-        let (commit, prover_data) = config.mmcs.commit_matrix(leaves);
-        challenger.observe(commit.clone());
+    // For Circle, we fold down to blowup elements (no separate final_poly_len)
+    let log_final_height = params.log_blowup;
 
-        let beta: Challenge = challenger.sample_ext_element();
+    while folded.len() > params.blowup() {
+        let log_current_height = log2_strict_usize(folded.len());
+        let next_input_log_height = inputs_iter.peek().map(|v| log2_strict_usize(v.len()));
+
+        // Compute the arity for this round
+        let log_arity = compute_log_arity_for_round(
+            log_current_height,
+            next_input_log_height,
+            log_final_height,
+            params.max_log_arity,
+        );
+        let arity = 1 << log_arity;
+        log_arities.push(log_arity);
+
+        let leaves = RowMajorMatrix::new(folded, arity);
+        let (commit, prover_data) = params.mmcs.commit_matrix(leaves);
+
+        // One call binds the commitment, grinds, and draws the folding challenge.
+        let (beta, witness) = transcript.commit_round(commit.clone());
+        // A zero difficulty still occupies a slot, keeping the proof shape fixed.
+        pow_witnesses.push(witness.unwrap_or(Val::ZERO));
+
         // We passed ownership of `current` to the MMCS, so get a reference to it
-        let leaves = config.mmcs.get_matrices(&prover_data).pop().unwrap();
-        folded = g.fold_matrix(beta, leaves.as_view());
+        let leaves = params.mmcs.get_matrices(&prover_data).pop().unwrap();
+        folded = folding.fold_matrix(beta, log_arity, leaves.as_view());
 
         commits.push(commit);
         data.push(prover_data);
@@ -106,45 +190,77 @@ where
     }
 
     // We should be left with `blowup` evaluations of a constant polynomial.
-    assert_eq!(folded.len(), config.blowup());
+    assert_eq!(folded.len(), params.blowup());
     let final_poly = folded[0];
     for x in folded {
         assert_eq!(x, final_poly);
     }
-    challenger.observe_ext_element(final_poly);
 
     CommitPhaseResult {
         commits,
         data,
+        log_arities,
+        pow_witnesses,
         final_poly,
     }
 }
 
-fn answer_query<F, M>(
-    config: &FriConfig<M>,
+/// For each round, return every query's sibling values together with one shared
+/// opening proof covering all of that round's queried groups.
+fn answer_queries<F, M>(
+    params: &FriParameters<M>,
+    log_arities: &[usize],
     commit_phase_commits: &[M::ProverData<RowMajorMatrix<F>>],
-    index: usize,
-) -> Vec<CircleCommitPhaseProofStep<F, M>>
+    start_indices: &[usize],
+) -> Vec<CircleCommitPhaseMultiStep<F, M>>
 where
     F: Field,
     M: Mmcs<F>,
 {
+    let mut current_indices = start_indices.to_vec();
+
     commit_phase_commits
         .iter()
         .enumerate()
         .map(|(i, commit)| {
-            let index_i = index >> i;
-            let index_i_sibling = index_i ^ 1;
-            let index_pair = index_i >> 1;
+            let log_arity = log_arities[i];
+            let arity = 1 << log_arity;
 
-            let (mut opened_rows, opening_proof) = config.mmcs.open_batch(index_pair, commit);
-            assert_eq!(opened_rows.len(), 1);
-            let opened_row = opened_rows.pop().unwrap();
-            assert_eq!(opened_row.len(), 2, "Committed data should be in pairs");
-            let sibling_value = opened_row[index_i_sibling % 2];
+            // Index of each query's group (row in the committed matrix).
+            let group_indices: Vec<usize> = current_indices
+                .iter()
+                .map(|&index| index >> log_arity)
+                .collect();
 
-            CircleCommitPhaseProofStep {
-                sibling_value,
+            // One shared proof that all queried groups are correct.
+            let (opened_rows, opening_proof) = params.mmcs.open_multi_batch(&group_indices, commit);
+
+            // For each query, keep all siblings (exclude the queried element).
+            let sibling_values: Vec<Vec<F>> = izip!(&current_indices, opened_rows)
+                .map(|(&index, mut rows)| {
+                    assert_eq!(rows.len(), 1);
+                    let opened_row = rows.pop().unwrap();
+                    assert_eq!(
+                        opened_row.len(),
+                        arity,
+                        "Committed data should have arity {} elements",
+                        arity
+                    );
+                    let index_in_group = index % arity;
+                    opened_row
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != index_in_group)
+                        .map(|(_, v)| v)
+                        .collect()
+                })
+                .collect();
+
+            // Move to the parent groups for the next round.
+            current_indices = group_indices;
+
+            CircleCommitPhaseMultiStep {
+                sibling_values,
                 opening_proof,
             }
         })

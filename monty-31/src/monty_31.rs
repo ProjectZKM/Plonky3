@@ -4,45 +4,69 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Display, Formatter};
 use core::hash::Hash;
-use core::intrinsics::transmute;
 use core::iter::{Product, Sum};
 use core::marker::PhantomData;
-use core::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
+use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use core::{array, iter};
 
 use num_bigint::BigUint;
-use p3_field::{
-    Field, FieldAlgebra, Packable, PrimeField, PrimeField32, PrimeField64, TwoAdicField,
+use p3_field::integers::QuotientMap;
+use p3_field::op_assign_macros::{
+    impl_add_assign, impl_div_methods, impl_mul_methods, impl_sub_assign,
 };
-use rand::distributions::{Distribution, Standard};
+use p3_field::{
+    Field, InjectiveMonomial, Packable, PermutationMonomial, PrimeCharacteristicRing, PrimeField,
+    PrimeField32, PrimeField64, RawDataSerializable, TwoAdicField, UniformSamplingField,
+    impl_raw_serializable_primefield32, quotient_map_small_int, tonelli_shanks_two_adic,
+};
+use p3_util::{flatten_to_base, gcd_inversion_prime_field_32};
 use rand::Rng;
+use rand::distr::{Distribution, StandardUniform};
+use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::utils::{from_monty, halve_u32, monty_reduce, to_monty, to_monty_64};
-use crate::{FieldParameters, MontyParameters, TwoAdicData};
+use crate::utils::{
+    add, from_monty, halve_u32, large_monty_reduce, monty_reduce, monty_reduce_u128, sub, to_monty,
+    to_monty_64, to_monty_64_signed, to_monty_signed,
+};
+use crate::{FieldParameters, MontyParameters, RelativelyPrimePower, TwoAdicData};
 
 #[derive(Clone, Copy, Default, Eq, Hash, PartialEq)]
-#[repr(transparent)] // Packed field implementations rely on this!
+#[repr(transparent)] // Important for reasoning about memory layout.
+#[must_use]
 pub struct MontyField31<MP: MontyParameters> {
-    // This is `pub(crate)` for tests and delayed reduction strategies. If you're accessing `value` outside of those, you're
-    // likely doing something fishy.
+    /// The MONTY form of the field element, saved as a positive integer less than `P`.
+    ///
+    /// This is `pub(crate)` for tests and delayed reduction strategies. If you're accessing `value` outside of those, you're
+    /// likely doing something fishy.
     pub(crate) value: u32,
     _phantom: PhantomData<MP>,
 }
 
 impl<MP: MontyParameters> MontyField31<MP> {
-    // The standard way to crate a new element.
-    // Note that new converts the input into MONTY form so should be avoided in performance critical implementations.
+    /// Create a new field element from any `u32`.
+    ///
+    /// Any `u32` value is accepted and automatically converted to Montgomery form.
     #[inline(always)]
     pub const fn new(value: u32) -> Self {
+        const {
+            assert!(MP::PRIME % 2 == 1, "PRIME must be odd");
+            assert!(MP::PRIME < (1 << 31), "PRIME must be a 31-bit prime");
+            assert!(MP::MONTY_BITS == 32);
+            assert!(
+                MP::PRIME.wrapping_mul(MP::MONTY_MU) == 1,
+                "MONTY_MU must satisfy PRIME * MONTY_MU ≡ 1 (mod 2^32)"
+            );
+        }
         Self {
             value: to_monty::<MP>(value),
             _phantom: PhantomData,
         }
     }
 
-    // Create a new field element from something already in MONTY form.
-    // This is `pub(crate)` for tests and delayed reduction strategies. If you're using it outside of those, you're
-    // likely doing something fishy.
+    /// Create a new field element from something already in MONTY form.
+    /// This is `pub(crate)` for tests and delayed reduction strategies. If you're using it outside of those, you're
+    /// likely doing something fishy.
     #[inline(always)]
     pub(crate) const fn new_monty(value: u32) -> Self {
         Self {
@@ -51,27 +75,21 @@ impl<MP: MontyParameters> MontyField31<MP> {
         }
     }
 
-    pub const fn value(&self) -> u32 {
-        self.value
-    }
-
     /// Produce a u32 in range [0, P) from a field element corresponding to the true value.
     #[inline(always)]
-    pub(crate) fn to_u32(elem: &Self) -> u32 {
+    pub(crate) const fn to_u32(elem: &Self) -> u32 {
         from_monty::<MP>(elem.value)
     }
 
-    /// Convert a constant u32 array into a constant array of field elements.
-    /// Constant version of array.map(MontyField31::new).
+    /// Convert a `[u32; N]` array to an array of field elements.
+    ///
+    /// Const version of `input.map(MontyField31::new)`.
     #[inline]
     pub const fn new_array<const N: usize>(input: [u32; N]) -> [Self; N] {
-        let mut output = [MontyField31::new_monty(0); N];
+        let mut output = [Self::new_monty(0); N];
         let mut i = 0;
-        loop {
-            if i == N {
-                break;
-            }
-            output[i] = MontyField31::new(input[i]);
+        while i < N {
+            output[i] = Self::new(input[i]);
             i += 1;
         }
         output
@@ -83,36 +101,34 @@ impl<MP: MontyParameters> MontyField31<MP> {
     pub const fn new_2d_array<const N: usize, const M: usize>(
         input: [[u32; N]; M],
     ) -> [[Self; N]; M] {
-        let mut output = [[MontyField31::new_monty(0); N]; M];
+        let mut output = [[Self::new_monty(0); N]; M];
         let mut i = 0;
-        loop {
-            if i == M {
-                break;
-            }
-            output[i] = MontyField31::new_array(input[i]);
+        while i < M {
+            output[i] = Self::new_array(input[i]);
             i += 1;
         }
         output
     }
+}
 
-    /// Multiply the given MontyField31 element by `2^{-n}`.
-    ///
-    /// This makes use of the fact that, as the monty constant is `2^32`,
-    /// the monty form of `2^{-n}` is `2^{32 - n}`. Monty reduction works
-    /// provided the input is `< 2^32P` so this works for `0 <= n <= 32`.
-    #[inline]
-    #[must_use]
-    pub const fn mul_2exp_neg_n(&self, n: u32) -> Self {
-        assert!(n < 33);
-        let value_mul_2exp_neg_n = (self.value as u64) << (32 - n);
-        MontyField31::new_monty(monty_reduce::<MP>(value_mul_2exp_neg_n))
-    }
+impl<FP: FieldParameters> MontyField31<FP> {
+    const MONTY_POWERS_OF_TWO: [Self; 64] = {
+        let mut powers_of_two = [FP::MONTY_ONE; 64];
+        let mut i = 1;
+        while i < 64 {
+            powers_of_two[i] = Self::new_monty(to_monty_64::<FP>(1 << i));
+            i += 1;
+        }
+        powers_of_two
+    };
+
+    const HALF: Self = Self::new(FP::HALF_P_PLUS_1);
 }
 
 impl<FP: MontyParameters> Ord for MontyField31<FP> {
     #[inline]
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        MontyField31::to_u32(self).cmp(&MontyField31::to_u32(other))
+        Self::to_u32(self).cmp(&Self::to_u32(other))
     }
 }
 
@@ -125,17 +141,17 @@ impl<FP: MontyParameters> PartialOrd for MontyField31<FP> {
 
 impl<FP: MontyParameters> Display for MontyField31<FP> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        Display::fmt(&MontyField31::to_u32(self), f)
+        Display::fmt(&Self::to_u32(self), f)
     }
 }
 
 impl<FP: MontyParameters> Debug for MontyField31<FP> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        Debug::fmt(&MontyField31::to_u32(self), f)
+        Debug::fmt(&Self::to_u32(self), f)
     }
 }
 
-impl<FP: MontyParameters> Distribution<MontyField31<FP>> for Standard {
+impl<FP: MontyParameters> Distribution<MontyField31<FP>> for StandardUniform {
     #[inline]
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> MontyField31<FP> {
         loop {
@@ -150,21 +166,73 @@ impl<FP: MontyParameters> Distribution<MontyField31<FP>> for Standard {
 
 impl<FP: FieldParameters> Serialize for MontyField31<FP> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u32(self.as_canonical_u32())
+        // It's faster to Serialize and Deserialize in monty form.
+        // Binary (non human-readable) formats get a fixed 4-byte encoding instead of
+        // the serializer's default varint, since every value here is a near-uniform
+        // 31-bit integer and varint saves nothing on average.
+        if serializer.is_human_readable() {
+            serializer.serialize_u32(self.value)
+        } else {
+            self.value.to_le_bytes().serialize(serializer)
+        }
     }
 }
 
 impl<'de, FP: FieldParameters> Deserialize<'de> for MontyField31<FP> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let val = u32::deserialize(d)?;
-        Ok(MontyField31::from_canonical_u32(val))
+        // It's faster to Serialize and Deserialize in monty form.
+        let human_readable = d.is_human_readable();
+        let val = if human_readable {
+            u32::deserialize(d)?
+        } else {
+            u32::from_le_bytes(<[u8; 4]>::deserialize(d)?)
+        };
+        if val < FP::PRIME {
+            Ok(Self::new_monty(val))
+        } else {
+            Err(D::Error::custom("Value is out of range"))
+        }
     }
 }
 
-impl<FP: FieldParameters> Packable for MontyField31<FP> {}
+impl<MP: MontyParameters> Packable for MontyField31<MP> {
+    #[inline]
+    fn transpose_owned(input: &[Self], width: usize, height: usize) -> Vec<Self> {
+        // SAFETY: Self is repr(transparent) over an initialized u32 and PhantomData.
+        unsafe { p3_util::transpose::transpose_words_owned(input, width, height) }
+    }
 
-impl<FP: FieldParameters> FieldAlgebra for MontyField31<FP> {
-    type F = Self;
+    #[inline]
+    fn transpose(input: &[Self], output: &mut [Self], width: usize, height: usize) {
+        // SAFETY: Self is repr(transparent) over an initialized u32 and PhantomData.
+        unsafe { p3_util::transpose::transpose_words(input, output, width, height) };
+    }
+
+    #[inline]
+    fn transpose_rows<'a>(
+        rows: usize,
+        cols: usize,
+        row: impl Fn(usize) -> &'a [Self],
+        dst: &mut [Self],
+    ) {
+        // SAFETY: Self is repr(transparent) over an initialized u32 and PhantomData.
+        unsafe { p3_util::transpose::transpose_rows_words(rows, cols, row, dst) };
+    }
+}
+
+// Provide a blanket implementation for Monty31 fields here, which forwards the
+// implementation of the variables to the generic argument `<Field>Parameter`,
+// for which we implement the trait (KoalaBear, BabyBear).
+impl<MP> UniformSamplingField for MontyField31<MP>
+where
+    MP: UniformSamplingField + MontyParameters,
+{
+    const MAX_SINGLE_SAMPLE_BITS: usize = MP::MAX_SINGLE_SAMPLE_BITS;
+    const SAMPLING_BITS_M: [u64; 64] = MP::SAMPLING_BITS_M;
+}
+
+impl<FP: FieldParameters> PrimeCharacteristicRing for MontyField31<FP> {
+    type PrimeSubfield = Self;
 
     const ZERO: Self = FP::MONTY_ZERO;
     const ONE: Self = FP::MONTY_ONE;
@@ -172,106 +240,8 @@ impl<FP: FieldParameters> FieldAlgebra for MontyField31<FP> {
     const NEG_ONE: Self = FP::MONTY_NEG_ONE;
 
     #[inline(always)]
-    fn from_f(f: Self::F) -> Self {
+    fn from_prime_subfield(f: Self) -> Self {
         f
-    }
-
-    #[inline(always)]
-    fn from_bool(b: bool) -> Self {
-        Self::from_canonical_u32(b as u32)
-    }
-
-    #[inline(always)]
-    fn from_canonical_u8(n: u8) -> Self {
-        Self::from_canonical_u32(n as u32)
-    }
-
-    #[inline(always)]
-    fn from_canonical_u16(n: u16) -> Self {
-        Self::from_canonical_u32(n as u32)
-    }
-
-    #[inline(always)]
-    fn from_canonical_u32(n: u32) -> Self {
-        debug_assert!(n < FP::PRIME);
-        Self::from_wrapped_u32(n)
-    }
-
-    #[inline(always)]
-    fn from_canonical_u64(n: u64) -> Self {
-        debug_assert!(n < FP::PRIME as u64);
-        Self::from_canonical_u32(n as u32)
-    }
-
-    #[inline(always)]
-    fn from_canonical_usize(n: usize) -> Self {
-        debug_assert!(n < FP::PRIME as usize);
-        Self::from_canonical_u32(n as u32)
-    }
-
-    #[inline(always)]
-    fn from_wrapped_u32(n: u32) -> Self {
-        Self::new(n)
-    }
-
-    #[inline(always)]
-    fn from_wrapped_u64(n: u64) -> Self {
-        Self::new_monty(to_monty_64::<FP>(n))
-    }
-
-    #[inline]
-    fn mul_2exp_u64(&self, exp: u64) -> Self {
-        let product = (self.value as u64) << exp;
-        let value = (product % (FP::PRIME as u64)) as u32;
-        Self::new_monty(value)
-    }
-
-    #[inline]
-    fn zero_vec(len: usize) -> Vec<Self> {
-        // SAFETY: repr(transparent) ensures transmutation safety.
-        unsafe { transmute(vec![0u32; len]) }
-    }
-}
-
-impl<FP: FieldParameters> Field for MontyField31<FP> {
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    type Packing = crate::PackedMontyField31Neon<FP>;
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        not(all(feature = "nightly-features", target_feature = "avx512f"))
-    ))]
-    type Packing = crate::PackedMontyField31AVX2<FP>;
-    #[cfg(all(
-        feature = "nightly-features",
-        target_arch = "x86_64",
-        target_feature = "avx512f"
-    ))]
-    type Packing = crate::PackedMontyField31AVX512<FP>;
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_feature = "neon"),
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx2",
-            not(all(feature = "nightly-features", target_feature = "avx512f"))
-        ),
-        all(
-            feature = "nightly-features",
-            target_arch = "x86_64",
-            target_feature = "avx512f"
-        ),
-    )))]
-    type Packing = Self;
-
-    const GENERATOR: Self = FP::MONTY_GEN;
-
-    #[inline]
-    fn exp_u64_generic<FA: FieldAlgebra<F = Self>>(val: FA, power: u64) -> FA {
-        FP::exp_u64_generic(val, power)
-    }
-
-    fn try_inverse(&self) -> Option<Self> {
-        FP::try_inverse(*self)
     }
 
     #[inline]
@@ -280,14 +250,459 @@ impl<FP: FieldParameters> Field for MontyField31<FP> {
     }
 
     #[inline]
+    fn mul_2exp_u64(&self, exp: u64) -> Self {
+        // The array FP::MONTY_POWERS_OF_TWO contains the powers of 2
+        // from 2^0 to 2^63 in monty form. We can use this to quickly
+        // compute 2^exp.
+        match exp {
+            0 => *self,
+            1 => *self + *self,
+            _ => {
+                if exp < 64 {
+                    *self * Self::MONTY_POWERS_OF_TWO[exp as usize]
+                } else {
+                    // For larger values we use the default method.
+                    *self * Self::TWO.exp_u64(exp)
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn div_2exp_u64(&self, exp: u64) -> Self {
+        if exp <= 32 {
+            // As the monty form of 2^{-exp} is 2^{32 - exp} mod P, for
+            // 0 <= exp <= 32, we can multiply by 2^{-exp} by doing a shift
+            // followed by a monty reduction.
+            let long_prod = (self.value as u64) << (32 - exp);
+            Self::new_monty(monty_reduce::<FP>(long_prod))
+        } else {
+            // For larger values we use a slower method though this is
+            // still much faster than the default method as it avoids the inverse().
+            *self * Self::HALF.exp_u64(exp)
+        }
+    }
+
+    #[inline]
+    fn zero_vec(len: usize) -> Vec<Self> {
+        // SAFETY:
+        // Due to `#[repr(transparent)]`, MontyField31 and u32 have the same size, alignment
+        // and memory layout making `flatten_to_base` safe. This this will create
+        // a vector MontyField31 elements with value set to 0 which is the
+        // MONTY form of 0.
+        unsafe { flatten_to_base(vec![0u32; len]) }
+    }
+
+    #[inline]
+    fn sum_array<const N: usize>(input: &[Self]) -> Self {
+        assert_eq!(N, input.len());
+        // Benchmarking shows that for N <= 7 it's faster to sum the elements directly
+        // but for N > 7 it's faster to use the .sum() methods which passes through u64's
+        // allowing for delayed reductions.
+        match N {
+            0 => Self::ZERO,
+            1 => input[0],
+            2 => input[0] + input[1],
+            3 => input[0] + input[1] + input[2],
+            4 => (input[0] + input[1]) + (input[2] + input[3]),
+            5 => Self::sum_array::<4>(&input[..4]) + Self::sum_array::<1>(&input[4..]),
+            6 => Self::sum_array::<4>(&input[..4]) + Self::sum_array::<2>(&input[4..]),
+            7 => Self::sum_array::<4>(&input[..4]) + Self::sum_array::<3>(&input[4..]),
+            _ => input.iter().copied().sum(),
+        }
+    }
+
+    #[inline]
+    fn dot_product<const N: usize>(lhs: &[Self; N], rhs: &[Self; N]) -> Self {
+        const {
+            assert!(N as u64 <= (1 << 34));
+
+            // This code relies on assumptions about the relative size of the
+            // prime and the monty parameter. If these are changes this needs to be checked.
+            debug_assert!(FP::MONTY_BITS == 32);
+            debug_assert!((FP::PRIME as u64) < (1 << 31));
+        }
+        match N {
+            0 => Self::ZERO,
+            1 => lhs[0] * rhs[0],
+            2 => {
+                // As all values are < P < 2^31, the products are < P^2 < 2^31P.
+                // Hence, summing two together we stay below MONTY*P which means
+                // monty_reduce will produce a valid result.
+                let u64_prod_sum = (lhs[0].value as u64) * (rhs[0].value as u64)
+                    + (lhs[1].value as u64) * (rhs[1].value as u64);
+                Self::new_monty(monty_reduce::<FP>(u64_prod_sum))
+            }
+            3 => {
+                // As all values are < P < 2^31, the products are < P^2 < 2^31P.
+                // Hence, summing three together will be less than 2 * MONTY * P
+                let u64_prod_sum = (lhs[0].value as u64) * (rhs[0].value as u64)
+                    + (lhs[1].value as u64) * (rhs[1].value as u64)
+                    + (lhs[2].value as u64) * (rhs[2].value as u64);
+                Self::new_monty(large_monty_reduce::<FP>(u64_prod_sum))
+            }
+            4 => {
+                // As all values are < P < 2^31, the products are < P^2 < 2^31P.
+                // Hence, summing four together will be less than 2 * MONTY * P.
+                let u64_prod_sum = (lhs[0].value as u64) * (rhs[0].value as u64)
+                    + (lhs[1].value as u64) * (rhs[1].value as u64)
+                    + (lhs[2].value as u64) * (rhs[2].value as u64)
+                    + (lhs[3].value as u64) * (rhs[3].value as u64);
+                Self::new_monty(large_monty_reduce::<FP>(u64_prod_sum))
+            }
+            5 => {
+                let head_sum = (lhs[0].value as u64) * (rhs[0].value as u64)
+                    + (lhs[1].value as u64) * (rhs[1].value as u64)
+                    + (lhs[2].value as u64) * (rhs[2].value as u64)
+                    + (lhs[3].value as u64) * (rhs[3].value as u64);
+                let tail_sum = (lhs[4].value as u64) * (rhs[4].value as u64);
+                // head_sum < 4*P^2, tail_sum < P^2.
+                let head_sum_corr = head_sum.wrapping_sub((FP::PRIME as u64) << FP::MONTY_BITS);
+                // head_sum.min(head_sum_corr) reduces a value < 4*P^2 modulo MONTY*P,
+                // so it is < MONTY * P. Hence sum < 2 * MONTY * P.
+                let sum = head_sum.min(head_sum_corr) + tail_sum;
+                Self::new_monty(large_monty_reduce::<FP>(sum))
+            }
+            6 => {
+                let head_sum = (lhs[0].value as u64) * (rhs[0].value as u64)
+                    + (lhs[1].value as u64) * (rhs[1].value as u64)
+                    + (lhs[2].value as u64) * (rhs[2].value as u64)
+                    + (lhs[3].value as u64) * (rhs[3].value as u64);
+                let tail_sum = (lhs[4].value as u64) * (rhs[4].value as u64)
+                    + (lhs[5].value as u64) * (rhs[5].value as u64);
+                // head_sum < 4*P^2, tail_sum < 2*P^2.
+                let head_sum_corr = head_sum.wrapping_sub((FP::PRIME as u64) << FP::MONTY_BITS);
+                // head_sum.min(head_sum_corr) reduces a value < 4*P^2 modulo MONTY*P,
+                // so it is < MONTY * P. Hence sum < 2 * MONTY * P.
+                let sum = head_sum.min(head_sum_corr) + tail_sum;
+                Self::new_monty(large_monty_reduce::<FP>(sum))
+            }
+            7 => {
+                let head_sum = (lhs[0].value as u64) * (rhs[0].value as u64)
+                    + (lhs[1].value as u64) * (rhs[1].value as u64)
+                    + (lhs[2].value as u64) * (rhs[2].value as u64)
+                    + (lhs[3].value as u64) * (rhs[3].value as u64);
+                let tail_sum = (lhs[4].value as u64) * (rhs[4].value as u64)
+                    + lhs[5].value as u64 * (rhs[5].value as u64)
+                    + lhs[6].value as u64 * (rhs[6].value as u64);
+                // head_sum, tail_sum are guaranteed to be < 4*P^2.
+                let head_sum_corr = head_sum.wrapping_sub((FP::PRIME as u64) << FP::MONTY_BITS);
+                let tail_sum_corr = tail_sum.wrapping_sub((FP::PRIME as u64) << FP::MONTY_BITS);
+                // head_sum.min(head_sum_corr), tail_sum.min(tail_sum_corr) each reduce a value
+                // < 4*P^2 modulo MONTY*P, so each is < MONTY * P. Hence sum < 2 * MONTY * P.
+                let sum = head_sum.min(head_sum_corr) + tail_sum.min(tail_sum_corr);
+                Self::new_monty(large_monty_reduce::<FP>(sum))
+            }
+            8 => {
+                let head_sum = (lhs[0].value as u64) * (rhs[0].value as u64)
+                    + (lhs[1].value as u64) * (rhs[1].value as u64)
+                    + (lhs[2].value as u64) * (rhs[2].value as u64)
+                    + (lhs[3].value as u64) * (rhs[3].value as u64);
+                let tail_sum = (lhs[4].value as u64) * (rhs[4].value as u64)
+                    + lhs[5].value as u64 * (rhs[5].value as u64)
+                    + lhs[6].value as u64 * (rhs[6].value as u64)
+                    + lhs[7].value as u64 * (rhs[7].value as u64);
+                // head_sum, tail_sum are guaranteed to be < 4*P^2.
+                let head_sum_corr = head_sum.wrapping_sub((FP::PRIME as u64) << FP::MONTY_BITS);
+                let tail_sum_corr = tail_sum.wrapping_sub((FP::PRIME as u64) << FP::MONTY_BITS);
+                // head_sum.min(head_sum_corr), tail_sum.min(tail_sum_corr) each reduce a value
+                // < 4*P^2 modulo MONTY*P, so each is < MONTY * P. Hence sum < 2 * MONTY * P.
+                let sum = head_sum.min(head_sum_corr) + tail_sum.min(tail_sum_corr);
+                Self::new_monty(large_monty_reduce::<FP>(sum))
+            }
+            _ => {
+                // For large enough N, we accumulate into a u128. This helps the compiler as it lets
+                // it do a lot of computation in parallel as it knows that summing u128's is associative.
+                let acc_u128 = lhs
+                    .chunks(4)
+                    .zip(rhs.chunks(4))
+                    .map(|(l, r)| {
+                        // As all values are < P < 2^31, the products are < P^2 < 2^31P.
+                        // Hence, summing four together will not overflow a u64 but will be
+                        // larger than 2^32P.
+                        let u64_prod_sum = l
+                            .iter()
+                            .zip(r)
+                            .map(|(l, r)| (l.value as u64) * (r.value as u64))
+                            .sum::<u64>();
+                        u64_prod_sum as u128
+                    })
+                    .sum();
+                // As N <= 2^34 by the earlier assertion, acc_u128 <= 2^34 * P^2 < 2^34 * 2^62 < 2^96.
+                Self::new_monty(monty_reduce_u128::<FP>(acc_u128))
+            }
+        }
+    }
+}
+
+impl<FP: FieldParameters + RelativelyPrimePower<D>, const D: u64> InjectiveMonomial<D>
+    for MontyField31<FP>
+{
+}
+
+impl<FP: FieldParameters + RelativelyPrimePower<D>, const D: u64> PermutationMonomial<D>
+    for MontyField31<FP>
+{
+    fn injective_exp_root_n(&self) -> Self {
+        FP::exp_root_d(*self)
+    }
+}
+
+impl<FP: FieldParameters> RawDataSerializable for MontyField31<FP> {
+    impl_raw_serializable_primefield32!();
+}
+
+impl<FP: FieldParameters> Field for MontyField31<FP> {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    type Packing = crate::PackedMontyField31Neon<FP>;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        not(target_feature = "avx512f")
+    ))]
+    type Packing = crate::PackedMontyField31AVX2<FP>;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    type Packing = crate::PackedMontyField31AVX512<FP>;
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512f")
+        ),
+        all(target_arch = "x86_64", target_feature = "avx512f"),
+    )))]
+    type Packing = Self;
+
+    const GENERATOR: Self = FP::MONTY_GEN;
+
+    const BENEFITS_FROM_LOCKSTEP_EVALUATION: bool = FP::BENEFITS_FROM_LOCKSTEP_EVALUATION;
+
+    fn try_inverse(&self) -> Option<Self> {
+        // The correction below needs P > 2^{30}.
+        const {
+            assert!(
+                FP::PRIME > (1 << 30),
+                "PRIME must exceed 2^30 for inversion"
+            );
+        }
+
+        if self.is_zero() {
+            return None;
+        }
+
+        // The number of bits of FP::PRIME, which lies in (2^{30}, 2^{31}).
+        const NUM_PRIME_BITS: u32 = 31;
+
+        // Get the inverse using a gcd algorithm.
+        // We use `val` to denote the input to `gcd_inversion_prime_field_32` and `R = 2^{MONTY_BITS}`
+        // our monty constant.
+        // The function gcd_inversion_31_bit_field maps `val mod P -> 2^{60}val mod P`
+        let gcd_inverse = gcd_inversion_prime_field_32::<NUM_PRIME_BITS>(self.value, FP::PRIME);
+
+        // Currently |gcd_inverse| <= 2^{2 * NUM_PRIME_BITS - 2} = 2^{60}.
+        //
+        // As P > 2^{30}, 0 < 2^{30}P + gcd_inverse < 2^{32}P, the input range of monty_reduce.
+        let pos_inverse = (((FP::PRIME as i64) << 30) + gcd_inverse) as u64;
+
+        // We could do a % operation here, but monty reduction is faster.
+        // This does remove a factor of `R` from the result so we will need to
+        // correct for that.
+        let uncorrected_value = Self::new_monty(monty_reduce::<FP>(pos_inverse));
+
+        // Currently, uncorrected_value = R^{-1} * 2^{60} * val^{-1} mod P = 2^{28} * val^{-1} mod P`.
+        // But `val` is really the monty form of some value `x` satisfying `val = xR mod P`. We want
+        // `x^{-1}R mod P = R^2 x^{-1}R^{-1} mod P = 2^{64} val^{-1} mod P`.
+        // Hence we need to multiply by 2^{64 - 28} = 2^{36}.
+
+        // Unrolling the definitions a little, this 36 comes from: 3 * FP::MONTY_BITS - (2 * NUM_PRIME_BITS - 2)
+
+        Some(uncorrected_value.mul_2exp_u64((3 * FP::MONTY_BITS - (2 * NUM_PRIME_BITS - 2)) as u64))
+    }
+
+    #[inline]
     fn order() -> BigUint {
         FP::PRIME.into()
     }
 }
 
+impl<FP: FieldParameters + TwoAdicData> MontyField31<FP> {
+    /// A square root of this field element, if one exists.
+    ///
+    /// This specializes the generic [`Field::try_sqrt`] for two-adic Monty-31
+    /// fields: it seeds Tonelli–Shanks from the precomputed
+    /// [`TwoAdicField::two_adic_generator`] instead of recomputing `GENERATOR^q`.
+    /// As an inherent method it shadows the trait method for concrete field types
+    /// such as `BabyBear` and `KoalaBear`; generic `Field` callers still use the
+    /// trait default.
+    ///
+    /// See [`Field::try_sqrt`] for the returned-root semantics.
+    #[inline]
+    #[must_use]
+    pub fn try_sqrt(&self) -> Option<Self> {
+        tonelli_shanks_two_adic(*self)
+    }
+}
+
+quotient_map_small_int!(MontyField31, u32, FieldParameters, [u8, u16]);
+quotient_map_small_int!(MontyField31, i32, FieldParameters, [i8, i16]);
+
+impl<FP: FieldParameters> QuotientMap<u32> for MontyField31<FP> {
+    /// Convert a given `u32` integer into an element of the `MontyField31` field.
+    #[inline]
+    fn from_int(int: u32) -> Self {
+        Self::new(int)
+    }
+
+    /// Convert a given `u32` integer into an element of the `MontyField31` field.
+    ///
+    /// Returns `None` if the given integer is greater than the Prime.
+    #[inline]
+    fn from_canonical_checked(int: u32) -> Option<Self> {
+        (int < FP::PRIME).then(|| Self::new(int))
+    }
+
+    /// Convert a given `u32` integer into an element of the `MontyField31` field.
+    ///
+    /// # Safety
+    /// This is always safe as the conversion to monty form can accept any `u32`.
+    #[inline(always)]
+    unsafe fn from_canonical_unchecked(int: u32) -> Self {
+        Self::new(int)
+    }
+}
+
+impl<FP: FieldParameters> QuotientMap<i32> for MontyField31<FP> {
+    /// Convert a given `i32` integer into an element of the `MontyField31` field.
+    #[inline]
+    fn from_int(int: i32) -> Self {
+        Self::new_monty(to_monty_signed::<FP>(int))
+    }
+
+    /// Convert a given `i32` integer into an element of the `MontyField31` field.
+    ///
+    /// Returns `None` if the given integer does not lie in the range `[(1 - P)/2, (P - 1)/2]`.
+    #[inline]
+    fn from_canonical_checked(int: i32) -> Option<Self> {
+        let bound = (FP::PRIME >> 1) as i32;
+        if int <= bound {
+            (int >= (-bound)).then(|| Self::new_monty(to_monty_signed::<FP>(int)))
+        } else {
+            None
+        }
+    }
+
+    /// Convert a given `i32` integer into an element of the `MontyField31` field.
+    ///
+    /// # Safety
+    /// This is always safe as the conversion to monty form can accept any `i32`.
+    #[inline(always)]
+    unsafe fn from_canonical_unchecked(int: i32) -> Self {
+        Self::new_monty(to_monty_signed::<FP>(int))
+    }
+}
+
+impl<FP: FieldParameters> QuotientMap<u64> for MontyField31<FP> {
+    /// Convert a given `u64` integer into an element of the `MontyField31` field.
+    fn from_int(int: u64) -> Self {
+        Self::new_monty(to_monty_64::<FP>(int))
+    }
+
+    /// Convert a given `u64` integer into an element of the `MontyField31` field.
+    ///
+    /// Returns `None` if the given integer is greater than the Prime.
+    fn from_canonical_checked(int: u64) -> Option<Self> {
+        (int < FP::PRIME as u64).then(|| Self::new(int as u32))
+    }
+
+    /// Convert a given `u64` integer into an element of the `MontyField31` field.
+    ///
+    /// # Safety
+    /// This is always safe as the conversion to monty form can accept any `u64`.
+    unsafe fn from_canonical_unchecked(int: u64) -> Self {
+        Self::new_monty(to_monty_64::<FP>(int))
+    }
+}
+
+impl<FP: FieldParameters> QuotientMap<i64> for MontyField31<FP> {
+    /// Convert a given `i64` integer into an element of the `MontyField31` field.
+    fn from_int(int: i64) -> Self {
+        Self::new_monty(to_monty_64_signed::<FP>(int))
+    }
+
+    /// Convert a given `i64` integer into an element of the `MontyField31` field.
+    ///
+    /// Returns `None` if the given integer does not lie in the range `[(1 - P)/2, (P - 1)/2]`.
+    fn from_canonical_checked(int: i64) -> Option<Self> {
+        let bound = (FP::PRIME >> 1) as i64;
+        if int <= bound {
+            (int >= (-bound)).then(|| Self::new_monty(to_monty_signed::<FP>(int as i32)))
+        } else {
+            None
+        }
+    }
+
+    /// Convert a given `i64` integer into an element of the `MontyField31` field.
+    ///
+    /// # Safety
+    /// This is always safe as the conversion to monty form can accept any `i64`.
+    unsafe fn from_canonical_unchecked(int: i64) -> Self {
+        Self::new_monty(to_monty_64_signed::<FP>(int))
+    }
+}
+
+impl<FP: FieldParameters> QuotientMap<u128> for MontyField31<FP> {
+    /// Convert a given `u128` integer into an element of the `MontyField31` field.
+    fn from_int(int: u128) -> Self {
+        Self::new_monty(to_monty::<FP>((int % (FP::PRIME as u128)) as u32))
+    }
+
+    /// Convert a given `u128` integer into an element of the `MontyField31` field.
+    ///
+    /// Returns `None` if the given integer is greater than the Prime.
+    fn from_canonical_checked(int: u128) -> Option<Self> {
+        (int < FP::PRIME as u128).then(|| Self::new(int as u32))
+    }
+
+    /// Convert a given `u128` integer into an element of the `MontyField31` field.
+    ///
+    /// # Safety
+    /// The input must be a valid `u64` element.
+    unsafe fn from_canonical_unchecked(int: u128) -> Self {
+        Self::new_monty(to_monty_64::<FP>(int as u64))
+    }
+}
+
+impl<FP: FieldParameters> QuotientMap<i128> for MontyField31<FP> {
+    /// Convert a given `i128` integer into an element of the `MontyField31` field.
+    fn from_int(int: i128) -> Self {
+        Self::new_monty(to_monty_signed::<FP>((int % (FP::PRIME as i128)) as i32))
+    }
+
+    /// Convert a given `i128` integer into an element of the `MontyField31` field.
+    ///
+    /// Returns `None` if the given integer does not lie in the range `[(1 - P)/2, (P - 1)/2]`.
+    fn from_canonical_checked(int: i128) -> Option<Self> {
+        let bound = (FP::PRIME >> 1) as i128;
+        if int <= bound {
+            (int >= (-bound)).then(|| Self::new_monty(to_monty_signed::<FP>(int as i32)))
+        } else {
+            None
+        }
+    }
+
+    /// Convert a given `i128` integer into an element of the `MontyField31` field.
+    ///
+    /// # Safety
+    /// The input must be a valid `i64` element.
+    unsafe fn from_canonical_unchecked(int: i128) -> Self {
+        Self::new_monty(to_monty_64_signed::<FP>(int as i64))
+    }
+}
+
 impl<FP: FieldParameters> PrimeField for MontyField31<FP> {
     fn as_canonical_biguint(&self) -> BigUint {
-        <Self as PrimeField32>::as_canonical_u32(self).into()
+        self.as_canonical_u32().into()
     }
 }
 
@@ -298,6 +713,13 @@ impl<FP: FieldParameters> PrimeField64 for MontyField31<FP> {
     fn as_canonical_u64(&self) -> u64 {
         self.as_canonical_u32().into()
     }
+
+    #[inline]
+    fn to_unique_u64(&self) -> u64 {
+        // The internal representation is already a unique u32 for each field element.
+        // It's fine to hash things in monty form.
+        self.value as u64
+    }
 }
 
 impl<FP: FieldParameters> PrimeField32 for MontyField31<FP> {
@@ -305,13 +727,32 @@ impl<FP: FieldParameters> PrimeField32 for MontyField31<FP> {
 
     #[inline]
     fn as_canonical_u32(&self) -> u32 {
-        MontyField31::to_u32(self)
+        Self::to_u32(self)
+    }
+
+    #[inline]
+    fn to_unique_u32(&self) -> u32 {
+        // The internal representation is already a unique u32 for each field element.
+        // It's fine to hash things in monty form.
+        self.value
     }
 }
 
 impl<FP: FieldParameters + TwoAdicData> TwoAdicField for MontyField31<FP> {
     const TWO_ADICITY: usize = FP::TWO_ADICITY;
     fn two_adic_generator(bits: usize) -> Self {
+        const {
+            // Verify that 2^TWO_ADICITY divides PRIME - 1.
+            assert!(
+                (FP::PRIME as u64 - 1).is_multiple_of(1u64 << FP::TWO_ADICITY),
+                "2^TWO_ADICITY must divide PRIME - 1"
+            );
+            // Verify maximality: 2^(TWO_ADICITY+1) must NOT divide PRIME - 1.
+            assert!(
+                ((FP::PRIME as u64 - 1) >> FP::TWO_ADICITY) % 2 == 1,
+                "TWO_ADICITY must be maximal"
+            );
+        }
         assert!(bits <= Self::TWO_ADICITY);
         FP::TWO_ADIC_GENERATORS.as_ref()[bits]
     }
@@ -322,31 +763,7 @@ impl<FP: MontyParameters> Add for MontyField31<FP> {
 
     #[inline]
     fn add(self, rhs: Self) -> Self {
-        let mut sum = self.value + rhs.value;
-        let (corr_sum, over) = sum.overflowing_sub(FP::PRIME);
-        if !over {
-            sum = corr_sum;
-        }
-        Self::new_monty(sum)
-    }
-}
-
-impl<FP: MontyParameters> AddAssign for MontyField31<FP> {
-    #[inline]
-    fn add_assign(&mut self, rhs: Self) {
-        *self = *self + rhs;
-    }
-}
-
-impl<FP: MontyParameters> Sum for MontyField31<FP> {
-    #[inline]
-    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        // This is faster than iter.reduce(|x, y| x + y).unwrap_or(Self::ZERO) for iterators of length > 2.
-        // There might be a faster reduction method possible for lengths <= 16 which avoids %.
-
-        // This sum will not overflow so long as iter.len() < 2^33.
-        let sum = iter.map(|x| x.value as u64).sum::<u64>();
-        Self::new_monty((sum % FP::PRIME as u64) as u32)
+        Self::new_monty(add::<FP>(self.value, rhs.value))
     }
 }
 
@@ -355,17 +772,7 @@ impl<FP: MontyParameters> Sub for MontyField31<FP> {
 
     #[inline]
     fn sub(self, rhs: Self) -> Self {
-        let (mut diff, over) = self.value.overflowing_sub(rhs.value);
-        let corr = if over { FP::PRIME } else { 0 };
-        diff = diff.wrapping_add(corr);
-        Self::new_monty(diff)
-    }
-}
-
-impl<FP: MontyParameters> SubAssign for MontyField31<FP> {
-    #[inline]
-    fn sub_assign(&mut self, rhs: Self) {
-        *self = *self - rhs;
+        Self::new_monty(sub::<FP>(self.value, rhs.value))
     }
 }
 
@@ -388,26 +795,19 @@ impl<FP: MontyParameters> Mul for MontyField31<FP> {
     }
 }
 
-impl<FP: MontyParameters> MulAssign for MontyField31<FP> {
-    #[inline]
-    fn mul_assign(&mut self, rhs: Self) {
-        *self = *self * rhs;
-    }
-}
+impl_add_assign!(MontyField31, (MontyParameters, MP));
+impl_sub_assign!(MontyField31, (MontyParameters, MP));
+impl_mul_methods!(MontyField31, (FieldParameters, FP));
+impl_div_methods!(MontyField31, MontyField31, (FieldParameters, FP));
 
-impl<FP: FieldParameters> Product for MontyField31<FP> {
+impl<FP: MontyParameters> Sum for MontyField31<FP> {
     #[inline]
-    fn product<I: Iterator<Item = Self>>(iter: I) -> Self {
-        iter.reduce(|x, y| x * y).unwrap_or(Self::ONE)
-    }
-}
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        // This is faster than iter.reduce(|x, y| x + y).unwrap_or(Self::ZERO) for iterators of length > 2.
+        // There might be a faster reduction method possible for lengths <= 16 which avoids %.
 
-impl<FP: FieldParameters> Div for MontyField31<FP> {
-    type Output = Self;
-
-    #[allow(clippy::suspicious_arithmetic_impl)]
-    #[inline]
-    fn div(self, rhs: Self) -> Self {
-        self * rhs.inverse()
+        // This sum will not overflow so long as iter.len() < 2^33.
+        let sum = iter.map(|x| x.value as u64).sum::<u64>();
+        Self::new_monty((sum % FP::PRIME as u64) as u32)
     }
 }

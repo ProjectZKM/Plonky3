@@ -1,12 +1,38 @@
 use core::borrow::BorrowMut;
 
+use p3_maybe_rayon::PARALLEL_ENABLED;
 use p3_maybe_rayon::prelude::*;
-use p3_util::{log2_strict_usize, reverse_bits_len};
+use p3_util::{log2_strict_usize, reverse_bits_len, reverse_slice_index_bits};
 use tracing::instrument;
 
-use crate::dense::{DenseMatrix, DenseStorage, RowMajorMatrix};
 use crate::Matrix;
+use crate::dense::{DenseMatrix, DenseStorage, RowMajorMatrix};
 
+/// Reverse the order of matrix rows based on the bit-reversal of their indices.
+///
+/// Given a matrix `mat` of height `h = 2^k`, this function rearranges its rows by
+/// reversing the binary representation of each row index. For example, if `h = 8` (i.e., 3 bits):
+///
+/// ```text
+/// Original Index  Binary   Reversed   Target Index
+/// --------------  -------  ---------  -------------
+///      0          000      000        0
+///      1          001      100        4
+///      2          010      010        2
+///      3          011      110        6
+///      4          100      001        1
+///      5          101      101        5
+///      6          110      011        3
+///      7          111      111        7
+/// ```
+///
+/// The transformation is performed in-place.
+///
+/// # Panics
+/// Panics if the height of the matrix is not a power of two.
+///
+/// # Arguments
+/// - `mat`: The matrix whose rows should be reordered.
 #[instrument(level = "debug", skip_all)]
 pub fn reverse_matrix_index_bits<'a, F, S>(mat: &mut DenseMatrix<F, S>)
 where
@@ -16,19 +42,68 @@ where
     let w = mat.width();
     let h = mat.height();
     let log_h = log2_strict_usize(h);
-    let values = mat.values.borrow_mut().as_mut_ptr() as usize;
+    let values = mat.values.borrow_mut();
+    let total_bytes = core::mem::size_of_val(values);
 
-    (0..h).into_par_iter().for_each(|i| {
+    // Small elements benefit from the slice permutation's cache-aware decomposition.
+    // On AArch64, retain parallel row swaps above 64 KiB when multiple workers are active.
+    // Check the worker count because dependencies can enable Rayon through feature unification.
+    let use_slice = w == 1 && core::mem::size_of::<F>() <= 8;
+    #[cfg(target_arch = "aarch64")]
+    let use_slice = use_slice && (total_bytes <= 64 * 1024 || current_num_threads() == 1);
+    if use_slice {
+        reverse_slice_index_bits(values);
+        return;
+    }
+
+    let values = values.as_mut_ptr() as usize;
+
+    // SAFETY: Bit reversal is an involution on 0..h. Visiting each index once and
+    // swapping only when i < j gives each row pair a single owner, so concurrent
+    // swaps use disjoint rows within the matrix.
+    let swap = |i, use_outline| {
         let values = values as *mut F;
         let j = reverse_bits_len(i, log_h);
         if i < j {
-            unsafe { swap_rows_raw(values, w, i, j) };
+            unsafe { swap_rows_raw(values, w, i, j, use_outline) };
         }
-    });
+    };
+    // Total matrix bytes, not rows: avoid scheduling overhead for inputs up to 32 KiB.
+    if total_bytes <= 32 * 1024 {
+        (0..h).for_each(|i| swap(i, true));
+    } else {
+        // Amortize scheduling over roughly 64 KiB of candidate rows; swap partners may
+        // lie outside the chunk.
+        const CHUNK_BYTES: usize = 64 * 1024;
+        let rows_per_chunk = CHUNK_BYTES.div_ceil(w * core::mem::size_of::<F>());
+        (0..h.div_ceil(rows_per_chunk))
+            .into_par_iter()
+            .for_each(|chunk| {
+                let start = chunk * rows_per_chunk;
+                let end = start + rows_per_chunk.min(h - start);
+                // Keep Rayon jobs, including one-worker pools, free of a helper call per row pair.
+                for i in start..end {
+                    swap(i, !PARALLEL_ENABLED);
+                }
+            });
+    }
 }
 
-/// Assumes `i < j`.
+/// Swap two rows `i` and `j` in a [`RowMajorMatrix`].
+///
+/// # Panics
+/// Panics if the indices are out of bounds or not ordered as `i < j`.
+///
+/// # Arguments
+/// - `mat`: The matrix to modify.
+/// - `i`: The first row index (must be less than `j`).
+/// - `j`: The second row index.
 pub fn swap_rows<F: Clone + Send + Sync>(mat: &mut RowMajorMatrix<F>, i: usize, j: usize) {
+    // Checked up front: slicing alone misses width 0 and wraps huge indices in release builds.
+    assert!(
+        i < j && j < mat.height(),
+        "rows must satisfy i < j < height"
+    );
     let w = mat.width();
     let (upper, lower) = mat.values.split_at_mut(j * w);
     let row_i = &mut upper[i * w..(i + 1) * w];
@@ -36,11 +111,284 @@ pub fn swap_rows<F: Clone + Send + Sync>(mat: &mut RowMajorMatrix<F>, i: usize, 
     row_i.swap_with_slice(row_j);
 }
 
-/// Assumes `i < j`.
+/// Swap two rows `i` and `j` in-place using raw pointer access.
 ///
-/// SAFETY: The caller must ensure `i < j < h`, where `h` is the height of the matrix.
-pub(crate) unsafe fn swap_rows_raw<F>(mat: *mut F, w: usize, i: usize, j: usize) {
-    let row_i = core::slice::from_raw_parts_mut(mat.add(i * w), w);
-    let row_j = core::slice::from_raw_parts_mut(mat.add(j * w), w);
+/// This function is equivalent to [`swap_rows`] but uses unsafe raw pointer math for better performance.
+///
+/// # Safety
+/// - The caller must ensure `i < j < h`, where `h` is the height of the matrix.
+/// - The pointer must point to a vector corresponding to a matrix of width `w`.
+///
+/// # Arguments
+/// - `mat`: A mutable pointer to the underlying matrix data.
+/// - `w`: The matrix width (number of columns).
+/// - `i`: The first row index.
+/// - `j`: The second row index.
+/// - `use_outline`: Whether wide row swaps may use the separate slice helper.
+unsafe fn swap_rows_raw<F>(mat: *mut F, w: usize, i: usize, j: usize, use_outline: bool) {
+    unsafe {
+        let row_i = core::slice::from_raw_parts_mut(mat.add(i * w), w);
+        let row_j = core::slice::from_raw_parts_mut(mat.add(j * w), w);
+        // Row bytes: amortize the function call while keeping small swaps inline.
+        if use_outline && core::mem::size_of_val(row_i) >= 64 {
+            swap_row_slices(row_i, row_j);
+        } else {
+            row_i.swap_with_slice(row_j);
+        }
+    }
+}
+
+// Keep disjoint row slices at a function boundary so the swap loop retains noalias information.
+#[inline(never)]
+fn swap_row_slices<F>(row_i: &mut [F], row_j: &mut [F]) {
     row_i.swap_with_slice(row_j);
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+    use crate::dense::RowMajorMatrix;
+
+    #[test]
+    fn test_swap_rows_basic() {
+        let mut matrix = RowMajorMatrix::new(
+            vec![
+                1, 2, 3, // row 0
+                4, 5, 6, // row 1
+                7, 8, 9, // row 2
+                10, 11, 12, // row 3
+            ],
+            3,
+        );
+
+        // Swap rows 0 and 2
+        swap_rows(&mut matrix, 0, 2);
+
+        assert_eq!(
+            matrix.values,
+            vec![
+                7, 8, 9, // row 0 (was row 2)
+                4, 5, 6, // row 1 (unchanged)
+                1, 2, 3, // row 2 (was row 0)
+                10, 11, 12, // row 3 (unchanged)
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "rows must satisfy i < j < height")]
+    fn test_swap_rows_rejects_unordered_rows() {
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4], 2);
+        swap_rows(&mut matrix, 1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "rows must satisfy i < j < height")]
+    fn test_swap_rows_rejects_out_of_range_row() {
+        // Height 2: row 2 is one past the end.
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4], 2);
+        swap_rows(&mut matrix, 0, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "rows must satisfy i < j < height")]
+    fn test_swap_rows_rejects_rows_of_width_zero_matrix() {
+        // Width 0 makes every row slice empty, so only the index check can catch this.
+        let mut matrix = RowMajorMatrix::<u8>::new(vec![], 0);
+        swap_rows(&mut matrix, 5, 3);
+    }
+
+    #[test]
+    fn test_swap_rows_raw_basic() {
+        let mut matrix = RowMajorMatrix::new(
+            vec![
+                1, 2, 3, // row 0
+                4, 5, 6, // row 1
+                7, 8, 9, // row 2
+            ],
+            3,
+        );
+        let ptr = matrix.values.as_mut_ptr();
+        unsafe {
+            swap_rows_raw(ptr, matrix.width(), 0, 2, false);
+        }
+
+        assert_eq!(
+            matrix.values,
+            vec![
+                7, 8, 9, // row 0 (was row 2)
+                4, 5, 6, // row 1 (unchanged)
+                1, 2, 3, // row 2 (was row 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reverse_matrix_index_bits_pow2_height() {
+        let mut matrix = RowMajorMatrix::new(
+            vec![
+                0, 1, // row 0
+                2, 3, // row 1
+                4, 5, // row 2
+                6, 7, // row 3
+                8, 9, // row 4
+                10, 11, // row 5
+                12, 13, // row 6
+                14, 15, // row 7
+            ],
+            2,
+        );
+
+        reverse_matrix_index_bits(&mut matrix);
+
+        assert_eq!(
+            matrix.values,
+            vec![
+                0, 1, // row 0 → index 0b000 → stays at 0
+                8, 9, // row 1 → index 0b001 → goes to index 4
+                4, 5, // row 2 → index 0b010 → stays
+                12, 13, // row 3 → index 0b011 → goes to index 6
+                2, 3, // row 4 → index 0b100 → was row 1
+                10, 11, // row 5 → index 0b101 → stays
+                6, 7, // row 6 → index 0b110 → was row 3
+                14, 15, // row 7 → index 0b111 → stays
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reverse_matrix_index_bits_strings() {
+        use alloc::string::ToString;
+        use alloc::vec::Vec;
+
+        for width in [1, 3, 17] {
+            for log_h in 0..=14 {
+                let height = 1 << log_h;
+                let original: Vec<_> = (0..height * width).map(|i| i.to_string()).collect();
+                let expected: Vec<_> = (0..height)
+                    .flat_map(|row| {
+                        let start = reverse_bits_len(row, log_h) * width;
+                        original[start..start + width].iter().cloned()
+                    })
+                    .collect();
+                let mut matrix = RowMajorMatrix::new(original.clone(), width);
+                reverse_matrix_index_bits(&mut matrix);
+                assert_eq!(matrix.values, expected, "width={width}, log_h={log_h}");
+                reverse_matrix_index_bits(&mut matrix);
+                assert_eq!(
+                    matrix.values, original,
+                    "involution: width={width}, log_h={log_h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_reverse_matrix_index_bits_preserves_owners_without_cloning() {
+        use alloc::vec::Vec;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        // Fits the width-one fast path while detecting cloning and lost or duplicate owners.
+        struct Owner<'a>(&'a AtomicUsize);
+        impl Clone for Owner<'_> {
+            fn clone(&self) -> Self {
+                panic!("bit reversal must not clone elements");
+            }
+        }
+        impl Drop for Owner<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for width in [1, 3, 17] {
+            for log_h in 0..=15 {
+                let height = 1 << log_h;
+                let drops: Vec<_> = (0..height * width).map(|_| AtomicUsize::new(0)).collect();
+                let mut matrix = RowMajorMatrix::new(drops.iter().map(Owner).collect(), width);
+                reverse_matrix_index_bits(&mut matrix);
+                for (i, value) in matrix.values.iter().enumerate() {
+                    let source = reverse_bits_len(i / width, log_h) * width + i % width;
+                    assert!(core::ptr::eq(value.0, &drops[source]));
+                }
+                reverse_matrix_index_bits(&mut matrix);
+                for (value, count) in matrix.values.iter().zip(&drops) {
+                    assert!(core::ptr::eq(value.0, count));
+                    assert_eq!(count.load(Ordering::Relaxed), 0);
+                }
+                drop(matrix);
+                assert!(drops.iter().all(|count| count.load(Ordering::Relaxed) == 1));
+            }
+        }
+    }
+
+    #[test]
+    fn test_reverse_matrix_index_bits_work_unit_boundaries() {
+        use alloc::vec::Vec;
+
+        // An uneven final chunk, then rows just below, at, and above 64 KiB.
+        for (width, height) in [(3, 8192), (16_383, 8), (16_384, 8), (16_385, 8)] {
+            let original: Vec<u32> = (0..width * height).map(|i| i as u32).collect();
+            let mut matrix = RowMajorMatrix::new(original.clone(), width);
+
+            reverse_matrix_index_bits(&mut matrix.as_view_mut());
+            for (row, values) in matrix.values.chunks_exact(width).enumerate() {
+                let source = row.reverse_bits() >> (usize::BITS - height.ilog2());
+                assert_eq!(
+                    values,
+                    &original[source * width..(source + 1) * width],
+                    "width={width}, height={height}, row={row}"
+                );
+            }
+            reverse_matrix_index_bits(&mut matrix);
+            assert_eq!(matrix.values, original, "width={width}, height={height}");
+        }
+    }
+
+    #[test]
+    fn test_reverse_matrix_index_bits_zero_sized_elements() {
+        let mut matrix = RowMajorMatrix::new(vec![(); 3 * 8192], 3);
+        reverse_matrix_index_bits(&mut matrix);
+        assert_eq!(matrix.width(), 3);
+        assert_eq!(matrix.height(), 8192);
+        assert_eq!(matrix.values.len(), 3 * 8192);
+    }
+
+    #[test]
+    fn test_reverse_matrix_index_bits_height_1() {
+        let mut matrix = RowMajorMatrix::new(
+            vec![
+                42, 43, // row 0
+            ],
+            2,
+        );
+
+        // Bit-reversing a height-1 matrix should do nothing.
+        reverse_matrix_index_bits(&mut matrix);
+
+        assert_eq!(
+            matrix.values,
+            vec![
+                42, 43, // row 0 (unchanged)
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_reverse_matrix_index_bits_non_power_of_two_should_panic() {
+        // height = 3 → not a power of two → should panic
+        let mut matrix = RowMajorMatrix::new(
+            vec![
+                1, 2, // row 0
+                3, 4, // row 1
+                5, 6, // row 2
+            ],
+            2,
+        );
+
+        reverse_matrix_index_bits(&mut matrix);
+    }
 }

@@ -1,28 +1,51 @@
 [package]
 name = "p3-goldilocks"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+description = "An implementation of the Goldilocks prime field F_p, where p = 2^64 - 2^32 + 1."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# criterion pulls rayon transitively and rayon does not build on wasi.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion.workspace = true
+
+[package.metadata.plonky3.ci]
+test-features = ["constant-time"]
 
 [features]
-nightly-features = []
+constant-time = ["dep:subtle"]
 
 [dependencies]
-p3-field.workspace = true
 p3-dft.workspace = true
+p3-field.workspace = true
 p3-mds.workspace = true
+p3-poseidon1.workspace = true
+p3-poseidon2.workspace = true
 p3-symmetric.workspace = true
 p3-util.workspace = true
-p3-poseidon2.workspace = true
-p3-poseidon.workspace = true
+
 num-bigint.workspace = true
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
+spin.workspace = true
+subtle = { workspace = true, optional = true }
 
 [dev-dependencies]
-p3-field-testing.workspace = true
-rand = { workspace = true, features = ["min_const_gen"] }
-criterion.workspace = true
+p3-blake3 = { path = "../blake3" }
+p3-commit = { path = "../commit" }
+p3-field-testing = { path = "../field-testing" }
+p3-keccak = { path = "../keccak" }
+p3-matrix = { path = "../matrix" }
+p3-merkle-tree = { path = "../merkle-tree" }
+p3-sha256 = { path = "../sha256" }
+
+proptest.workspace = true
+rand.workspace = true
+serde_json.workspace = true
 
 [[bench]]
 name = "bench_field"
@@ -31,3 +54,6 @@ harness = false
 [[bench]]
 name = "extension"
 harness = false
+
+[lints]
+workspace = true

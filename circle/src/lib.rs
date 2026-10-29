@@ -1,6 +1,4 @@
-//! A framework for operating over the unit circle of a finite field,
-//! following the [Circle STARKs paper](https://eprint.iacr.org/2024/278) by Haböck, Levit and Papini.
-
+#![doc = include_str!("../README.md")]
 #![no_std]
 
 extern crate alloc;
@@ -11,13 +9,21 @@ mod domain;
 mod folding;
 mod ordering;
 mod pcs;
+mod periodic;
 mod point;
 mod proof;
 mod prover;
+mod transcript;
 mod verifier;
 
 pub use cfft::*;
 pub use domain::*;
 pub use ordering::*;
 pub use pcs::*;
+pub use periodic::*;
+pub use point::*;
 pub use proof::*;
+pub use transcript::{
+    CirclePcsShape, CircleProverTranscript, CircleTranscriptFailure, CircleVerifierTranscript,
+    OpeningClaim,
+};

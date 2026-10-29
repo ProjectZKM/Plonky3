@@ -1,14 +1,14 @@
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use p3_field::{ExtensionField, PrimeField32, PrimeField64};
-use p3_maybe_rayon::prelude::*;
-use p3_symmetric::{CryptographicHasher, Hash};
+use p3_field::{BasedVectorSpace, PrimeField32, PrimeField64};
+use p3_symmetric::{CryptographicHasher, Hash, MerkleCap};
 use p3_util::log2_ceil_u64;
 use tracing::instrument;
 
 use crate::{
-    CanObserve, CanSample, CanSampleBits, FieldChallenger, GrindingChallenger, HashChallenger,
+    ByteGrindingChallenger, CanFinalizeDigest, CanObserve, CanSample, CanSampleBits,
+    CanSampleUniformBits, FieldChallenger, GrindingChallenger, HashChallenger, ResamplingError,
 };
 
 /// Given a challenger that can observe and sample bytes, produces a challenger that is able to
@@ -33,7 +33,7 @@ pub struct SerializingChallenger32<F, Inner> {
 /// -  Takes a field element will serialize it into a byte array and observe each byte.
 ///
 /// **Sampling**:
-/// -  Samples a field element in a prime field of size `p` by sampling unofrmly an element in the
+/// -  Samples a field element in a prime field of size `p` by sampling uniformly an element in the
 ///    range (0..1 << log_2(p)). This avoids modulo bias.
 #[derive(Clone, Debug)]
 pub struct SerializingChallenger64<F, Inner> {
@@ -55,7 +55,7 @@ where
     F: PrimeField32,
     H: CryptographicHasher<u8, [u8; 32]>,
 {
-    pub fn from_hasher(initial_state: Vec<u8>, hasher: H) -> Self {
+    pub const fn from_hasher(initial_state: Vec<u8>, hasher: H) -> Self {
         Self::new(HashChallenger::new(initial_state, hasher))
     }
 }
@@ -63,7 +63,7 @@ where
 impl<F: PrimeField32, Inner: CanObserve<u8>> CanObserve<F> for SerializingChallenger32<F, Inner> {
     fn observe(&mut self, value: F) {
         self.inner
-            .observe_slice(&value.as_canonical_u32().to_le_bytes());
+            .observe_slice(&value.to_unique_u32().to_le_bytes());
     }
 }
 
@@ -87,26 +87,69 @@ impl<F: PrimeField32, const N: usize, Inner: CanObserve<u8>> CanObserve<Hash<F, 
     }
 }
 
+impl<F: PrimeField32, const N: usize, Inner: CanObserve<u8>> CanObserve<&MerkleCap<F, [u8; N]>>
+    for SerializingChallenger32<F, Inner>
+{
+    fn observe(&mut self, cap: &MerkleCap<F, [u8; N]>) {
+        for digest in cap.roots() {
+            for value in digest {
+                self.inner.observe(*value);
+            }
+        }
+    }
+}
+
+impl<F: PrimeField32, const N: usize, Inner: CanObserve<u8>> CanObserve<MerkleCap<F, [u8; N]>>
+    for SerializingChallenger32<F, Inner>
+{
+    fn observe(&mut self, cap: MerkleCap<F, [u8; N]>) {
+        self.observe(&cap);
+    }
+}
+
+impl<F: PrimeField32, const N: usize, Inner: CanObserve<u8>> CanObserve<&MerkleCap<F, [u64; N]>>
+    for SerializingChallenger32<F, Inner>
+{
+    fn observe(&mut self, cap: &MerkleCap<F, [u64; N]>) {
+        for digest in cap.roots() {
+            for value in digest {
+                self.inner.observe_slice(&value.to_le_bytes());
+            }
+        }
+    }
+}
+
+impl<F: PrimeField32, const N: usize, Inner: CanObserve<u8>> CanObserve<MerkleCap<F, [u64; N]>>
+    for SerializingChallenger32<F, Inner>
+{
+    fn observe(&mut self, cap: MerkleCap<F, [u64; N]>) {
+        self.observe(&cap);
+    }
+}
+
 impl<F, EF, Inner> CanSample<EF> for SerializingChallenger32<F, Inner>
 where
     F: PrimeField32,
-    EF: ExtensionField<F>,
+    EF: BasedVectorSpace<F>,
     Inner: CanSample<u8>,
 {
     fn sample(&mut self) -> EF {
-        let modulus = F::ORDER_U64 as u32;
+        let modulus = F::ORDER_U32;
         let log_size = log2_ceil_u64(F::ORDER_U64);
         // We use u64 to avoid overflow in the case that log_size = 32.
         let pow_of_two_bound = ((1u64 << log_size) - 1) as u32;
         // Perform rejection sampling over the uniform range (0..log2_ceil(p))
         let sample_base = |inner: &mut Inner| loop {
-            let value = u32::from_le_bytes(inner.sample_array::<4>());
+            let value = u32::from_le_bytes(inner.sample_array());
             let value = value & pow_of_two_bound;
             if value < modulus {
-                return F::from_canonical_u32(value);
+                return unsafe {
+                    // This is safe as value < F::ORDER_U32.
+                    F::from_canonical_unchecked(value)
+                };
             }
         };
-        EF::from_base_fn(|_| sample_base(&mut self.inner))
+        EF::from_basis_coefficients_fn(|_| sample_base(&mut self.inner))
     }
 }
 
@@ -116,30 +159,114 @@ where
     Inner: CanSample<u8>,
 {
     fn sample_bits(&mut self, bits: usize) -> usize {
-        debug_assert!(bits < (usize::BITS as usize));
-        // Limiting the number of bits to the field size
-        debug_assert!((1 << bits) <= F::ORDER_U64 as usize);
-        let rand_usize = u32::from_le_bytes(self.inner.sample_array::<4>()) as usize;
+        assert!(bits < (usize::BITS as usize));
+        // Evaluate the bound in `u64` to keep the shift within its type width.
+        // A `usize` shift by `bits >= 32` overflows on 32-bit targets and would zero the mask.
+        assert!(
+            (1u64 << bits) < F::ORDER_U64,
+            "requested bit count must fit within the field order"
+        );
+        let rand_usize = u32::from_le_bytes(self.inner.sample_array()) as usize;
         rand_usize & ((1 << bits) - 1)
+    }
+}
+
+impl<F, Inner> CanSampleUniformBits<F> for SerializingChallenger32<F, Inner>
+where
+    F: PrimeField32,
+    Inner: CanSample<u8>,
+{
+    /// Sample uniform bits by masking bytes from the inner stream.
+    ///
+    /// # Overview
+    ///
+    /// The inner stream emits cryptographic-hash bytes uniform on `[0, 2^8)`.
+    ///
+    /// Reading 4 bytes as a 32-bit integer and masking the low `bits` is
+    /// exactly uniform on `[0, 2^bits)`.
+    ///
+    /// No field-element decomposition occurs, so no rejection band exists.
+    /// The const generic is therefore inert: this function never errors
+    /// and never resamples.
+    fn sample_uniform_bits<const RESAMPLE: bool>(
+        &mut self,
+        bits: usize,
+    ) -> Result<usize, ResamplingError> {
+        // Byte-sourced sampling is uniform without rejection, so the
+        // result is always valid and the error arm is unreachable.
+        Ok(self.sample_bits(bits))
+    }
+}
+
+impl<F, Inner> SerializingChallenger32<F, Inner>
+where
+    F: PrimeField32,
+    Inner: CanSample<u8> + CanObserve<u8>,
+{
+    /// Hash everything observed since the last sample into the inner state.
+    ///
+    /// Discards one sampled byte. A proof-of-work step starts here, so each candidate
+    /// witness is hashed against a digest of the transcript rather than its pending input.
+    fn squeeze(&mut self) {
+        let _: u8 = self.inner.sample();
+    }
+
+    /// Absorb `witness` and report whether the next `bits` sampled bits are all zero.
+    fn witness_passes(&mut self, bits: usize, witness: F) -> bool {
+        self.observe(witness);
+        self.sample_bits(bits) == 0
     }
 }
 
 impl<F, Inner> GrindingChallenger for SerializingChallenger32<F, Inner>
 where
     F: PrimeField32,
-    Inner: CanSample<u8> + CanObserve<u8> + Clone + Send + Sync,
+    Inner: ByteGrindingChallenger,
 {
     type Witness = F;
 
-    #[instrument(name = "grind for proof-of-work witness", skip_all)]
+    #[instrument(name = "grind for proof-of-work witness", skip_all, level = "debug")]
     fn grind(&mut self, bits: usize) -> Self::Witness {
-        let witness = (0..F::ORDER_U64)
-            .into_par_iter()
-            .map(|i| F::from_canonical_u64(i))
-            .find_any(|witness| self.clone().check_witness(bits, *witness))
+        assert!(bits < (usize::BITS as usize));
+        // Evaluate the bound in `u64` to keep the shift within its type width.
+        // A `u32` shift by `bits >= 32` would wrap and accept a trivial proof-of-work.
+        assert!(
+            (1u64 << bits) < F::ORDER_U64,
+            "requested bit count must fit within the field order"
+        );
+
+        // Trivial case: 0 bits mean no PoW is required and any witness is valid.
+        if bits == 0 {
+            return F::ZERO;
+        }
+
+        let mut squeezed = self.clone();
+        squeezed.squeeze();
+        // Candidate `i` is the field element `i`.
+        let mask = (1usize << bits) - 1;
+        let index = squeezed
+            .inner
+            .find_witness(
+                u64::from(F::ORDER_U32),
+                // The bytes `observe` absorbs for the candidate.
+                |i| F::from_u64(i).to_unique_u32().to_le_bytes(),
+                // The test `witness_passes` applies to the word `sample_bits` reads.
+                |bytes| (u32::from_le_bytes(bytes) as usize & mask) == 0,
+            )
             .expect("failed to find witness");
+        let witness = F::from_u64(index);
         assert!(self.check_witness(bits, witness));
         witness
+    }
+
+    /// Squeeze the transcript, absorb `witness`, and check that the next `bits` sampled bits
+    /// are all zero. Zero difficulty accepts any witness without touching the transcript.
+    fn check_witness(&mut self, bits: usize, witness: Self::Witness) -> bool {
+        if bits == 0 {
+            return true;
+        }
+        self.squeeze();
+        self.witness_passes(bits, witness)
     }
 }
 
@@ -164,7 +291,7 @@ where
     F: PrimeField64,
     H: CryptographicHasher<u8, [u8; 32]>,
 {
-    pub fn from_hasher(initial_state: Vec<u8>, hasher: H) -> Self {
+    pub const fn from_hasher(initial_state: Vec<u8>, hasher: H) -> Self {
         Self::new(HashChallenger::new(initial_state, hasher))
     }
 }
@@ -172,7 +299,7 @@ where
 impl<F: PrimeField64, Inner: CanObserve<u8>> CanObserve<F> for SerializingChallenger64<F, Inner> {
     fn observe(&mut self, value: F) {
         self.inner
-            .observe_slice(&value.as_canonical_u64().to_le_bytes());
+            .observe_slice(&value.to_unique_u64().to_le_bytes());
     }
 }
 
@@ -186,10 +313,60 @@ impl<F: PrimeField64, const N: usize, Inner: CanObserve<u8>> CanObserve<Hash<F, 
     }
 }
 
+impl<F: PrimeField64, const N: usize, Inner: CanObserve<u8>> CanObserve<Hash<F, u64, N>>
+    for SerializingChallenger64<F, Inner>
+{
+    fn observe(&mut self, values: Hash<F, u64, N>) {
+        for value in values {
+            self.inner.observe_slice(&value.to_le_bytes());
+        }
+    }
+}
+
+impl<F: PrimeField64, const N: usize, Inner: CanObserve<u8>> CanObserve<&MerkleCap<F, [u8; N]>>
+    for SerializingChallenger64<F, Inner>
+{
+    fn observe(&mut self, cap: &MerkleCap<F, [u8; N]>) {
+        for digest in cap.roots() {
+            for value in digest {
+                self.inner.observe(*value);
+            }
+        }
+    }
+}
+
+impl<F: PrimeField64, const N: usize, Inner: CanObserve<u8>> CanObserve<MerkleCap<F, [u8; N]>>
+    for SerializingChallenger64<F, Inner>
+{
+    fn observe(&mut self, cap: MerkleCap<F, [u8; N]>) {
+        self.observe(&cap);
+    }
+}
+
+impl<F: PrimeField64, const N: usize, Inner: CanObserve<u8>> CanObserve<&MerkleCap<F, [u64; N]>>
+    for SerializingChallenger64<F, Inner>
+{
+    fn observe(&mut self, cap: &MerkleCap<F, [u64; N]>) {
+        for digest in cap.roots() {
+            for value in digest {
+                self.inner.observe_slice(&value.to_le_bytes());
+            }
+        }
+    }
+}
+
+impl<F: PrimeField64, const N: usize, Inner: CanObserve<u8>> CanObserve<MerkleCap<F, [u64; N]>>
+    for SerializingChallenger64<F, Inner>
+{
+    fn observe(&mut self, cap: MerkleCap<F, [u64; N]>) {
+        self.observe(&cap);
+    }
+}
+
 impl<F, EF, Inner> CanSample<EF> for SerializingChallenger64<F, Inner>
 where
     F: PrimeField64,
-    EF: ExtensionField<F>,
+    EF: BasedVectorSpace<F>,
     Inner: CanSample<u8>,
 {
     fn sample(&mut self) -> EF {
@@ -200,13 +377,16 @@ where
 
         // Perform rejection sampling over the uniform range (0..log2_ceil(p))
         let sample_base = |inner: &mut Inner| loop {
-            let value = u64::from_le_bytes(inner.sample_array::<8>());
+            let value = u64::from_le_bytes(inner.sample_array());
             let value = value & pow_of_two_bound;
             if value < modulus {
-                return F::from_canonical_u64(value);
+                return unsafe {
+                    // This is safe as value < F::ORDER_U64.
+                    F::from_canonical_unchecked(value)
+                };
             }
         };
-        EF::from_base_fn(|_| sample_base(&mut self.inner))
+        EF::from_basis_coefficients_fn(|_| sample_base(&mut self.inner))
     }
 }
 
@@ -216,30 +396,105 @@ where
     Inner: CanSample<u8>,
 {
     fn sample_bits(&mut self, bits: usize) -> usize {
-        debug_assert!(bits < (usize::BITS as usize));
-        // Limiting the number of bits to the field size
-        debug_assert!((1 << bits) <= F::ORDER_U64 as usize);
-        let rand_usize = u64::from_le_bytes(self.inner.sample_array::<8>()) as usize;
-        rand_usize & ((1 << bits) - 1)
+        assert!(bits < (usize::BITS as usize));
+        assert!((1u64 << bits) < F::ORDER_U64);
+        let rand_u64 = u64::from_le_bytes(self.inner.sample_array());
+        (rand_u64 & ((1u64 << bits) - 1)) as usize
+    }
+}
+
+impl<F, Inner> CanSampleUniformBits<F> for SerializingChallenger64<F, Inner>
+where
+    F: PrimeField64,
+    Inner: CanSample<u8>,
+{
+    /// Sample uniform bits by masking bytes from the inner stream.
+    ///
+    /// # Overview
+    ///
+    /// The inner stream emits cryptographic-hash bytes uniform on `[0, 2^8)`.
+    ///
+    /// Reading 8 bytes as a 64-bit integer and masking the low `bits` is
+    /// exactly uniform on `[0, 2^bits)`.
+    ///
+    /// No field-element decomposition occurs, so no rejection band exists.
+    /// The const generic is therefore inert: this function never errors
+    /// and never resamples.
+    fn sample_uniform_bits<const RESAMPLE: bool>(
+        &mut self,
+        bits: usize,
+    ) -> Result<usize, ResamplingError> {
+        // Byte-sourced sampling is uniform without rejection, so the
+        // result is always valid and the error arm is unreachable.
+        Ok(self.sample_bits(bits))
+    }
+}
+
+impl<F, Inner> SerializingChallenger64<F, Inner>
+where
+    F: PrimeField64,
+    Inner: CanSample<u8> + CanObserve<u8>,
+{
+    /// Hash everything observed since the last sample into the inner state.
+    ///
+    /// Discards one sampled byte. A proof-of-work step starts here, so each candidate
+    /// witness is hashed against a digest of the transcript rather than its pending input.
+    fn squeeze(&mut self) {
+        let _: u8 = self.inner.sample();
+    }
+
+    /// Absorb `witness` and report whether the next `bits` sampled bits are all zero.
+    fn witness_passes(&mut self, bits: usize, witness: F) -> bool {
+        self.observe(witness);
+        self.sample_bits(bits) == 0
     }
 }
 
 impl<F, Inner> GrindingChallenger for SerializingChallenger64<F, Inner>
 where
     F: PrimeField64,
-    Inner: CanSample<u8> + CanObserve<u8> + Clone + Send + Sync,
+    Inner: ByteGrindingChallenger,
 {
     type Witness = F;
 
-    #[instrument(name = "grind for proof-of-work witness", skip_all)]
+    #[instrument(name = "grind for proof-of-work witness", skip_all, level = "debug")]
     fn grind(&mut self, bits: usize) -> Self::Witness {
-        let witness = (0..F::ORDER_U64)
-            .into_par_iter()
-            .map(|i| F::from_canonical_u64(i))
-            .find_any(|witness| self.clone().check_witness(bits, *witness))
+        assert!(bits < (usize::BITS as usize));
+        assert!(bits < 64);
+        assert!((1u64 << bits) < F::ORDER_U64);
+
+        // Trivial case: 0 bits mean no PoW is required and any witness is valid.
+        if bits == 0 {
+            return F::ZERO;
+        }
+
+        let mut squeezed = self.clone();
+        squeezed.squeeze();
+        // Candidate `i` is the field element `i`.
+        let mask = (1u64 << bits) - 1;
+        let index = squeezed
+            .inner
+            .find_witness(
+                F::ORDER_U64,
+                // The bytes `observe` absorbs for the candidate.
+                |i| F::from_u64(i).to_unique_u64().to_le_bytes(),
+                // The test `witness_passes` applies to the word `sample_bits` reads.
+                |bytes| (u64::from_le_bytes(bytes) & mask) as usize == 0,
+            )
             .expect("failed to find witness");
+        let witness = F::from_u64(index);
         assert!(self.check_witness(bits, witness));
         witness
+    }
+
+    /// Squeeze the transcript, absorb `witness`, and check that the next `bits` sampled bits
+    /// are all zero. Zero difficulty accepts any witness without touching the transcript.
+    fn check_witness(&mut self, bits: usize, witness: Self::Witness) -> bool {
+        if bits == 0 {
+            return true;
+        }
+        self.squeeze();
+        self.witness_passes(bits, witness)
     }
 }
 
@@ -248,4 +503,291 @@ where
     F: PrimeField64,
     Inner: CanSample<u8> + CanObserve<u8> + Clone + Send + Sync,
 {
+}
+
+impl<F, Inner> CanFinalizeDigest for SerializingChallenger32<F, Inner>
+where
+    Inner: CanFinalizeDigest,
+{
+    type Digest = Inner::Digest;
+
+    fn finalize(self) -> Self::Digest {
+        self.inner.finalize()
+    }
+}
+
+impl<F, Inner> CanFinalizeDigest for SerializingChallenger64<F, Inner>
+where
+    Inner: CanFinalizeDigest,
+{
+    type Digest = Inner::Digest;
+
+    fn finalize(self) -> Self::Digest {
+        self.inner.finalize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use p3_baby_bear::BabyBear;
+    use p3_blake3::Blake3;
+    use p3_field::PrimeCharacteristicRing;
+    use p3_goldilocks::Goldilocks;
+    use p3_keccak::Keccak256Hash;
+    use p3_sha256::Sha256;
+    use p3_symmetric::CryptographicHasher;
+
+    use super::*;
+    use crate::HashChallenger;
+
+    /// Toy byte hasher: deterministic length-only fingerprint.
+    ///
+    /// Enough to drive the challenger plumbing without pulling in a real hash crate.
+    #[derive(Clone)]
+    struct ByteCountHasher;
+
+    impl CryptographicHasher<u8, [u8; 32]> for ByteCountHasher {
+        fn hash_iter<I>(&self, input: I) -> [u8; 32]
+        where
+            I: IntoIterator<Item = u8>,
+        {
+            let len = input.into_iter().count() as u8;
+            core::array::from_fn(|i| len.wrapping_add(i as u8))
+        }
+
+        fn hash_iter_slices<'a, I>(&self, input: I) -> [u8; 32]
+        where
+            I: IntoIterator<Item = &'a [u8]>,
+        {
+            let len = input.into_iter().map(<[u8]>::len).sum::<usize>() as u8;
+            core::array::from_fn(|i| len.wrapping_add(i as u8))
+        }
+    }
+
+    type Inner = HashChallenger<u8, ByteCountHasher, 32>;
+
+    /// Size of the transcript left pending before a grind in the rehash tests.
+    const PENDING_LEN: usize = 1 << 12;
+
+    /// Toy byte hasher that counts the calls whose input spans the pending transcript.
+    ///
+    /// FNV-1a folded through a SplitMix64 finalizer: input-sensitive enough to grind against.
+    #[derive(Clone)]
+    struct LongInputCounter(Arc<AtomicUsize>);
+
+    impl CryptographicHasher<u8, [u8; 32]> for LongInputCounter {
+        fn hash_iter<I>(&self, input: I) -> [u8; 32]
+        where
+            I: IntoIterator<Item = u8>,
+        {
+            let mut len = 0;
+            let mut state = 0xcbf2_9ce4_8422_2325_u64;
+            for byte in input {
+                state = (state ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+                len += 1;
+            }
+            if len >= PENDING_LEN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            let mut out = [0; 32];
+            for (i, chunk) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                let mut z = state.wrapping_add((i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                *chunk = (z ^ (z >> 31)).to_le_bytes();
+            }
+            out
+        }
+    }
+
+    /// Grind over a long pending transcript and count how often it gets rehashed.
+    ///
+    /// The search starts from a squeezed copy, and the final check squeezes the real
+    /// transcript, so the pending input is hashed at most twice however many candidates
+    /// are tried. The verifier must accept the witness and stay in sync with the prover.
+    fn assert_grind_rehashes_pending_input_at_most_twice<C>(
+        wrap: impl FnOnce(HashChallenger<u8, LongInputCounter, 32>) -> C,
+    ) where
+        C: GrindingChallenger + CanSampleBits<usize> + Clone,
+    {
+        const BITS: usize = 8;
+        let long_hashes = Arc::new(AtomicUsize::new(0));
+        let inner =
+            HashChallenger::new(vec![7; PENDING_LEN], LongInputCounter(long_hashes.clone()));
+        let mut prover = wrap(inner);
+        let mut verifier = prover.clone();
+
+        let witness = prover.grind(BITS);
+        assert!(long_hashes.load(Ordering::Relaxed) <= 2);
+
+        assert!(verifier.check_witness(BITS, witness));
+        assert_eq!(prover.sample_bits(20), verifier.sample_bits(20));
+    }
+
+    #[test]
+    fn test_serializing_challenger32_grind_rehashes_pending_input_at_most_twice() {
+        assert_grind_rehashes_pending_input_at_most_twice(
+            SerializingChallenger32::<BabyBear, _>::new,
+        );
+    }
+
+    #[test]
+    fn test_serializing_challenger64_grind_rehashes_pending_input_at_most_twice() {
+        assert_grind_rehashes_pending_input_at_most_twice(
+            SerializingChallenger64::<Goldilocks, _>::new,
+        );
+    }
+
+    #[test]
+    fn test_serializing_challenger32_grind_zero_bits_returns_zero() {
+        // bits == 0: must short-circuit to ZERO without consuming bytes.
+        type F = BabyBear;
+        let inner = Inner::new(vec![0, 1, 2, 3], ByteCountHasher);
+        let mut challenger = SerializingChallenger32::<F, Inner>::new(inner);
+
+        // Pristine shadow: equal next-byte proves no inner mutation.
+        let mut shadow = challenger.clone();
+
+        let witness = challenger.grind(0);
+
+        assert_eq!(witness, F::ZERO);
+        let after_grind: u8 = challenger.inner.sample();
+        let no_grind: u8 = shadow.inner.sample();
+        assert_eq!(after_grind, no_grind);
+    }
+
+    #[test]
+    fn test_serializing_challenger64_grind_zero_bits_returns_zero() {
+        // bits == 0: must short-circuit to ZERO without consuming bytes.
+        type F = Goldilocks;
+        let inner = Inner::new(vec![0, 1, 2, 3], ByteCountHasher);
+        let mut challenger = SerializingChallenger64::<F, Inner>::new(inner);
+
+        // Pristine shadow: equal next-byte proves no inner mutation.
+        let mut shadow = challenger.clone();
+
+        let witness = challenger.grind(0);
+
+        assert_eq!(witness, F::ZERO);
+        let after_grind: u8 = challenger.inner.sample();
+        let no_grind: u8 = shadow.inner.sample();
+        assert_eq!(after_grind, no_grind);
+    }
+
+    #[test]
+    #[should_panic = "requested bit count must fit within the field order"]
+    fn test_serializing_challenger32_sample_bits_rejects_oversized_request() {
+        // BabyBear order is ~2^30.9, so a 32-bit request must be rejected.
+        // The bound is evaluated in u64, so the guard fires in every build profile.
+        type F = BabyBear;
+        let inner = Inner::new(vec![0, 1, 2, 3], ByteCountHasher);
+        let mut challenger = SerializingChallenger32::<F, Inner>::new(inner);
+        let _ = challenger.sample_bits(32);
+    }
+
+    #[test]
+    #[should_panic = "requested bit count must fit within the field order"]
+    fn test_serializing_challenger32_grind_rejects_oversized_request() {
+        // Same guard, reached through the proof-of-work entry point.
+        type F = BabyBear;
+        let inner = Inner::new(vec![0, 1, 2, 3], ByteCountHasher);
+        let mut challenger = SerializingChallenger32::<F, Inner>::new(inner);
+        let _ = challenger.grind(32);
+    }
+
+    /// A byte challenger that keeps the default search, one clone per candidate.
+    #[derive(Clone)]
+    struct Unbatched(HashChallenger<u8, Keccak256Hash, 32>);
+
+    impl CanObserve<u8> for Unbatched {
+        fn observe(&mut self, value: u8) {
+            self.0.observe(value);
+        }
+
+        fn observe_slice(&mut self, values: &[u8]) {
+            self.0.observe_slice(values);
+        }
+    }
+
+    impl CanSample<u8> for Unbatched {
+        fn sample(&mut self) -> u8 {
+            self.0.sample()
+        }
+    }
+
+    impl ByteGrindingChallenger for Unbatched {}
+
+    /// A byte transcript whose pending input length and buffered output vary with `seed`.
+    fn transcript<H>(hasher: H, seed: u64) -> HashChallenger<u8, H, 32>
+    where
+        H: CryptographicHasher<u8, [u8; 32]>,
+    {
+        let mut challenger = HashChallenger::new(seed.to_le_bytes().to_vec(), hasher);
+        // A partly consumed digest, with its chaining value pending.
+        let _: [u8; 3] = challenger.sample_array();
+        // Then between 0 and 149 more pending bytes.
+        let observed: Vec<u8> = (0..(seed * 29 % 150) as u8)
+            .map(|i| i ^ seed as u8)
+            .collect();
+        challenger.observe_slice(&observed);
+        challenger
+    }
+
+    /// Grind `challenger` and compare against `check_witness` on the transcript before the grind.
+    fn assert_grind_agrees_with_check_witness<C>(challenger: &C, bits: usize)
+    where
+        C: GrindingChallenger + CanSample<C::Witness> + Clone,
+    {
+        let mut ground = challenger.clone();
+        let witness = ground.grind(bits);
+
+        let mut checked = challenger.clone();
+        assert!(checked.check_witness(bits, witness));
+
+        // The search returns the smallest candidate `check_witness` accepts, on any thread count.
+        let smallest = (0..)
+            .map(C::Witness::from_u64)
+            .find(|&candidate| challenger.clone().check_witness(bits, candidate));
+        assert_eq!(smallest, Some(witness));
+
+        // Grinding leaves the transcript where checking the same witness does.
+        let after_grind: [C::Witness; 12] = ground.sample_array();
+        let after_check: [C::Witness; 12] = checked.sample_array();
+        assert_eq!(after_grind, after_check);
+    }
+
+    fn assert_grind_agrees_for<Inner: ByteGrindingChallenger>(make: impl Fn(u64) -> Inner) {
+        for seed in 0..6 {
+            for bits in [0, 1, 2, 4, 8, 14] {
+                let narrow = SerializingChallenger32::<BabyBear, _>::new(make(seed));
+                assert_grind_agrees_with_check_witness(&narrow, bits);
+                let wide = SerializingChallenger64::<Goldilocks, _>::new(make(seed));
+                assert_grind_agrees_with_check_witness(&wide, bits);
+            }
+        }
+    }
+
+    #[test]
+    fn test_grind_agrees_with_check_witness_keccak() {
+        assert_grind_agrees_for(|seed| transcript(Keccak256Hash, seed));
+    }
+
+    #[test]
+    fn test_grind_agrees_with_check_witness_sha256() {
+        assert_grind_agrees_for(|seed| transcript(Sha256, seed));
+    }
+
+    #[test]
+    fn test_grind_agrees_with_check_witness_blake3() {
+        assert_grind_agrees_for(|seed| transcript(Blake3, seed));
+    }
+
+    #[test]
+    fn test_grind_agrees_with_check_witness_unbatched() {
+        assert_grind_agrees_for(|seed| Unbatched(transcript(Keccak256Hash, seed)));
+    }
 }
