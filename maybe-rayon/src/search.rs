@@ -17,10 +17,10 @@
 //! Work past it is at most one chunk per worker.
 
 use core::ops::Range;
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", target_has_atomic = "64"))]
 use core::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", target_has_atomic = "64"))]
 use rayon::prelude::*;
 
 /// Return `f(state, i)` at the smallest `i` in `candidates` where it is `Some`.
@@ -29,6 +29,7 @@ use rayon::prelude::*;
 /// It is scratch space only: the result must depend on `i` alone.
 ///
 /// The answer is the one a serial scan gives, whatever the thread count.
+/// Targets without 64-bit atomics use the serial scan even when `parallel` is enabled.
 ///
 /// # Performance
 ///
@@ -42,7 +43,7 @@ pub fn find_map_first<T, R>(
 where
     R: Send,
 {
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", target_has_atomic = "64"))]
     {
         let threads = rayon::current_num_threads();
         if threads > 1 {
@@ -50,13 +51,13 @@ where
         }
     }
 
-    // One worker: a plain scan in order.
+    // One worker or no 64-bit atomics: scan in order.
     let mut state = init();
     candidates.into_iter().find_map(|i| f(&mut state, i))
 }
 
 /// The ordered search on `threads` workers.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", target_has_atomic = "64"))]
 fn find_map_first_parallel<T, R>(
     candidates: Range<u64>,
     threads: usize,
@@ -104,7 +105,7 @@ where
 ///
 /// Every worker writes the claim counter, and every worker reads the best match.
 /// Apart, the reads stay cache hits between the writes.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", target_has_atomic = "64"))]
 #[repr(align(128))]
 struct CacheLine<T>(T);
 
@@ -120,7 +121,7 @@ struct CacheLine<T>(T);
 /// ```
 ///
 /// A chunk then holds about `1 / per_level` of the candidates before it.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", target_has_atomic = "64"))]
 struct Schedule {
     /// The candidates to split.
     candidates: Range<u64>,
@@ -128,7 +129,7 @@ struct Schedule {
     per_level: u64,
 }
 
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", target_has_atomic = "64"))]
 impl Schedule {
     /// The fewest candidates in a chunk.
     ///
@@ -174,9 +175,9 @@ impl Schedule {
 mod tests {
     use super::*;
 
-    /// Run `op` on four workers, so the parallel path runs on any host.
+    /// Run `op` on four workers when parallel search is supported.
     fn on_four_workers<R: Send>(op: impl FnOnce() -> R + Send) -> R {
-        #[cfg(feature = "parallel")]
+        #[cfg(all(feature = "parallel", target_has_atomic = "64"))]
         {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(4)
@@ -184,7 +185,7 @@ mod tests {
                 .unwrap()
                 .install(op)
         }
-        #[cfg(not(feature = "parallel"))]
+        #[cfg(not(all(feature = "parallel", target_has_atomic = "64")))]
         {
             op()
         }
@@ -214,7 +215,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", target_has_atomic = "64"))]
     #[test]
     fn chunks_tile_the_range_in_order() {
         // Short and long ranges, one ending at the top of `u64`, on 1, 3 and 16 workers.
