@@ -49,37 +49,36 @@ pub(crate) fn plan_layout(shapes: &[LayoutShape]) -> (usize, Vec<TablePlacement>
     let mut order = (0..shapes.len()).collect::<Vec<usize>>();
     order.sort_by_key(|&i| shapes[i].arity);
 
-    // Stacked arity: log2_ceil of the total cell count.
-    let k = log2_ceil_usize(
-        shapes
-            .iter()
-            .map(|s| s.width * (1usize << s.arity))
-            .sum::<usize>(),
-    );
-
-    // Running cursor into the stacked polynomial, in scalar units.
+    // Start each table at a multiple of its own block, the next power of two
+    // of its width in slots, so its columns form one aligned block and the
+    // table is opened as a single claim. Gaps are zero slots.
+    // Only a set of power-of-two widths is aligned; any other set keeps the
+    // original contiguous layout (block 1: no rounding).
+    let align = shapes.iter().all(|shape| shape.width.is_power_of_two());
     let mut offset = 0usize;
-    let mut placements = Vec::with_capacity(shapes.len());
-
-    // Lay out largest tables first; each column claims one slot.
+    let mut starts = Vec::with_capacity(shapes.len());
     for &table_idx in order.iter().rev() {
         let shape = &shapes[table_idx];
-        // Slot size per column: 2^arity.
-        let slot_size = 1usize << shape.arity;
-
-        // Assign one selector per column, advancing the cursor after each.
-        let selectors = (0..shape.width)
-            .map(|_| {
-                // Selector bit-width is stacked arity minus table arity.
-                let selector = Selector::new(k - shape.arity, offset >> shape.arity);
-                // Advance the cursor by one slot.
-                offset += slot_size;
-                selector
-            })
-            .collect();
-
-        placements.push(TablePlacement::new(table_idx, selectors));
+        let block = if align { shape.width.next_power_of_two() << shape.arity } else { 1 };
+        offset = offset.div_ceil(block) * block;
+        starts.push((table_idx, offset));
+        offset += shape.width << shape.arity;
     }
+
+    // Stacked arity: log2_ceil of the end of the last table.
+    let k = log2_ceil_usize(offset.max(1));
+
+    let placements = starts
+        .into_iter()
+        .map(|(table_idx, start)| {
+            let shape = &shapes[table_idx];
+            let slot_size = 1usize << shape.arity;
+            let selectors = (0..shape.width)
+                .map(|column| Selector::new(k - shape.arity, (start + column * slot_size) >> shape.arity))
+                .collect();
+            TablePlacement::new(table_idx, selectors)
+        })
+        .collect();
 
     (k, placements)
 }

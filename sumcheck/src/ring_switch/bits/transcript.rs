@@ -538,6 +538,18 @@ pub struct ClaimsDraws<EF> {
 pub struct BitRingSwitchClaimsShape {
     /// The shape of each claim, in the order the claims are bound.
     pub claims: Vec<BitRingSwitchShape>,
+    /// The claims send one tensor between them, their own weighed by powers
+    /// of a challenge drawn after their points (and readings) are bound:
+    ///
+    /// ```text
+    ///     per claim        point
+    ///     then, once       claim batching, tensor rows, batching point
+    ///     then, once       sumcheck bracket, surviving claim
+    /// ```
+    ///
+    /// Only claims sharing their absorbed coordinates, none with successor
+    /// elements, are merged.
+    pub merged: bool,
 }
 
 impl BitRingSwitchClaimsShape {
@@ -569,6 +581,45 @@ impl BitRingSwitchClaimsShape {
         };
 
         let mut steps = Vec::new();
+        if self.merged {
+            // Every claim's point is bound before the challenge weighing them,
+            // and the one tensor that challenge combines before the batching point.
+            for claim in &self.claims {
+                steps.push(Interaction::algebra::<F, EF>(
+                    Hierarchy::Atomic,
+                    Kind::Message,
+                    EVALUATION_POINT,
+                    Length::Fixed(claim.num_variables),
+                ));
+            }
+            steps.push(scalar_challenge(CLAIM_BATCHING));
+            steps.push(rows(TENSOR_ROWS));
+            steps.push(Interaction::algebra::<F, EF>(
+                Hierarchy::Atomic,
+                Kind::Challenge,
+                BATCHING_POINT,
+                Length::Fixed(BitRingSwitch::<F, EF>::BATCHED),
+            ));
+            steps.extend([
+                Interaction::marker::<BatchedSumcheck>(
+                    Hierarchy::Begin,
+                    Kind::Protocol,
+                    BATCHED_SUMCHECK,
+                ),
+                Interaction::marker::<BatchedSumcheck>(
+                    Hierarchy::End,
+                    Kind::Protocol,
+                    BATCHED_SUMCHECK,
+                ),
+                Interaction::algebra::<F, EF>(
+                    Hierarchy::Atomic,
+                    Kind::Message,
+                    SURVIVING_CLAIM,
+                    Length::Scalar,
+                ),
+            ]);
+            return InteractionPattern::new(steps).expect("one matched bracket is always well formed");
+        }
         // Every claim is bound whole before any draw, which is what the batching bound needs.
         for claim in &self.claims {
             steps.push(Interaction::algebra::<F, EF>(
@@ -633,6 +684,10 @@ impl BitRingSwitchClaimsShape {
                 Some(rows) => separator.instance(&(rows as u64).to_be_bytes()),
                 None => separator.instance(&[]),
             };
+        }
+        // A merged batch is another protocol; an unmerged one keeps its seed.
+        if self.merged {
+            separator.instance(b"merged");
         }
         separator
     }
@@ -720,6 +775,36 @@ where
             alpha,
             lambda,
         }
+    }
+
+    /// A merged batch: bind every claim's point, then draw the challenge
+    /// whose powers weigh the claims.
+    pub fn merged_points(&mut self, points: &[&Point<EF>]) -> EF {
+        assert!(self.shape.merged, "only a merged batch binds its points alone");
+        assert_eq!(points.len(), self.shape.claims.len(), "one point per claim");
+        for point in points {
+            self.state
+                .observe_extensions::<F, EF, FieldToFieldCodec<F>>(EVALUATION_POINT, point.as_slice());
+        }
+        self.state
+            .challenge_extension::<F, EF, FieldToFieldCodec<F>>(CLAIM_BATCHING)
+            .into_inner()
+    }
+
+    /// A merged batch: bind the one tensor's rows, then draw the batching point.
+    pub fn merged_rows(&mut self, rows: &[F]) -> Point<EF> {
+        self.state
+            .observe_extensions::<F, F, FieldToFieldCodec<F>>(TENSOR_ROWS, rows);
+        Point::new(
+            self.state
+                .challenge_extensions::<F, EF, FieldToFieldCodec<F>>(
+                    BATCHING_POINT,
+                    BitRingSwitch::<F, EF>::BATCHED,
+                )
+                .into_iter()
+                .map(TranscriptBound::into_inner)
+                .collect(),
+        )
     }
 
     /// Hand the sponge to the delegated sumcheck rounds.
@@ -848,6 +933,57 @@ where
             alpha,
             lambda,
         })
+    }
+
+    /// A merged batch: replay every claim's point, then redraw the challenge
+    /// whose powers weigh the claims.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, releasing the driver, when the claim count or a
+    /// point's width disagrees with the shape.
+    pub fn merged_points(&mut self, points: &[&Point<EF>]) -> Result<EF, TranscriptWidth> {
+        let checked = if points.len() == self.shape.claims.len() {
+            points.iter().zip(&self.shape.claims).try_for_each(|(point, shape)| {
+                if point.num_variables() == shape.num_variables {
+                    Ok(())
+                } else {
+                    Err(TranscriptWidth::Point { expected: shape.num_variables, actual: point.num_variables() })
+                }
+            })
+        } else {
+            Err(TranscriptWidth::Claims { expected: self.shape.claims.len(), actual: points.len() })
+        };
+        if let Err(error) = checked {
+            self.state.abort();
+            return Err(error);
+        }
+        for point in points {
+            let _ = self
+                .state
+                .observe_extensions::<F, EF, FieldToFieldCodec<F>>(EVALUATION_POINT, point.as_slice());
+        }
+        Ok(self
+            .state
+            .challenge_extension::<F, EF, FieldToFieldCodec<F>>(CLAIM_BATCHING)
+            .into_inner())
+    }
+
+    /// A merged batch: replay the one tensor's rows, then redraw the batching point.
+    pub fn merged_rows(&mut self, rows: &[F]) -> Point<EF> {
+        let _ = self
+            .state
+            .observe_extensions::<F, F, FieldToFieldCodec<F>>(TENSOR_ROWS, rows);
+        Point::new(
+            self.state
+                .challenge_extensions::<F, EF, FieldToFieldCodec<F>>(
+                    BATCHING_POINT,
+                    BitRingSwitch::<F, EF>::BATCHED,
+                )
+                .into_iter()
+                .map(TranscriptBound::into_inner)
+                .collect(),
+        )
     }
 
     /// Hand the sponge to the delegated sumcheck replay.
@@ -1571,6 +1707,7 @@ mod tests {
             seed_digest(
                 &BitRingSwitchClaimsShape {
                     claims: claims.to_vec(),
+                    merged: false,
                 }
                 .domain_separator::<EF, EF>(),
             )
@@ -1589,7 +1726,8 @@ mod tests {
         assert!(
             pow_difficulties(
                 &BitRingSwitchClaimsShape {
-                    claims: vec![plain, successor]
+                    claims: vec![plain, successor],
+                    merged: false,
                 }
                 .pattern::<EF, EF>()
             )
@@ -1602,6 +1740,7 @@ mod tests {
         // The verifier checks every claim's widths before the sponge moves.
         let shape = BitRingSwitchClaimsShape {
             claims: vec![base_shape(), base_shape()],
+            merged: false,
         };
         let point = point_of(NUM_VARIABLES, 1);
         let rows = rows_of(1);

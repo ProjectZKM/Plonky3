@@ -685,9 +685,11 @@ where
             tracing::info_span!("read committed packing").in_scope(|| Self::packing(&prover_data));
 
         // One batch for every opening, leaving one claim about the packing.
-        let (reduction, surviving_point, surviving_value) = tracing::info_span!("bit ring switch")
-            .in_scope(|| {
-                claims.prove::<<EF as ChallengeField<EF>>::SumcheckRepr, _, _>(&packing, challenger)
+        let (reduction, surviving_point, surviving_value, currents) =
+            tracing::info_span!("bit ring switch").in_scope(|| {
+                claims.prove_with_readings::<<EF as ChallengeField<EF>>::SumcheckRepr, _, _>(
+                    &packing, challenger,
+                )
             });
 
         // The elements each claim sends already hold its readings.
@@ -695,14 +697,17 @@ where
         let readings = openings
             .iter()
             .zip(claims.reductions())
-            .zip(&reduction.claims)
-            .map(|((opening, switch), elements)| {
-                let current = opening
-                    .current
-                    .then(|| switch.incoming_claim(&elements.tensor));
+            .zip(&currents)
+            .enumerate()
+            .map(|(index, ((opening, switch), &reading))| {
+                let current = opening.current.then_some(reading);
+                // A claim reading its successor is never merged, so it sent its own elements.
                 let next = opening
                     .next
-                    .then(|| switch.successor_claim(&elements.tensor, elements.successor.as_ref()))
+                    .then(|| {
+                        let elements = &reduction.claims[index];
+                        switch.successor_claim(&elements.tensor, elements.successor.as_ref())
+                    })
                     .transpose()
                     .map_err(BooleanPcsError::Reduction)?;
                 Ok(BitReadings { current, next })
@@ -755,7 +760,10 @@ where
             + CanObserve<MX::Commitment>,
     {
         self.check_openings(openings)?;
-        if readings.len() != openings.len() || proof.reduction.claims.len() != openings.len() {
+        let claims = Self::claims(openings)?;
+        if readings.len() != openings.len()
+            || proof.reduction.claims.len() != claims.elements_sent()
+        {
             return Err(BooleanPcsError::ClaimCount {
                 expected: openings.len(),
                 values: readings.len(),
@@ -773,7 +781,6 @@ where
         {
             return Err(BooleanPcsError::ReadingShape { index });
         }
-        let claims = Self::claims(openings)?;
 
         // The batch turns every reading about the bits into one claim about the packing.
         let readings = readings

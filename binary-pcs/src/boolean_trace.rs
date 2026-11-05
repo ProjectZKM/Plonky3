@@ -104,13 +104,17 @@ use p3_sumcheck::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use self::plan::{OpeningRoute, TableRun, opening_evals, sample_points, value_count};
+use self::plan::{
+    OpeningRoute, TableRun, column_values, opening_evals, packed_forms, packed_weights,
+    sample_points, value_count, wire_value_count,
+};
 use crate::boolean::{
     BitOpening, BitReadings, BooleanBackend, BooleanMultilinearPcs, BooleanPcs, BooleanPcsError,
     BooleanProof, ReadingsCheck,
 };
 use crate::boolean_trace_transcript::{
     ColumnBatchProverTranscript, ColumnBatchShape, ColumnBatchVerifierTranscript,
+    FormsSumcheckProverTranscript, FormsSumcheckShape, FormsSumcheckVerifierTranscript,
 };
 use crate::fold::{ChallengeField, FoldAlphabet};
 use crate::packing::Coordinates;
@@ -199,16 +203,17 @@ where
         column_point: &'a Point<EF>,
         current: &'a [EF],
         successor: &'a [EF],
+        folded: Option<EF>,
     ) -> impl Iterator<Item = (BitOpening<EF>, BitReadings<EF>)> + 'a {
         let next = run.shape.next;
         run.blocks.iter().map(move |block| {
             let columns = block.first..(block.first + (1 << block.variables)).min(current.len());
             let block_point = Point::new(column_point.as_slice()[..block.variables].to_vec());
+            // A packed run's one block reads the columns its sumcheck folded.
             let readings = BitReadings {
-                current: Some(Self::combine_columns(
-                    &current[columns.clone()],
-                    &block_point,
-                )),
+                current: Some(folded.unwrap_or_else(|| {
+                    Self::combine_columns(&current[columns.clone()], &block_point)
+                })),
                 next: next.then(|| Self::combine_columns(&successor[columns], &block_point)),
             };
             let mut local = block_point;
@@ -268,6 +273,12 @@ impl<EF: Field, D> BooleanTraceCommitmentData<EF, D> {
     pub fn table(&self, index: usize) -> &Table<EF> {
         &self.tables[index]
     }
+
+    /// whir-gc experiment: the prover data of the bit commitment underneath.
+    #[must_use]
+    pub const fn inner(&self) -> &D {
+        &self.inner
+    }
 }
 
 /// One opening of a Boolean trace: the column values, and the bit proof behind them.
@@ -322,6 +333,13 @@ pub enum BooleanTraceCommitmentError<E> {
         expected: usize,
         /// Number of tables retained by the prover.
         actual: usize,
+    },
+
+    /// whir-gc experiment: a packed batch's column sumcheck does not close.
+    #[error("the packed columns of batch {batch} do not close their sumcheck")]
+    PackedColumns {
+        /// Batch, among the protocol's, whose sumcheck failed.
+        batch: usize,
     },
 
     /// A table's bit region is wider than the table itself.
@@ -633,7 +651,8 @@ where
         self.inner
             .verify_readings(commitment, &openings, &readings, &proof.opening, challenger)
             .map_err(BooleanTraceCommitmentError::Boolean)?;
-        Ok(opening_evals(protocol, &proof.values))
+        let columns = column_values(&OpeningRoute::new(protocol), &proof.values);
+        Ok(opening_evals(protocol, &columns))
     }
 
     fn verify_pair_at(
@@ -674,9 +693,13 @@ where
                 challenger,
             )
             .map_err(BooleanTraceCommitmentError::Boolean)?;
+        let first_columns =
+            column_values(&OpeningRoute::new(first_side.protocol), &first_side.proof.values);
+        let second_columns =
+            column_values(&OpeningRoute::new(second_side.protocol), &second_side.proof.values);
         Ok((
-            opening_evals(first_side.protocol, &first_side.proof.values),
-            opening_evals(second_side.protocol, &second_side.proof.values),
+            opening_evals(first_side.protocol, &first_columns),
+            opening_evals(second_side.protocol, &second_columns),
         ))
     }
 
@@ -800,6 +823,7 @@ where
         let pad = self.stacked_pad(plan_stacked_layout(&protocol.table_shapes()).0)?;
 
         let mut values = Vec::with_capacity(value_count(protocol));
+        let mut forms_runs: Vec<(&TableRun, &Point<EF>, Vec<EF>)> = Vec::new();
         let mut openings = Vec::new();
         let mut expected = Vec::new();
         let mut batch_points = points.iter();
@@ -813,7 +837,7 @@ where
             } = run.shape;
             let run_points: Vec<_> = batch_points.by_ref().take(num_batches).collect();
             let run_known = batch_known.by_ref().take(num_batches);
-            let offset = values.len();
+            let mut full = Vec::with_capacity(num_batches * width * run.shape.num_views());
             tracing::info_span!("evaluate boolean columns", width, next).in_scope(|| {
                 for (point, known) in run_points.iter().zip(run_known) {
                     // A supplied run is bound as it stands; the reduction below compares each
@@ -821,31 +845,45 @@ where
                     // a random check, the only one the run meets: a wrong run passes it with
                     // probability at most `j / |EF|` per block of `2^j` columns.
                     if let Some(known) = known {
-                        values.extend_from_slice(known.current());
-                        values.extend_from_slice(known.next());
+                        full.extend_from_slice(known.current());
+                        full.extend_from_slice(known.next());
                         continue;
                     }
                     let (current, successor) =
                         Self::evaluate_views(&tables[run.table], point, next);
-                    values.extend(current);
-                    values.extend(successor);
+                    full.extend(current);
+                    full.extend(successor);
                 }
             });
 
             let mut transcript = ColumnBatchProverTranscript::new(challenger, run.shape);
-            let chunks = values[offset..].chunks_exact(run.shape.values_per_batch());
+            let chunks = full.chunks_exact(width * run.shape.num_views());
             for (point, batch_values) in run_points.into_iter().zip(chunks) {
                 let (current, successor) = batch_values.split_at(width);
-                // Both value runs are bound before the point that combines either of them.
-                let column_point = transcript.batch(point, current, successor);
-                for (opening, readings) in
-                    Self::block_claims(run, pad, point, &column_point, current, successor)
-                {
-                    openings.push(opening);
-                    expected.push(readings);
+                if run.forms.is_empty() {
+                    values.extend_from_slice(batch_values);
+                    // Both value runs are bound before the point that combines either of them.
+                    let column_point = transcript.batch(point, current, successor);
+                    for (opening, readings) in
+                        Self::block_claims(run, pad, point, &column_point, current, successor, None)
+                    {
+                        openings.push(opening);
+                        expected.push(readings);
+                    }
+                    continue;
                 }
+                // A forms batch binds its row point and forms here; the sumcheck every
+                // forms batch shares runs once all runs are bound.
+                assert_eq!(run.shape.num_batches, 1, "a forms run opens one point");
+                let forms = packed_forms(current, &run.forms);
+                transcript.bind_forms(point, &forms);
+                values.extend_from_slice(&forms);
+                forms_runs.push((run, point, current.to_vec()));
             }
             transcript.finish();
+        }
+        if !forms_runs.is_empty() {
+            Self::prove_forms(&forms_runs, pad, challenger, &mut values, &mut openings, &mut expected);
         }
         Ok(PendingOpening {
             openings,
@@ -861,7 +899,7 @@ where
         points: &[Point<EF>],
     ) -> Result<Vec<TablePlacement>, BooleanTraceCommitmentError<B::Error>> {
         let placements = self.validate_opening(protocol, points)?;
-        let expected_values = value_count(protocol);
+        let expected_values = wire_value_count(&OpeningRoute::new(protocol), protocol);
         if proof.values.len() != expected_values {
             return Err(BooleanTraceCommitmentError::ValueCount {
                 expected: expected_values,
@@ -898,6 +936,8 @@ where
 
         let mut openings = Vec::new();
         let mut readings = Vec::new();
+        let mut batch_index = 0;
+        let mut forms_runs: Vec<(&TableRun, &Point<EF>, &[EF])> = Vec::new();
         let mut batch_points = points.iter();
         let mut batch_values = proof.values.as_slice();
         for run in &runs {
@@ -910,19 +950,201 @@ where
                 .take(run.shape.num_batches)
                 .zip(run_values.chunks_exact(run.shape.values_per_batch()))
             {
-                let (current, successor) = values.split_at(run.shape.width);
-                // Both value runs are bound before the point that combines either of them.
-                let column_point = transcript.batch(point, current, successor)?;
-                for (opening, reading) in
-                    Self::block_claims(run, pad, point, &column_point, current, successor)
-                {
-                    openings.push(opening);
-                    readings.push(reading);
+                batch_index += 1;
+                if run.forms.is_empty() {
+                    let (current, successor) = values.split_at(run.shape.width);
+                    // Both value runs are bound before the point that combines either of them.
+                    let column_point = transcript.batch(point, current, successor)?;
+                    for (opening, reading) in
+                        Self::block_claims(run, pad, point, &column_point, current, successor, None)
+                    {
+                        openings.push(opening);
+                        readings.push(reading);
+                    }
+                    continue;
                 }
+                assert_eq!(run.shape.num_batches, 1, "a forms run opens one point");
+                transcript.bind_forms(point, values)?;
+                forms_runs.push((run, point, values));
             }
             transcript.finish();
         }
+        if !forms_runs.is_empty() {
+            Self::verify_forms(&forms_runs, pad, batch_values, challenger, &mut openings, &mut readings)?;
+        }
+        let _ = batch_index;
         Ok((openings, readings))
+    }
+
+    /// whir-gc experiment: the one sumcheck every forms run shares, prover side.
+    ///
+    /// ```text
+    ///     claim   sum_g rho^g form_g  =  sum_t sum_u L_t(u) W_t(u)
+    /// ```
+    ///
+    /// over the widest table's column variables, each table's slots zero above its width,
+    /// so after the leading coordinates it reads its own columns at the trailing ones.
+    #[allow(clippy::type_complexity)]
+    fn prove_forms<Challenger>(
+        runs: &[(&TableRun, &Point<EF>, Vec<EF>)],
+        pad: usize,
+        challenger: &mut Challenger,
+        values: &mut Vec<EF>,
+        openings: &mut Vec<BitOpening<EF>>,
+        expected: &mut Vec<BitReadings<EF>>,
+    ) where
+        Challenger: FieldChallenger<B::Val>
+            + GrindingChallenger<Witness = B::Val>
+            + CanSampleUniformBits<B::Val>,
+    {
+        let column_variables = runs
+            .iter()
+            .map(|(run, _, _)| run.shape.column_variables())
+            .max()
+            .expect("at least one forms run");
+        let shape = FormsSumcheckShape { column_variables, tables: runs.len() };
+        let mut transcript =
+            FormsSumcheckProverTranscript::<B::Val, EF, Challenger>::new(challenger, shape);
+        let rho = transcript.weight();
+        let size = 1usize << column_variables;
+        let mut power = EF::ONE;
+        let mut tables: Vec<(Vec<EF>, Vec<EF>)> = runs
+            .iter()
+            .map(|(run, _, current)| {
+                let mut weights = packed_weights(run.shape.width, &run.forms, rho);
+                for weight in &mut weights {
+                    *weight *= power;
+                }
+                power *= rho.exp_u64(run.forms.len() as u64);
+                weights.resize(size, EF::ZERO);
+                let mut columns = current.clone();
+                columns.resize(size, EF::ZERO);
+                (weights, columns)
+            })
+            .collect();
+        let mut coordinates = Vec::with_capacity(column_variables);
+        for _ in 0..column_variables {
+            let half = tables[0].0.len() / 2;
+            let (mut a, mut c) = (EF::ZERO, EF::ZERO);
+            for (weights, columns) in &tables {
+                for i in 0..half {
+                    a += weights[i] * columns[i];
+                    c += (weights[half + i] - weights[i]) * (columns[half + i] - columns[i]);
+                }
+            }
+            values.push(a);
+            values.push(c);
+            let r = transcript.round([a, c]);
+            for (weights, columns) in &mut tables {
+                for i in 0..half {
+                    let (low, high) = (weights[i], weights[half + i]);
+                    weights[i] = low + r * (high - low);
+                    let (low, high) = (columns[i], columns[half + i]);
+                    columns[i] = low + r * (high - low);
+                }
+                weights.truncate(half);
+                columns.truncate(half);
+            }
+            coordinates.push(r);
+        }
+        let suffixes: Vec<Point<EF>> = runs
+            .iter()
+            .map(|(run, _, _)| {
+                Point::new(coordinates[column_variables - run.shape.column_variables()..].to_vec())
+            })
+            .collect();
+        let folds: Vec<EF> = runs
+            .iter()
+            .zip(&suffixes)
+            .map(|((_, _, current), suffix)| Self::combine_columns(current, suffix))
+            .collect();
+        transcript.folds(&folds);
+        values.extend_from_slice(&folds);
+        for (((run, point, current), suffix), &fold) in runs.iter().zip(&suffixes).zip(&folds) {
+            for (opening, readings) in
+                Self::block_claims(run, pad, point, suffix, current, &[], Some(fold))
+            {
+                openings.push(opening);
+                expected.push(readings);
+            }
+        }
+        transcript.finish();
+    }
+
+    /// whir-gc experiment: the one sumcheck every forms run shares, verifier side; `tail`
+    /// holds its rounds and then one fold per forms run.
+    #[allow(clippy::type_complexity)]
+    fn verify_forms<Challenger>(
+        runs: &[(&TableRun, &Point<EF>, &[EF])],
+        pad: usize,
+        tail: &[EF],
+        challenger: &mut Challenger,
+        openings: &mut Vec<BitOpening<EF>>,
+        readings: &mut Vec<BitReadings<EF>>,
+    ) -> Result<(), BooleanTraceCommitmentError<B::Error>>
+    where
+        Challenger: FieldChallenger<B::Val>
+            + GrindingChallenger<Witness = B::Val>
+            + CanSampleUniformBits<B::Val>,
+    {
+        let column_variables = runs
+            .iter()
+            .map(|(run, _, _)| run.shape.column_variables())
+            .max()
+            .expect("at least one forms run");
+        let shape = FormsSumcheckShape { column_variables, tables: runs.len() };
+        let mut transcript =
+            FormsSumcheckVerifierTranscript::<B::Val, EF, Challenger>::new(challenger, shape);
+        let rho = transcript.weight();
+        let (rounds, folds) = tail.split_at(2 * column_variables);
+        // The weighted forms, in run order, are the sum the rounds open with.
+        let mut claim = EF::ZERO;
+        let mut power = EF::ONE;
+        for (_, _, forms) in runs {
+            for &form in *forms {
+                claim += power * form;
+                power *= rho;
+            }
+        }
+        let mut coordinates = Vec::with_capacity(column_variables);
+        for round in rounds.chunks_exact(2) {
+            let (a, c) = (round[0], round[1]);
+            let b = claim - a.double() - c;
+            let r = transcript.round([a, c])?;
+            claim = a + b * r + c * r.square();
+            coordinates.push(r);
+        }
+        transcript.folds(folds)?;
+        // Each table, zero above its width, is its weight times its fold at the trailing
+        // coordinates, scaled by eq(0, the leading ones) once for each of the two factors.
+        let mut expected = EF::ZERO;
+        let mut power = EF::ONE;
+        let mut suffixes = Vec::with_capacity(runs.len());
+        for ((run, _, _), &fold) in runs.iter().zip(folds) {
+            let lead = column_variables - run.shape.column_variables();
+            let prefix: EF = coordinates[..lead].iter().map(|&u| EF::ONE - u).product();
+            let suffix = Point::new(coordinates[lead..].to_vec());
+            let mut weights = packed_weights(run.shape.width, &run.forms, rho);
+            for weight in &mut weights {
+                *weight *= power;
+            }
+            power *= rho.exp_u64(run.forms.len() as u64);
+            expected += prefix.square() * Self::combine_columns(&weights, &suffix) * fold;
+            suffixes.push(suffix);
+        }
+        if claim != expected {
+            transcript.abort();
+            return Err(BooleanTraceCommitmentError::PackedColumns { batch: 0 });
+        }
+        transcript.finish();
+        // Each fold is what its block's bit claim reads; no column value is needed.
+        for (((run, point, _), suffix), &fold) in runs.iter().zip(&suffixes).zip(folds) {
+            for (opening, reading) in Self::block_claims(run, pad, point, suffix, &[], &[], Some(fold)) {
+                openings.push(opening);
+                readings.push(reading);
+            }
+        }
+        Ok(())
     }
 
     /// The reductions an opening of this protocol asks of the bit commitment, and the column

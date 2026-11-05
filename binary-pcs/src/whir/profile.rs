@@ -55,6 +55,15 @@ pub struct BinaryWhirProfile {
     starting_log_inv_rate: usize,
     /// Variables eliminated by each round.
     folding_factor: usize,
+    /// whir-gc experiment: variables the first round eliminates, when not
+    /// `folding_factor` (zero: the same).
+    first_folding_factor: usize,
+    /// whir-gc experiment: rounds whose rate grows by their folding factor
+    /// (the folded domain kept) rather than one less, bit `i` for round `i`.
+    rate_bumps: u32,
+    /// whir-gc experiment: every round's folding factor, zeros past the last;
+    /// all zero for the constant (or first-round) schedule.
+    round_folds: [u8; 8],
 }
 
 impl BinaryWhirProfile {
@@ -70,6 +79,9 @@ impl BinaryWhirProfile {
             security_level,
             starting_log_inv_rate,
             folding_factor,
+            first_folding_factor: 0,
+            rate_bumps: 0,
+            round_folds: [0; 8],
         }
     }
 
@@ -87,6 +99,9 @@ impl BinaryWhirProfile {
             security_level,
             starting_log_inv_rate,
             folding_factor,
+            first_folding_factor: 0,
+            rate_bumps: 0,
+            round_folds: [0; 8],
         }
     }
 
@@ -104,7 +119,24 @@ impl BinaryWhirProfile {
             security_level,
             starting_log_inv_rate,
             folding_factor,
+            first_folding_factor: 0,
+            rate_bumps: 0,
+            round_folds: [0; 8],
         }
+    }
+
+    /// whir-gc experiment: a first round folding `first_folding_factor`
+    /// variables, and the rounds in `rate_bumps` keeping their folded domain.
+    #[must_use]
+    pub const fn with_first_round(self, first_folding_factor: usize, rate_bumps: u32) -> Self {
+        Self { first_folding_factor, rate_bumps, ..self }
+    }
+
+    /// whir-gc experiment: a folding factor per round, and the rounds in
+    /// `rate_bumps` keeping their folded domain.
+    #[must_use]
+    pub const fn with_round_folds(self, round_folds: [u8; 8], rate_bumps: u32) -> Self {
+        Self { round_folds, rate_bumps, ..self }
     }
 
     /// The proximity regime this profile is graded under.
@@ -145,12 +177,68 @@ impl BinaryWhirProfile {
         Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
         Domain: WhirDomain<F, EF>,
     {
+        // A per-round schedule that does not fit these variables falls back to the constant one.
+        if self.round_folds[0] != 0 {
+            let per_round = self.config_exact::<EF, F, Challenger, Domain>(num_variables, domain);
+            if let Err(ProfileError::Schedule(error)) = &per_round {
+                tracing::info!(num_variables, ?error, "per-round folds do not fit: constant schedule");
+                let constant = Self { round_folds: [0; 8], rate_bumps: 0, ..*self };
+                return constant.config_exact(num_variables, domain);
+            }
+            tracing::info!(num_variables, folds = ?self.round_folds, "per-round folds");
+            return per_round;
+        }
+        self.config_exact(num_variables, domain)
+    }
+
+    fn config_exact<EF, F, Challenger, Domain>(
+        &self,
+        num_variables: usize,
+        domain: &Domain,
+    ) -> Result<WhirConfig<EF, F, Challenger>, ProfileError>
+    where
+        F: Field,
+        EF: ExtensionField<F>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+        Domain: WhirDomain<F, EF>,
+    {
+        let folding_factor = if self.round_folds[0] != 0 {
+            FoldingFactor::PerRound(
+                self.round_folds
+                    .iter()
+                    .take_while(|&&fold| fold != 0)
+                    .map(|&fold| usize::from(fold))
+                    .collect(),
+            )
+        } else if self.first_folding_factor == 0
+            || self.first_folding_factor == self.folding_factor
+        {
+            FoldingFactor::Constant(self.folding_factor)
+        } else {
+            FoldingFactor::ConstantFromSecondRound(self.first_folding_factor, self.folding_factor)
+        };
+        let round_log_inv_rates = if self.rate_bumps == 0 {
+            Vec::new()
+        } else {
+            let schedule = folding_factor
+                .compute_folding_schedule(num_variables)
+                .map_err(|error| ProfileError::Schedule(error.into()))?;
+            let mut rate = self.starting_log_inv_rate;
+            schedule[..schedule.len() - 1]
+                .iter()
+                .enumerate()
+                .map(|(round, &factor)| {
+                    rate += factor - 1 + ((self.rate_bumps >> round) & 1) as usize;
+                    rate
+                })
+                .collect()
+        };
         let mut pow_bits = 0;
         loop {
             let parameters = ProtocolParameters {
                 starting_log_inv_rate: self.starting_log_inv_rate,
-                round_log_inv_rates: Vec::new(),
-                folding_factor: FoldingFactor::Constant(self.folding_factor),
+                round_log_inv_rates: round_log_inv_rates.clone(),
+                folding_factor: folding_factor.clone(),
                 soundness_type: self.assumption,
                 security_level: self.security_level,
                 pow_bits,
@@ -193,6 +281,32 @@ mod tests {
     const SECURITY_LEVEL: usize = 100;
     const LOG_INV_RATE: usize = 2;
     const FOLDING: usize = 3;
+
+    #[test]
+    fn per_round_folds_shape_the_rounds_and_fall_back_when_they_do_not_fit() {
+        // whir-gc experiment: the level-4 schedule, 23 packed variables at 1/1024.
+        let profile = BinaryWhirProfile::proven_list_decoding(108, 10, 5)
+            .with_round_folds([4, 5, 4, 4, 0, 0, 0, 0], 1);
+        let config = profile
+            .config::<EF, EF, MyChallenger, _>(23, &BooleanWhirDomain::default())
+            .unwrap();
+        let rounds: alloc::vec::Vec<(usize, usize)> = config
+            .round_parameters()
+            .iter()
+            .map(|round| (round.folding_factor, round.log_inv_rate))
+            .collect();
+        assert_eq!(rounds, [(4, 14), (5, 18), (4, 21)]);
+        // Three variables cannot take these folds: the constant schedule is used instead.
+        let small = BinaryWhirProfile::unique_decoding(SECURITY_LEVEL, LOG_INV_RATE, FOLDING)
+            .with_round_folds([4, 5, 4, 4, 0, 0, 0, 0], 1);
+        let fallback = small
+            .config::<EF, EF, MyChallenger, _>(NUM_VARIABLES, &BooleanWhirDomain::default())
+            .unwrap();
+        let constant = BinaryWhirProfile::unique_decoding(SECURITY_LEVEL, LOG_INV_RATE, FOLDING)
+            .config::<EF, EF, MyChallenger, _>(NUM_VARIABLES, &BooleanWhirDomain::default())
+            .unwrap();
+        assert_eq!(fallback.round_parameters().len(), constant.round_parameters().len());
+    }
 
     #[test]
     fn a_schedule_that_opens_no_position_is_refused() {

@@ -162,7 +162,8 @@ impl<'a, F: Field> RadixFourBatch<'a, F> {
         Self { states }
     }
 
-    /// Computes one degree-five batched sumcheck message.
+    /// Computes one batched sumcheck message: `h`, the degree-four round polynomial
+    /// without its eq factor (whir-gc experiment), at nodes 0, 2, 3, 4.
     pub(super) fn round(
         &self,
         equality: &[F],
@@ -173,7 +174,7 @@ impl<'a, F: Field> RadixFourBatch<'a, F> {
         debug_assert_eq!(equality.len(), logical_len);
 
         // Node one is omitted because the running sum reconstructs it.
-        let nodes = [0, 2, 3, 4, 5].map(F::interpolation_node);
+        let nodes = [0, 2, 3, 4].map(F::interpolation_node);
         let rows = logical_len / 2;
 
         // Each chunk of rows sums its own message; the chunks' messages are added at the end.
@@ -182,10 +183,9 @@ impl<'a, F: Field> RadixFourBatch<'a, F> {
             .map(|chunk| {
                 let mut evaluations = [F::ZERO; ROUND_POLY_LEN];
                 for row in chunk * ROUND_CHUNK..((chunk + 1) * ROUND_CHUNK).min(rows) {
-                    let eq_zero = equality[2 * row];
-                    let eq_one = equality[2 * row + 1];
+                    // The two weights of a pair are eq_rest (1 - r_k) and eq_rest r_k.
+                    let eq_value = equality[2 * row] + equality[2 * row + 1];
                     for (node_index, node) in nodes.into_iter().enumerate() {
-                        let eq_value = interpolate_pair([eq_zero, eq_one], node);
                         let mut power = F::ONE;
                         let mut batched_product = F::ZERO;
                         for state in &self.states {

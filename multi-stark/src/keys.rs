@@ -72,6 +72,12 @@ impl AirShape {
 }
 
 impl<C: MultiStarkConfig> ProvingKey<C> {
+    /// whir-gc experiment: the committed preprocessed data, when an AIR declares any.
+    #[must_use]
+    pub fn preprocessed_prover_data(&self) -> Option<&ProverData<C>> {
+        self.preprocessed.as_ref().map(|data| &data.prover_data)
+    }
+
     /// Whether this key can have come from `setup` over `airs`, in this order.
     ///
     /// The count, every width and every public-value count are compared on each call.

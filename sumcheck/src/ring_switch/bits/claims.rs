@@ -94,7 +94,7 @@ use super::reduction::{
 use super::tensor::BitTensor;
 use super::transcript::{
     BitRingSwitchClaimsProverTranscript, BitRingSwitchClaimsShape,
-    BitRingSwitchClaimsVerifierTranscript, ClaimStatement, ClaimsDraws,
+    BitRingSwitchClaimsVerifierTranscript, ClaimStatement, ClaimsDraws, TranscriptWidth,
 };
 use crate::data::SumcheckData;
 use crate::strategy::{Basis, FromTable, IntoTranscriptField, ReprSumcheckProver, VariableOrder};
@@ -194,7 +194,41 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitchClaims<
     fn shape(&self) -> BitRingSwitchClaimsShape {
         BitRingSwitchClaimsShape {
             claims: self.reductions.iter().map(BitRingSwitch::shape).collect(),
+            merged: self.merged(),
         }
+    }
+
+    /// Whether the claims send one tensor between them: at least two claims,
+    /// none with a successor view, all sharing the coordinates an element
+    /// absorbs (so one column weighing serves them all).
+    ///
+    /// # Merged claims
+    ///
+    /// Claim `i` sends `s_i = sum_w eq_i(w) ⊗ t'(w)`, its weight on the first
+    /// leg.  After every point (and reading) is bound, `mu` is drawn and one
+    /// element goes on the wire:
+    ///
+    /// ```text
+    ///     T = sum_i (mu^i ⊗ 1) s_i         columns: sum_i mu^i col_v(s_i)
+    ///     sum_v eq_low[v] col_v(T)  =  sum_i mu^i reading_i
+    /// ```
+    ///
+    /// The rows of `T` are those of the element of the weight
+    /// `W(w) = sum_i mu^i eq_i(w)`, so one sumcheck against the weight
+    /// multilinear of `W` ties them to the packing, `r''` drawn after `T` is
+    /// bound.  A wrong reading survives only if `sum_i mu^i err_i = 0`, at most
+    /// `(k - 1) / |EF|`, the same term `lambda` adds to an unmerged batch.
+    fn merged(&self) -> bool {
+        let absorbed = |reduction: &BitRingSwitch<F, EF>| {
+            let point = reduction.point().as_slice();
+            point[point.len() - BitRingSwitch::<F, EF>::ABSORBED..].to_vec()
+        };
+        self.reductions.len() >= 2
+            && self.reductions.iter().all(|reduction| !reduction.has_successor_view())
+            && self
+                .reductions
+                .iter()
+                .all(|reduction| absorbed(reduction) == absorbed(&self.reductions[0]))
     }
 
     /// The leading Boolean coordinates every claim shares, and the slot address they spell.
@@ -267,6 +301,42 @@ where
             .collect()
     }
 
+    /// How many elements a proof of this batch sends: one when merged, else one per claim.
+    #[must_use]
+    pub fn elements_sent(&self) -> usize {
+        if self.merged() { 1 } else { self.reductions.len() }
+    }
+
+    /// [`Self::prove`], with each claim's current reading as well.
+    ///
+    /// A merged proof sends no element per claim, so the readings come from here.
+    #[allow(clippy::type_complexity)]
+    pub fn prove_with_readings<R, Challenger, S>(
+        &self,
+        packing: &BitPacking<F, S>,
+        challenger: &mut Challenger,
+    ) -> (BitRingSwitchClaimsProof<F, EF>, Point<EF>, EF, Vec<EF>)
+    where
+        F: Send + Sync,
+        EF: Send + Sync,
+        R: IntoTranscriptField<EF> + FromTable<F> + Sync,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+        S: Borrow<[F]>,
+    {
+        if self.merged() {
+            tracing::info!(claims = self.reductions.len(), "bit ring switch claims merged");
+            return self.prove_merged::<R, _, _>(packing, challenger);
+        }
+        let (proof, point, value) = self.prove::<R, _, _>(packing, challenger);
+        let readings = self
+            .reductions
+            .iter()
+            .zip(&proof.claims)
+            .map(|(reduction, claim)| reduction.incoming_claim(&claim.tensor))
+            .collect();
+        (proof, point, value, readings)
+    }
+
     /// Reduce every claim to one claim about the packing, at one point.
     ///
     /// # The field the rounds run in
@@ -297,6 +367,16 @@ where
         if let [reduction] = self.reductions.as_slice() {
             let (proof, point, value) = reduction.prove::<R, _, _>(packing, challenger);
             return (BitRingSwitchClaimsProof::of_single(proof), point, value);
+        }
+        tracing::info!(
+            claims = self.reductions.len(),
+            successor_views = self.reductions.iter().filter(|r| r.has_successor_view()).count(),
+            merged = self.merged(),
+            "bit ring switch claims"
+        );
+        if self.merged() {
+            let (proof, point, value, _) = self.prove_merged::<R, _, _>(packing, challenger);
+            return (proof, point, value);
         }
 
         let num_variables = self.num_variables();
@@ -407,6 +487,9 @@ where
     where
         Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
     {
+        if self.merged() {
+            return self.verify_merged(proof, readings, challenger);
+        }
         let expected = self.reductions.len();
         if let Some(actual) = [proof.claims.len(), readings.len()]
             .into_iter()
@@ -488,6 +571,213 @@ where
             return Err(BitRingSwitchProofError::FinalCheck);
         }
 
+        Ok((self.restore_prefix(prefix, &r_prime), proof.final_eval))
+    }
+
+    /// The merged batch's prover: one tensor for every claim (see [`Self::merged`]).
+    ///
+    /// Also returns each claim's current reading, read off its own element.
+    #[allow(clippy::type_complexity)]
+    fn prove_merged<R, Challenger, S>(
+        &self,
+        packing: &BitPacking<F, S>,
+        challenger: &mut Challenger,
+    ) -> (BitRingSwitchClaimsProof<F, EF>, Point<EF>, EF, Vec<EF>)
+    where
+        F: Send + Sync,
+        EF: Send + Sync,
+        R: IntoTranscriptField<EF> + FromTable<F> + Sync,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+        S: Borrow<[F]>,
+    {
+        let num_variables = self.num_variables();
+        assert_eq!(
+            packing.num_variables(),
+            num_variables,
+            "the packing must have the {num_variables} variables the evaluation points leave"
+        );
+        let supports = self
+            .reductions
+            .iter()
+            .map(BitRingSwitch::support)
+            .collect::<Vec<_>>();
+        let elements = supports
+            .iter()
+            .map(|(_, offset, equality)| BitRingSwitch::tensor_over(packing, *offset, equality))
+            .collect::<Vec<_>>();
+
+        let readings = self
+            .reductions
+            .iter()
+            .zip(&elements)
+            .map(|(reduction, element)| reduction.incoming_claim(element))
+            .collect::<Vec<_>>();
+
+        let mut transcript =
+            BitRingSwitchClaimsProverTranscript::<Challenger, F, EF>::new(challenger, self.shape());
+        let points = self.reductions.iter().map(BitRingSwitch::point).collect::<Vec<_>>();
+        let mu = transcript.merged_points(&points);
+        let weights = claim_weights(mu, self.reductions.len());
+        let mut tensor = BitTensor::zero();
+        for (element, &weight) in elements.iter().zip(&weights) {
+            tensor.add_scaled_columns(element, weight);
+        }
+        let batching_point = transcript.merged_rows(tensor.rows());
+        let batches = self
+            .reductions
+            .iter()
+            .map(|reduction| {
+                reduction
+                    .batch_drawn(&batching_point, None)
+                    .expect("a merged batch sends no successor elements")
+            })
+            .collect::<Vec<_>>();
+
+        // The weight multilinear of W = sum_i mu^i eq_i, each claim on its sub-slot.
+        let (prefix, address) = self.common_prefix();
+        let rounds = num_variables - prefix;
+        let slot = 1usize << rounds;
+        let slot_offset = address * slot;
+        let mut table = Poly::<R>::zero(rounds);
+        for ((batch, (_, offset, equality)), &weight) in batches.iter().zip(&supports).zip(&weights)
+        {
+            let claim_weights = batch.weights_over::<R>(&equality.scaled(weight));
+            let start = offset - slot_offset;
+            table.as_mut_slice()[start..start + claim_weights.num_evals()]
+                .par_iter_mut()
+                .zip(claim_weights.as_slice().par_iter())
+                .for_each(|(entry, &value)| *entry += value);
+        }
+        let initial_sum = batches[0].initial_sum(&tensor, None);
+
+        let mut prover = ReprSumcheckProver::<F, EF, R>::from_repr_tables(
+            VariableOrder::Prefix,
+            slot_packing(packing, slot_offset, slot),
+            table,
+            initial_sum,
+        );
+        let mut sumcheck = SumcheckData::default();
+        let r_prime = transcript.batched_sumcheck(|challenger| {
+            prover.compute_sumcheck_polynomials(&mut sumcheck, challenger, rounds, 0)
+        });
+        let final_eval = prover.evals().as_slice()[0].into_transcript();
+        transcript.surviving_claim(final_eval);
+        transcript.finish();
+
+        (
+            BitRingSwitchClaimsProof {
+                claims: alloc::vec![ClaimElements {
+                    tensor,
+                    successor: None,
+                }],
+                sumcheck,
+                final_eval,
+            },
+            self.restore_prefix(prefix, &r_prime),
+            final_eval,
+            readings,
+        )
+    }
+
+    /// The merged batch's verifier (see [`Self::merged`]).
+    fn verify_merged<Challenger>(
+        &self,
+        proof: &BitRingSwitchClaimsProof<F, EF>,
+        readings: &[(Option<EF>, Option<EF>)],
+        challenger: &mut Challenger,
+    ) -> Result<(Point<EF>, EF), BitRingSwitchProofError>
+    where
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        let expected = self.reductions.len();
+        if readings.len() != expected {
+            return Err(BitRingSwitchProofError::ClaimCount {
+                expected,
+                actual: readings.len(),
+            });
+        }
+        let [claim] = proof.claims.as_slice() else {
+            return Err(BitRingSwitchProofError::ClaimCount {
+                expected: 1,
+                actual: proof.claims.len(),
+            });
+        };
+        if !claim.tensor.is_well_formed() {
+            return Err(TranscriptWidth::TensorRows {
+                expected: BitTensor::<EF, F>::DIMENSION,
+                actual: claim.tensor.rows().len(),
+            }
+            .into());
+        }
+        if claim.successor.is_some() {
+            return Err(TranscriptWidth::successor_elements(false, true).into());
+        }
+        let mut current = Vec::with_capacity(expected);
+        for &(reading, next) in readings {
+            match (reading, next) {
+                (_, Some(_)) => return Err(BitRingSwitchProofError::NoSuccessorView),
+                (None, None) => return Err(BitRingSwitchProofError::NoReading),
+                (Some(reading), None) => current.push(reading),
+            }
+        }
+        check_no_grinding(&proof.sumcheck)?;
+
+        let (prefix, _) = self.common_prefix();
+        let rounds = self.num_variables() - prefix;
+        let mut transcript = BitRingSwitchClaimsVerifierTranscript::<Challenger, F, EF>::new(
+            challenger,
+            self.shape(),
+        );
+        let points = self.reductions.iter().map(BitRingSwitch::point).collect::<Vec<_>>();
+        let mu = transcript.merged_points(&points)?;
+        let weights = claim_weights(mu, expected);
+
+        // The one element's columns, weighed back together, are the weighted readings.
+        let weighted: EF = current.iter().zip(&weights).map(|(&reading, &weight)| weight * reading).sum();
+        if self.reductions[0].incoming_claim(&claim.tensor) != weighted {
+            transcript.abort();
+            return Err(BitRingSwitchProofError::ClaimMismatch);
+        }
+        let batching_point = transcript.merged_rows(claim.tensor.rows());
+        let batches = self
+            .reductions
+            .iter()
+            .map(|reduction| {
+                reduction
+                    .batch_drawn(&batching_point, None)
+                    .expect("a merged batch sends no successor elements")
+            })
+            .collect::<Vec<_>>();
+
+        // The starting sum is derived from the element's rows, never taken from the prover.
+        let mut sum = batches[0].initial_sum(&claim.tensor, None);
+        let replay = transcript.batched_sumcheck(|challenger| {
+            proof
+                .sumcheck
+                .verify_rounds(challenger, &mut sum, rounds, 0, Basis::Evaluation)
+        });
+        let r_prime = match replay {
+            Ok(point) => point,
+            Err(error) => {
+                transcript.abort();
+                return Err(error.into());
+            }
+        };
+        transcript.surviving_claim(proof.final_eval);
+        transcript.finish();
+
+        // The rounds close on the weight multilinear of W at r', times the surviving value.
+        let mut closing = EF::ZERO;
+        for ((reduction, batch), &weight) in self.reductions.iter().zip(&batches).zip(&weights) {
+            let own = reduction.fixed_prefix().0 - prefix;
+            let (selected, rest) = r_prime.as_slice().split_at(own);
+            let gate = boolean_equality(&reduction.high()[prefix..prefix + own], selected);
+            let inside = batch.closing_weight_scaled(&Point::new(rest.to_vec()), weight)?;
+            closing += gate * inside;
+        }
+        if sum != closing * proof.final_eval {
+            return Err(BitRingSwitchProofError::FinalCheck);
+        }
         Ok((self.restore_prefix(prefix, &r_prime), proof.final_eval))
     }
 
@@ -810,6 +1100,149 @@ mod tests {
         assert_eq!(proof.sumcheck.num_rounds(), 10 - ABSORBED);
     }
 
+    /// Claims whose points share the coordinates an element absorbs, the rest per claim.
+    fn sharing_low(rng: &mut SmallRng, prefixes: &[Vec<bool>], num_variables: usize) -> Vec<Claim> {
+        let low = Point::<EF>::rand(rng, ABSORBED);
+        prefixes
+            .iter()
+            .map(|prefix| {
+                let mut point = point_with_prefix(rng, prefix, num_variables).as_slice().to_vec();
+                point[num_variables - ABSORBED..].copy_from_slice(low.as_slice());
+                Claim {
+                    point: Point::new(point),
+                    successor: None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claims_sharing_the_absorbed_coordinates_send_one_element() {
+        // Invariant: one element for the batch, and the surviving claim is true of the packing.
+        let witness = bits(0x3E1, 128);
+        let mut rng = SmallRng::seed_from_u64(0x3E2);
+        let claims = sharing_low(&mut rng, &[vec![], vec![], vec![], vec![]], 10);
+        assert!(batch(&claims).merged());
+        let proof = round_trip(&witness, &claims);
+        assert_eq!(proof.claims.len(), 1);
+        assert_eq!(proof.sumcheck.num_rounds(), 10 - ABSORBED);
+
+        // Column selectors, as a stacked trace reads them: shared and parted prefixes.
+        let claims = sharing_low(
+            &mut rng,
+            &[
+                vec![true, false, true],
+                vec![true, true],
+                vec![true],
+                vec![true, false, true],
+            ],
+            10,
+        );
+        let proof = round_trip(&witness, &claims);
+        assert_eq!(proof.claims.len(), 1);
+        assert_eq!(proof.sumcheck.num_rounds(), 10 - ABSORBED - 1);
+
+        // A successor view, or absorbed coordinates that differ, keep one element per claim.
+        let mut apart = claims.clone();
+        apart[2].successor = Some(3);
+        assert!(!batch(&apart).merged());
+        assert_eq!(round_trip(&witness, &apart).claims.len(), 4);
+        let mut apart = claims;
+        let last = apart[1].point.num_variables() - 1;
+        let mut point = apart[1].point.as_slice().to_vec();
+        point[last] += EF::ONE;
+        apart[1].point = Point::new(point);
+        assert!(!batch(&apart).merged());
+        assert_eq!(round_trip(&witness, &apart).claims.len(), 4);
+    }
+
+    fn merged_batch() -> (Vec<u8>, Vec<Claim>, BitRingSwitchClaimsProof<EF>) {
+        let witness = bits(0x3F1, 128);
+        let mut rng = SmallRng::seed_from_u64(0x3F2);
+        let claims = sharing_low(&mut rng, &[vec![true], vec![false, true], vec![]], 10);
+        let packing = BitPacking::<EF>::new(&witness).unwrap();
+        let (proof, _, _) = batch(&claims).prove::<EF, _, _>(&packing, &mut challenger());
+        (witness, claims, proof)
+    }
+
+    #[test]
+    fn a_merged_batch_rejects_a_false_reading_at_any_point() {
+        let (witness, claims, proof) = merged_batch();
+        let setup = batch(&claims);
+        assert!(
+            setup
+                .verify_readings(&proof, &honest_readings(&claims, &witness), &mut challenger())
+                .is_ok()
+        );
+        for index in 0..claims.len() {
+            let mut readings = honest_readings(&claims, &witness);
+            readings[index].0 = readings[index].0.map(|value| value + EF::ONE);
+            assert_eq!(
+                setup
+                    .verify_readings(&proof, &readings, &mut challenger())
+                    .unwrap_err(),
+                BitRingSwitchProofError::ClaimMismatch,
+                "claim {index}"
+            );
+        }
+
+        // Two errors that cancel unweighted still move the weighted sum.
+        let mut readings = honest_readings(&claims, &witness);
+        readings[0].0 = readings[0].0.map(|value| value + EF::ONE);
+        readings[1].0 = readings[1].0.map(|value| value + EF::ONE);
+        assert!(setup.verify_readings(&proof, &readings, &mut challenger()).is_err());
+
+        // A successor reading the merged batch never sends is refused.
+        let mut readings = honest_readings(&claims, &witness);
+        readings[2].1 = Some(EF::ONE);
+        assert_eq!(
+            setup
+                .verify_readings(&proof, &readings, &mut challenger())
+                .unwrap_err(),
+            BitRingSwitchProofError::NoSuccessorView
+        );
+    }
+
+    #[test]
+    fn a_merged_element_with_a_forged_row_is_rejected() {
+        // Any row moved, the honest readings no longer close: the columns move with it,
+        // or the starting sum does.
+        let (witness, claims, proof) = merged_batch();
+        let setup = batch(&claims);
+        for row in [0, 3, 15] {
+            let mut forged = proof.clone();
+            let mut rows: Vec<EF> = forged.claims[0].tensor.clone().into();
+            rows[row] += EF::ONE;
+            forged.claims[0].tensor = BitTensor::try_from(rows).unwrap();
+            assert!(
+                setup
+                    .verify_readings(&forged, &honest_readings(&claims, &witness), &mut challenger())
+                    .is_err(),
+                "row {row}"
+            );
+        }
+
+        // A tampered surviving value does not close the rounds.
+        let mut forged = proof.clone();
+        forged.final_eval += EF::ONE;
+        assert_eq!(
+            setup
+                .verify_readings(&forged, &honest_readings(&claims, &witness), &mut challenger())
+                .unwrap_err(),
+            BitRingSwitchProofError::FinalCheck
+        );
+
+        // One element per claim, as an unmerged proof sends, is refused.
+        let mut forged = proof;
+        forged.claims = vec![forged.claims[0].clone(); claims.len()];
+        assert!(matches!(
+            setup
+                .verify_readings(&forged, &honest_readings(&claims, &witness), &mut challenger())
+                .unwrap_err(),
+            BitRingSwitchProofError::ClaimCount { .. }
+        ));
+    }
+
     /// Three honest claims, their batch, and the proof it produced.
     fn honest_batch() -> (Vec<u8>, Vec<Claim>, BitRingSwitchClaimsProof<EF>) {
         let witness = bits(0xA1, 64);
@@ -1000,8 +1433,12 @@ mod tests {
         let distinct = [point.clone(), Point::rand(&mut rng, 9)];
         let repeated = [point.clone(), point];
 
-        // Two plain claims at distinct points, then at one point used twice.
-        for points in [distinct, repeated] {
+        // One point used twice merges into one element, which a row error moves alone
+        // (`a_merged_element_with_a_forged_row_is_rejected`).
+        assert!(batch(&repeated.clone().map(|point| Claim { point, successor: None })).merged());
+
+        // Two plain claims at distinct points.
+        for points in [distinct] {
             let claims = points.map(|point| Claim {
                 point,
                 successor: None,

@@ -18,7 +18,7 @@ use super::transcript::{ProductGkrProverTranscript, ProductGkrVerifierTranscript
 use super::{ProductGkrError, ProductGkrShape};
 
 /// Number of transmitted evaluations for a degree-five round polynomial.
-pub(crate) const ROUND_POLY_LEN: usize = 5;
+pub(crate) const ROUND_POLY_LEN: usize = 4;
 
 /// Prover messages for one product-tree layer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,7 +289,8 @@ impl<EF> ProductGkrProof<EF> {
         let mut values = roots.clone();
         let mut point = Vec::with_capacity(shape.log_height);
         let mut inconsistent_layer = None;
-        let interpolator = RoundPolyInterpolator::new(5);
+        // whir-gc experiment: a round sends h, the round polynomial without its eq factor.
+        let interpolator = RoundPolyInterpolator::new(4);
 
         for (layer_index, ((arity, _), layer)) in
             shape.layers().into_iter().zip(&self.layers).enumerate()
@@ -323,9 +324,28 @@ impl<EF> ProductGkrProof<EF> {
                 } => {
                     debug_assert_eq!(arity, 4);
                     let mut round_point = Vec::with_capacity(round_polys.len());
-                    for round_poly in round_polys {
+                    // Round k binds coordinate k of the claim point:
+                    //     g(X) = l(X) h(X),   l(X) = (1 - r_k)(1 - X) + r_k X,
+                    // so h(1) = (s - (1 - r_k) h(0)) / r_k from the running sum s.
+                    let coordinates = &point[..round_polys.len()];
+                    if coordinates.iter().any(|r| r.is_zero()) {
+                        inconsistent_layer.get_or_insert(layer_index);
+                    }
+                    let inverses = p3_field::batch_multiplicative_inverse(
+                        &coordinates
+                            .iter()
+                            .map(|&r| if r.is_zero() { EF::ONE } else { r })
+                            .collect::<Vec<_>>(),
+                    );
+                    for ((round_poly, &r), &r_inverse) in
+                        round_polys.iter().zip(coordinates).zip(&inverses)
+                    {
                         let challenge = transcript.round(round_poly);
-                        running_sum = interpolator.eval(round_poly, running_sum, challenge);
+                        let h0 = round_poly[0];
+                        let h1 = (running_sum - (EF::ONE - r) * h0) * r_inverse;
+                        let at_challenge = interpolator.eval(round_poly, h0 + h1, challenge);
+                        running_sum =
+                            ((EF::ONE - r) * (EF::ONE - challenge) + r * challenge) * at_challenge;
                         round_point.push(challenge);
                     }
                     let expected = Point::eval_eq(&point, &round_point)

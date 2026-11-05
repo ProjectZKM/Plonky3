@@ -15,6 +15,9 @@ criterion.workspace = true
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
+# Proof-of-work search on the GPU through libzkmgrind.so (cuda/zkm_blake3_grind.cu);
+# needs ZKM_GRIND_LIB_DIR at build time. Off by default: grinding runs on the CPU.
+gpu-grind = []
 
 [dependencies]
 p3-blake3.workspace = true

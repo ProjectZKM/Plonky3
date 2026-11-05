@@ -197,6 +197,11 @@ pub(super) struct TableRun {
     pub(super) shape: ColumnBatchShape,
     /// Aligned blocks the table's column slots split into, each one reduction per batch.
     pub(super) blocks: Vec<ColumnBlock>,
+    /// whir-gc experiment: the linear forms sent instead of the columns, empty when
+    /// every column is sent; only a current-row run of one block sends forms.
+    pub(super) forms: Vec<Vec<(usize, u128)>>,
+    /// A right inverse of the forms, one list per column.
+    pub(super) inverse: Vec<Vec<(usize, u128)>>,
 }
 
 /// One aligned run of a table's column slots, read as one claim at a lifted point.
@@ -286,6 +291,18 @@ fn batched_runs(protocol: &OpeningProtocol) -> Option<Vec<TableRun>> {
             }
             _ => {
                 let placement = by_table[table]?;
+                let blocks = column_blocks(placement, shapes[table], arity, used)?;
+                let column_variables = width.next_power_of_two().trailing_zeros() as usize;
+                let spec = protocol.table(table);
+                let packs = !spec.forms().is_empty()
+                    && !next
+                    && blocks.len() == 1
+                    && blocks[0].variables == column_variables;
+                let (forms, inverse) = if packs {
+                    (spec.forms().to_vec(), spec.inverse().to_vec())
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 runs.push(TableRun {
                     table,
                     shape: ColumnBatchShape {
@@ -293,8 +310,11 @@ fn batched_runs(protocol: &OpeningProtocol) -> Option<Vec<TableRun>> {
                         width,
                         num_batches: 1,
                         next,
+                        forms: forms.len(),
                     },
-                    blocks: column_blocks(placement, shapes[table], arity, used)?,
+                    blocks,
+                    forms,
+                    inverse,
                 });
             }
         }
@@ -413,6 +433,111 @@ pub(super) fn column_claims(protocol: &OpeningProtocol) -> Vec<ColumnClaim> {
 /// Values one protocol opens: per batch, its current readings then its successor ones.
 pub(super) fn value_count(protocol: &OpeningProtocol) -> usize {
     protocol.iter_openings().map(|(_, batch)| batch.len()).sum()
+}
+
+/// Values a proof carries on a route: per column, or per batched run's wire layout.
+pub(super) fn wire_value_count(route: &OpeningRoute, protocol: &OpeningProtocol) -> usize {
+    match route {
+        OpeningRoute::Batched(runs) => {
+            let own: usize = runs
+                .iter()
+                .map(|run| run.shape.values_per_batch() * run.shape.num_batches)
+                .sum();
+            // The shared forms sumcheck: two values per round of the widest, one fold per run.
+            let forms_runs = runs.iter().filter(|run| !run.forms.is_empty());
+            let tail = forms_runs
+                .clone()
+                .map(|run| run.shape.column_variables())
+                .max()
+                .map_or(0, |widest| 2 * widest + forms_runs.count());
+            own + tail
+        }
+        OpeningRoute::PerColumn(_) => value_count(protocol),
+    }
+}
+
+/// whir-gc experiment: a coefficient from its coordinate representation.
+pub(super) fn coefficient<EF: BitCoordinates>(repr: u128) -> EF {
+    EF::from_coordinate_bytes(repr.to_le_bytes().into_iter().take(EF::DIMENSION / 8))
+}
+
+/// The forms' values at the columns' values.
+pub(super) fn packed_forms<EF: BitCoordinates + Field>(
+    columns: &[EF],
+    forms: &[Vec<(usize, u128)>],
+) -> Vec<EF> {
+    forms
+        .iter()
+        .map(|form| {
+            form.iter()
+                .map(|&(column, c)| coefficient::<EF>(c) * columns[column])
+                .sum()
+        })
+        .collect()
+}
+
+/// The weight of each column slot under `rho`: `sum_j rho^j` times form `j`'s
+/// coefficient of the column.  Slots past the width weigh nothing.
+pub(super) fn packed_weights<EF: BitCoordinates + Field>(
+    width: usize,
+    forms: &[Vec<(usize, u128)>],
+    rho: EF,
+) -> Vec<EF> {
+    let mut weights = alloc::vec![EF::ZERO; width.next_power_of_two()];
+    let mut power = EF::ONE;
+    for form in forms {
+        for &(column, c) in form {
+            weights[column] += power * coefficient::<EF>(c);
+        }
+        power *= rho;
+    }
+    weights
+}
+
+/// Columns the forms take the values of, through their right inverse.  An AIR
+/// reading the columns only through the forms evaluates them as it would the
+/// committed columns.
+pub(super) fn expand_forms<EF: BitCoordinates + Field>(
+    values: &[EF],
+    inverse: &[Vec<(usize, u128)>],
+) -> Vec<EF> {
+    inverse
+        .iter()
+        .map(|column| {
+            column
+                .iter()
+                // `usize::MAX` is the constant one, for an affine inverse.
+                .map(|&(form, c)| {
+                    coefficient::<EF>(c) * if form == usize::MAX { EF::ONE } else { values[form] }
+                })
+                .sum()
+        })
+        .collect()
+}
+
+/// The per-column values a proof's wire values stand for, in protocol order.
+pub(super) fn column_values<EF: BitCoordinates>(route: &OpeningRoute, values: &[EF]) -> Vec<EF> {
+    let OpeningRoute::Batched(runs) = route else {
+        return values.to_vec();
+    };
+    if runs.iter().all(|run| run.forms.is_empty()) {
+        return values.to_vec();
+    }
+    let mut columns = Vec::with_capacity(values.len());
+    let mut rest = values;
+    for run in runs {
+        let per_batch = run.shape.values_per_batch();
+        for _ in 0..run.shape.num_batches {
+            let (batch, tail) = rest.split_at(per_batch);
+            rest = tail;
+            if run.forms.is_empty() {
+                columns.extend_from_slice(batch);
+            } else {
+                columns.extend(expand_forms(&batch[..run.shape.forms], &run.inverse));
+            }
+        }
+    }
+    columns
 }
 
 /// The per-column claims of one protocol, together with the length of the value run they lay

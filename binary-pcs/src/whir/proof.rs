@@ -31,6 +31,10 @@ pub enum BooleanWhirOpening<F: Field, EF: ExtensionField<F>, MT: Mmcs<F>> {
     Own(PcsProof<F, EF, MT>),
     /// The first side of a pair: the second side's proof carries the shared opening.
     Paired,
+    /// whir-gc experiment: the first side of a pair whose two ring switches ran as one,
+    /// over both packings behind a selector variable; this side's reduction is the joint
+    /// one, the second side's is empty, and the second side carries the shared opening.
+    JointPaired,
     /// The second side of a pair: one opening for both sides' surviving claims.
     Pair(PairProof<F, EF, MT>),
 }
@@ -42,7 +46,7 @@ impl<F: Field, EF: ExtensionField<F>, MT: Mmcs<F>> BooleanWhirOpening<F, EF, MT>
         match self {
             Self::Own(opening) => Some(&opening.whir),
             Self::Pair(pair) => Some(&pair.whir),
-            Self::Paired => None,
+            Self::Paired | Self::JointPaired => None,
         }
     }
 
@@ -51,7 +55,7 @@ impl<F: Field, EF: ExtensionField<F>, MT: Mmcs<F>> BooleanWhirOpening<F, EF, MT>
         match self {
             Self::Own(opening) => Some(&mut opening.whir),
             Self::Pair(pair) => Some(&mut pair.whir),
-            Self::Paired => None,
+            Self::Paired | Self::JointPaired => None,
         }
     }
 }

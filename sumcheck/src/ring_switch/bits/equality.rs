@@ -51,6 +51,16 @@ impl<F: Field> FactoredEquality<F> {
         }
     }
 
+    /// The table times `a`: the outer factor scaled, the inner one kept.
+    #[must_use]
+    pub(crate) fn scaled(&self, a: F) -> Self {
+        let mut outer = self.outer.clone();
+        for entry in outer.as_mut_slice() {
+            *entry *= a;
+        }
+        Self { outer, inner: self.inner.clone() }
+    }
+
     /// Number of variables the table indexes.
     #[must_use]
     pub(crate) fn num_variables(&self) -> usize {

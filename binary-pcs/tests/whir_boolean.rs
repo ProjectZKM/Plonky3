@@ -1151,7 +1151,7 @@ mod pair {
             .map_err(|error| format!("{error:?}"))?;
         assert!(matches!(
             main_proof.opening.opening,
-            BooleanWhirOpening::Paired
+            BooleanWhirOpening::Paired | BooleanWhirOpening::JointPaired
         ));
         assert!(matches!(
             second_proof.opening.opening,

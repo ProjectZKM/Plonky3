@@ -402,6 +402,7 @@ fn forged_successor_proof(
         width,
         num_batches: points.len(),
         next: true,
+        forms: 0,
     };
     let mut transcript = ColumnBatchProverTranscript::new(challenger, batch_shape);
     let mut openings = Vec::with_capacity(points.len());
@@ -870,10 +871,12 @@ fn each_route_emits_the_reductions_its_plan_counts() {
         let proof = scheme
             .open_at(data, &protocol, &points, &mut prover_chal)
             .unwrap();
-        assert_eq!(
-            proof.opening.reduction.claims.len(),
-            route.num_reductions(),
-            "{seed:#x}"
+        // Claims sharing the coordinates an element absorbs merge into one element.
+        let sent = proof.opening.reduction.claims.len();
+        assert!(
+            sent == route.num_reductions() || (sent == 1 && route.num_reductions() > 1),
+            "{seed:#x}: {sent} elements for {} reductions",
+            route.num_reductions()
         );
     }
 }
@@ -1341,7 +1344,8 @@ fn reordered_subset_batches_use_the_fallback_column_route() {
         )
         .unwrap();
     assert_eq!(proof.values.len(), 2);
-    assert_eq!(proof.opening.reduction.claims.len(), 2);
+    // Two claims at one point merge into one element.
+    assert_eq!(proof.opening.reduction.claims.len(), 1);
 
     let mut verifier_chal = challenger();
     scheme.observe_commitment(&commitment, &mut verifier_chal);
@@ -2271,4 +2275,233 @@ fn a_batched_run_over_several_tables_charges_every_block() {
         .find(|term| term.label == "column-batching")
         .unwrap();
     assert!((batching.bits.bits() - (128.0 - 6f64.log2())).abs() < 1e-9);
+}
+
+/// whir-gc experiment: forms reading groups of columns packed, the rest one by one.
+fn group_forms(
+    width: usize,
+    groups: &[(usize, usize)],
+) -> (Vec<Vec<(usize, u128)>>, Vec<Vec<(usize, u128)>>) {
+    let mut forms = Vec::new();
+    let mut inverse = vec![Vec::new(); width];
+    let mut column = 0;
+    for &(first, len) in groups.iter().chain(core::iter::once(&(width, 0))) {
+        for c in column..first {
+            inverse[c] = vec![(forms.len(), 1)];
+            forms.push(vec![(c, 1)]);
+        }
+        if len > 0 {
+            // The group's first column carries the packed value, e_0 being one.
+            inverse[first] = vec![(forms.len(), 1)];
+            forms.push((0..len).map(|k| (first + k, 1u128 << k)).collect());
+        }
+        column = first + len;
+    }
+    (forms, inverse)
+}
+
+/// whir-gc experiment: a table with two packed groups beside a plain table.
+fn packed_fixture() -> (Vec<TableShape>, OpeningProtocol, Vec<Table<EF>>, Vec<Point<EF>>) {
+    let shapes = vec![TableShape::new(8, 16), TableShape::new(6, 3)];
+    let protocol =
+        protocol(&shapes).with_forms(vec![Some(group_forms(16, &[(1, 4), (6, 3)])), None]);
+    let tables = vec![table_with_width(0x9AC1, 8, 16), table_with_width(0x9AC2, 6, 3)];
+    let mut rng = SmallRng::seed_from_u64(0x9AC3);
+    let points = vec![Point::<EF>::rand(&mut rng, 8), Point::rand(&mut rng, 6)];
+    (shapes, protocol, tables, points)
+}
+
+#[test]
+fn coefficients_are_coordinate_representations() {
+    let basis = crate::coordinate_basis::<EF>();
+    for (k, e) in basis.iter().enumerate() {
+        assert_eq!(plan::coefficient::<EF>(1u128 << k), *e);
+    }
+    assert_eq!(plan::coefficient::<EF>(1), EF::ONE);
+}
+
+#[test]
+fn overlapping_forms_open_to_columns_with_the_same_forms() {
+    // Form 0 reads columns 0 and 1, form 1 column 1 scaled by e_1, the rest one by
+    // one: the inverse makes column 0 of both forms.
+    let shape = TableShape::new(7, 8);
+    let e1 = 1u128 << 1;
+    let mut forms = vec![vec![(0, 1), (1, 1)], vec![(1, e1)]];
+    forms.extend((2..8).map(|c| vec![(c, 1)]));
+    let repr = representation(plan::coefficient::<EF>(e1).inverse());
+    let mut inverse = vec![vec![(0, 1), (1, repr)], vec![(1, repr)]];
+    inverse.extend((2..8).map(|c| vec![(c, 1)]));
+    let protocol = protocol(&[shape]).with_forms(vec![Some((forms.clone(), inverse))]);
+    let table = table_with_width(0x9AD1, 7, 8);
+    let point = Point::<EF>::rand(&mut SmallRng::seed_from_u64(0x9AD2), 7);
+    let scheme = pcs(&[shape]);
+    let mut prover_chal = challenger();
+    let (commitment, data) = scheme.commit(vec![table.clone()], &mut prover_chal).unwrap();
+    let proof = scheme
+        .open_at(data, &protocol, core::slice::from_ref(&point), &mut prover_chal)
+        .unwrap();
+    assert_eq!(proof.values.len(), 8 + 2 * 3 + 1);
+    let mut verifier_chal = challenger();
+    scheme.observe_commitment(&commitment, &mut verifier_chal);
+    let evals = scheme
+        .verify_at(&commitment, &proof, &protocol, core::slice::from_ref(&point), &mut verifier_chal)
+        .unwrap();
+    let truth: Vec<EF> = (0..8)
+        .map(|c| Poly::new(table.poly(c).as_slice().to_vec()).eval_base(&point))
+        .collect();
+    let opened = evals[0].current();
+    for form in &forms {
+        let value = |columns: &[EF]| -> EF {
+            form.iter().map(|&(c, k)| plan::coefficient::<EF>(k) * columns[c]).sum()
+        };
+        assert_eq!(value(opened), value(&truth));
+    }
+}
+
+/// The coordinate representation of a field element.
+fn representation(x: EF) -> u128 {
+    u128::from_le_bytes(
+        crate::packing::coordinate_bytes(core::slice::from_ref(&x))
+            .try_into()
+            .expect("sixteen bytes"),
+    )
+}
+
+#[test]
+fn packed_groups_send_one_value_each_and_open_to_columns_that_pack_alike() {
+    let (shapes, protocol, tables, points) = packed_fixture();
+    let scheme = pcs(&shapes);
+    let mut prover_chal = challenger();
+    let (commitment, data) = scheme.commit(tables.clone(), &mut prover_chal).unwrap();
+    let proof = scheme.open_at(data, &protocol, &points, &mut prover_chal).unwrap();
+    // Eleven forms (the nine columns outside the groups and two groups), four column
+    // rounds of two, one fold; then the plain table's three values.
+    assert_eq!(proof.values.len(), 11 + 2 * 4 + 1 + 3);
+
+    let mut verifier_chal = challenger();
+    scheme.observe_commitment(&commitment, &mut verifier_chal);
+    let evals = scheme
+        .verify_at(&commitment, &proof, &protocol, &points, &mut verifier_chal)
+        .unwrap();
+    assert_eq!(
+        p3_challenger::CanSample::<EF>::sample(&mut prover_chal),
+        p3_challenger::CanSample::<EF>::sample(&mut verifier_chal)
+    );
+    let basis = crate::coordinate_basis::<EF>();
+    let truth = |table: usize, column: usize| {
+        Poly::new(tables[table].poly(column).as_slice().to_vec()).eval_base(&points[table])
+    };
+    let opened = evals[0].current();
+    for column in [0, 5, 9, 10, 15] {
+        assert_eq!(opened[column], truth(0, column), "column {column}");
+    }
+    for (first, len) in [(1usize, 4usize), (6, 3)] {
+        let packed_opened: EF = (0..len).map(|k| basis[k] * opened[first + k]).sum();
+        let packed_truth: EF = (0..len).map(|k| basis[k] * truth(0, first + k)).sum();
+        assert_eq!(packed_opened, packed_truth, "group at {first}");
+    }
+    for column in 0..3 {
+        assert_eq!(evals[1].current()[column], truth(1, column));
+    }
+}
+
+#[test]
+fn every_packed_wire_value_is_checked() {
+    let (shapes, protocol, tables, points) = packed_fixture();
+    let scheme = pcs(&shapes);
+    let mut prover_chal = challenger();
+    let (commitment, data) = scheme.commit(tables.clone(), &mut prover_chal).unwrap();
+    let proof = scheme.open_at(data, &protocol, &points, &mut prover_chal).unwrap();
+    for index in 0..proof.values.len() {
+        let mut tampered = proof.clone();
+        tampered.values[index] += EF::ONE;
+        let mut verifier_chal = challenger();
+        scheme.observe_commitment(&commitment, &mut verifier_chal);
+        assert!(
+            scheme
+                .verify_at(&commitment, &tampered, &protocol, &points, &mut verifier_chal)
+                .is_err(),
+            "value {index}"
+        );
+    }
+
+    // A proof made without packing does not verify against the packed protocol.
+    let plain = OpeningProtocol::new(
+        shapes
+            .iter()
+            .map(|&shape| {
+                TableSpec::new(shape, vec![OpeningBatch::new((0..shape.width()).collect(), Vec::new())])
+            })
+            .collect(),
+    );
+    let mut prover_chal = challenger();
+    let (commitment, data) = scheme.commit(tables, &mut prover_chal).unwrap();
+    let unpacked = scheme.open_at(data, &plain, &points, &mut prover_chal).unwrap();
+    let mut verifier_chal = challenger();
+    scheme.observe_commitment(&commitment, &mut verifier_chal);
+    assert!(
+        scheme
+            .verify_at(&commitment, &unpacked, &protocol, &points, &mut verifier_chal)
+            .is_err()
+    );
+}
+
+#[test]
+fn forms_tables_of_different_widths_share_one_sumcheck() {
+    // A 16-wide and an 8-wide forms table and a plain one: one sumcheck over four column
+    // variables, the narrower table read at the last three; an affine inverse on the second.
+    let shapes = vec![TableShape::new(8, 16), TableShape::new(7, 8), TableShape::new(6, 3)];
+    let (second_forms, mut second_inverse) = group_forms(8, &[(2, 4)]);
+    // Column 7 is read as the constant one plus form 5 (column 7 itself): rebuilt as
+    // 1 + value, compared below on the forms only.
+    second_inverse[7].push((usize::MAX, 0));
+    let protocol = protocol(&shapes).with_forms(vec![
+        Some(group_forms(16, &[(1, 4), (6, 3)])),
+        Some((second_forms.clone(), second_inverse)),
+        None,
+    ]);
+    let tables = vec![
+        table_with_width(0x9AE1, 8, 16),
+        table_with_width(0x9AE2, 7, 8),
+        table_with_width(0x9AE3, 6, 3),
+    ];
+    let mut rng = SmallRng::seed_from_u64(0x9AE4);
+    let points = vec![
+        Point::<EF>::rand(&mut rng, 8),
+        Point::rand(&mut rng, 7),
+        Point::rand(&mut rng, 6),
+    ];
+    let scheme = pcs(&shapes);
+    let mut prover_chal = challenger();
+    let (commitment, data) = scheme.commit(tables.clone(), &mut prover_chal).unwrap();
+    let proof = scheme.open_at(data, &protocol, &points, &mut prover_chal).unwrap();
+    // 11 and 5 forms, the plain table's 3 values, 2 x 4 shared rounds and two folds.
+    assert_eq!(proof.values.len(), 11 + 5 + 3 + 2 * 4 + 2);
+    let mut verifier_chal = challenger();
+    scheme.observe_commitment(&commitment, &mut verifier_chal);
+    let evals = scheme
+        .verify_at(&commitment, &proof, &protocol, &points, &mut verifier_chal)
+        .unwrap();
+    let truth = |table: usize, column: usize| {
+        Poly::new(tables[table].poly(column).as_slice().to_vec()).eval_base(&points[table])
+    };
+    let opened = evals[1].current();
+    for form in &second_forms {
+        let value = |columns: &dyn Fn(usize) -> EF| -> EF {
+            form.iter().map(|&(c, k)| plan::coefficient::<EF>(k) * columns(c)).sum()
+        };
+        assert_eq!(value(&|c| opened[c]), value(&|c| truth(1, c)));
+    }
+    for index in 0..proof.values.len() {
+        let mut tampered = proof.clone();
+        tampered.values[index] += EF::ONE;
+        let mut verifier_chal = challenger();
+        scheme.observe_commitment(&commitment, &mut verifier_chal);
+        assert!(
+            scheme
+                .verify_at(&commitment, &tampered, &protocol, &points, &mut verifier_chal)
+                .is_err(),
+            "value {index}"
+        );
+    }
 }

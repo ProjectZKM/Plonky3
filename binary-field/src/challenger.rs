@@ -229,6 +229,13 @@ where
     }
 }
 
+#[cfg(feature = "gpu-grind")]
+unsafe extern "C" {
+    /// GPU proof-of-work search (zkm_blake3_grind.cu): 0 and the candidate
+    /// index in `out` when found, nonzero when it declines.
+    fn zkm_blake3_grind(pending: *const u8, len: usize, bits: u32, out: *mut u64) -> i32;
+}
+
 /// The `index`-th grinding candidate: the element whose low bytes are those of `index`.
 ///
 /// This is injective on the candidate range of every level: narrower levels stop before the
@@ -298,6 +305,27 @@ where
         } else {
             1u64 << F::bits()
         };
+
+        // GPU grinding (`gpu-grind` feature): the zkm_blake3_grind library finds a
+        // candidate over the same Blake3 transcript, or declines (CPU below).
+        #[cfg(feature = "gpu-grind")]
+        if F::bits() >= u64::BITS as usize {
+            if let Some(transcript) =
+                (&self.inner as &dyn Any).downcast_ref::<HashChallenger<u8, Blake3, 32>>()
+            {
+                let pending = transcript.pending_input();
+                let mut index = 0u64;
+                // SAFETY: the library reads `len` bytes from `pending` and writes one u64.
+                let declined = unsafe {
+                    zkm_blake3_grind(pending.as_ptr(), pending.len(), bits as u32, &mut index)
+                };
+                if declined == 0 {
+                    let witness = candidate::<F>(index);
+                    assert!(self.check_witness(bits, witness), "GPU grind witness fails the CPU check");
+                    return witness;
+                }
+            }
+        }
 
         let witness = if let Some(pending) = blake3_pending(&self.inner) {
             (0..num_candidates)

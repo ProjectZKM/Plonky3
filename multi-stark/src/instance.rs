@@ -189,6 +189,16 @@ impl<P> OpeningSchedule<P> {
         }
     }
 
+    /// whir-gc experiment: the linear forms each table's columns are read through.
+    pub(super) fn with_forms(self, forms: Vec<Option<p3_air::LinearForms>>) -> Self {
+        Self {
+            protocol: self
+                .protocol
+                .with_forms(forms.into_iter().map(|f| f.map(|f| (f.forms, f.inverse))).collect()),
+            payloads: self.payloads,
+        }
+    }
+
     /// Shape agreement to hand the commitment scheme.
     pub(super) const fn protocol(&self) -> &OpeningProtocol {
         &self.protocol
@@ -643,7 +653,15 @@ where
             }
         }
 
-        OpeningSchedule::new(tables)
+        // A table opened only by its AIR batch may send its linear forms.
+        let forms = tables
+            .iter()
+            .zip(self.airs())
+            .map(|((_, openings), air)| {
+                if openings.len() == 1 { air.main_linear_forms() } else { None }
+            })
+            .collect();
+        OpeningSchedule::new(tables).with_forms(forms)
     }
 
     /// Schedule the preprocessed trace opening, in the order the scheme walks the batches.
@@ -710,7 +728,19 @@ where
             }
         }
 
-        OpeningSchedule::new(tables)
+        // A table opened only by its AIR batch may send its linear forms.
+        let forms = tables
+            .iter()
+            .zip(&committed)
+            .map(|((_, openings), &air)| {
+                if openings.len() == 1 {
+                    self.0[air].air.preprocessed_linear_forms()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        OpeningSchedule::new(tables).with_forms(forms)
     }
 
     pub(super) fn preprocessed_next_columns(&self) -> Vec<Vec<usize>> {

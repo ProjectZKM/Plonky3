@@ -17,6 +17,11 @@ const POINT: &str = "row_point";
 const VALUES: &str = "column_values";
 const NEXT_VALUES: &str = "next_column_values";
 const COLUMN_POINT: &str = "column_point";
+const PACKING_WEIGHT: &str = "packing_weight";
+const COLUMN_ROUND: &str = "column_round";
+const COLUMN_CHALLENGE: &str = "column_challenge";
+const FOLDED_COLUMNS: &str = "folded_columns";
+const PACKED_LABEL: &[u8] = b"packed";
 const SUCCESSOR_LABEL: &[u8] = b"successor";
 
 type Alphabet<F> = FieldUnit<F>;
@@ -32,6 +37,11 @@ pub(crate) struct ColumnBatchShape {
     pub(crate) width: usize,
     pub(crate) num_batches: usize,
     pub(crate) next: bool,
+    /// whir-gc experiment: values a batch sends when its columns are read through linear
+    /// forms, zero when every column is sent.  Such a batch binds its row point and its
+    /// forms; one sumcheck shared by every such run (see [`FormsSumcheckShape`]) then
+    /// reduces all their forms to one fold of each table's columns.
+    pub(crate) forms: usize,
 }
 
 impl ColumnBatchShape {
@@ -44,9 +54,9 @@ impl ColumnBatchShape {
         1 + usize::from(self.next)
     }
 
-    /// Values each batch carries: the whole width once per view.
+    /// Values each batch carries: the whole width once per view, or its forms.
     pub(crate) fn values_per_batch(self) -> usize {
-        self.width * self.num_views()
+        if self.forms > 0 { self.forms } else { self.width * self.num_views() }
     }
 
     fn pattern<F, EF>(self) -> InteractionPattern
@@ -56,6 +66,23 @@ impl ColumnBatchShape {
     {
         let per_batch = 3 + usize::from(self.next);
         let mut steps = Vec::with_capacity(self.num_batches * per_batch);
+        if self.forms > 0 {
+            for _ in 0..self.num_batches {
+                steps.push(Interaction::algebra::<F, EF>(
+                    Hierarchy::Atomic,
+                    Kind::Message,
+                    POINT,
+                    Length::Fixed(self.table_variables),
+                ));
+                steps.push(Interaction::algebra::<F, EF>(
+                    Hierarchy::Atomic,
+                    Kind::Message,
+                    VALUES,
+                    Length::Fixed(self.forms),
+                ));
+            }
+            return InteractionPattern::new(steps).expect("flat forms transcript is valid");
+        }
         for _ in 0..self.num_batches {
             steps.push(Interaction::algebra::<F, EF>(
                 Hierarchy::Atomic,
@@ -100,6 +127,9 @@ impl ColumnBatchShape {
         // A run reading one row ahead carries its own label, so the two seeds part.
         if self.next {
             separator.instance(SUCCESSOR_LABEL);
+        }
+        if self.forms > 0 {
+            separator.instance(PACKED_LABEL).instance(&(self.forms as u64).to_be_bytes());
         }
         separator
     }
@@ -150,6 +180,15 @@ where
             .into_iter()
             .map(|coordinate| coordinate.into_inner());
         Point::new(coordinates.collect())
+    }
+
+    /// Bind a forms batch's row point and forms.
+    pub(crate) fn bind_forms(&mut self, point: &Point<EF>, forms: &[EF]) {
+        debug_assert_eq!(forms.len(), self.shape.forms);
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(POINT, point.as_slice());
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(VALUES, forms);
     }
 
     pub(crate) fn finish(self) {
@@ -212,10 +251,190 @@ where
         Ok(Point::new(coordinates.collect()))
     }
 
+    /// Bind a forms batch's row point and forms.
+    pub(crate) fn bind_forms(
+        &mut self,
+        point: &Point<EF>,
+        forms: &[EF],
+    ) -> Result<(), p3_challenger::fs::TranscriptError> {
+        debug_assert_eq!(forms.len(), self.shape.forms);
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(POINT, point.as_slice())?;
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(VALUES, forms)?;
+        Ok(())
+    }
+
     pub(crate) fn finish(self) {
         self.state
             .finalize()
             .expect("column-batching transcript is complete");
+    }
+}
+
+const FORMS_NAME: &[u8] = b"p3-boolean-trace-forms-sumcheck";
+
+/// whir-gc experiment: the one sumcheck every forms batch of an opening shares.
+///
+/// Every forms batch has bound its row point and forms in its own run's transcript.
+/// This one draws the weight `rho` over all their forms in run order, runs one degree-two
+/// sumcheck over the widest table's column variables (each table's slots zero above its
+/// own width, so it reads the trailing coordinates), and binds each table's fold.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FormsSumcheckShape {
+    pub(crate) column_variables: usize,
+    pub(crate) tables: usize,
+}
+
+impl FormsSumcheckShape {
+    fn pattern<F, EF>(self) -> InteractionPattern
+    where
+        F: TranscriptField,
+        EF: Field + AlgebraIdentity<F>,
+    {
+        let mut steps = Vec::with_capacity(2 + 2 * self.column_variables);
+        steps.push(Interaction::algebra::<F, EF>(
+            Hierarchy::Atomic,
+            Kind::Challenge,
+            PACKING_WEIGHT,
+            Length::Scalar,
+        ));
+        for _ in 0..self.column_variables {
+            steps.push(Interaction::algebra::<F, EF>(
+                Hierarchy::Atomic,
+                Kind::Message,
+                COLUMN_ROUND,
+                Length::Fixed(2),
+            ));
+            steps.push(Interaction::algebra::<F, EF>(
+                Hierarchy::Atomic,
+                Kind::Challenge,
+                COLUMN_CHALLENGE,
+                Length::Scalar,
+            ));
+        }
+        steps.push(Interaction::algebra::<F, EF>(
+            Hierarchy::Atomic,
+            Kind::Message,
+            FOLDED_COLUMNS,
+            Length::Fixed(self.tables),
+        ));
+        InteractionPattern::new(steps).expect("flat forms sumcheck transcript is valid")
+    }
+
+    fn separator<F, EF>(self) -> DomainSeparator<Alphabet<F>>
+    where
+        F: TranscriptField,
+        EF: Field + AlgebraIdentity<F>,
+    {
+        let mut separator = DomainSeparator::new(VERSION, FORMS_NAME, self.pattern::<F, EF>());
+        separator
+            .instance(&(self.column_variables as u64).to_be_bytes())
+            .instance(&(self.tables as u64).to_be_bytes())
+            .instance(PACKED_LABEL);
+        separator
+    }
+}
+
+/// Prover side of [`FormsSumcheckShape`].
+pub(crate) struct FormsSumcheckProverTranscript<'a, F: TranscriptField, EF, C> {
+    state: ProverState<&'a mut C, Alphabet<F>>,
+    _challenge: PhantomData<EF>,
+}
+
+impl<'a, F, EF, C> FormsSumcheckProverTranscript<'a, F, EF, C>
+where
+    F: Field + TranscriptField + AlgebraIdentity<F>,
+    EF: ExtensionField<F>,
+    C: CanObserve<F> + CanSample<F> + CanSampleUniformBits<F> + GrindingChallenger<Witness = F>,
+{
+    pub(crate) fn new(challenger: &'a mut C, shape: FormsSumcheckShape) -> Self {
+        let separator = shape.separator::<F, EF>();
+        Self {
+            state: ProverState::new(challenger, &separator),
+            _challenge: PhantomData,
+        }
+    }
+
+    pub(crate) fn weight(&mut self) -> EF {
+        self.state
+            .challenge_extension::<F, EF, FieldToFieldCodec<F>>(PACKING_WEIGHT)
+            .into_inner()
+    }
+
+    pub(crate) fn round(&mut self, coefficients: [EF; 2]) -> EF {
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(COLUMN_ROUND, &coefficients);
+        self.state
+            .challenge_extension::<F, EF, FieldToFieldCodec<F>>(COLUMN_CHALLENGE)
+            .into_inner()
+    }
+
+    pub(crate) fn folds(&mut self, folds: &[EF]) {
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(FOLDED_COLUMNS, folds);
+    }
+
+    pub(crate) fn finish(self) {
+        assert!(
+            self.state.finalize().is_empty(),
+            "forms sumcheck transcript carries no wire values",
+        );
+    }
+}
+
+/// Verifier side of [`FormsSumcheckShape`].
+pub(crate) struct FormsSumcheckVerifierTranscript<'a, F: TranscriptField, EF, C> {
+    state: VerifierState<'static, &'a mut C, Alphabet<F>>,
+    _challenge: PhantomData<EF>,
+}
+
+impl<'a, F, EF, C> FormsSumcheckVerifierTranscript<'a, F, EF, C>
+where
+    F: Field + TranscriptField + AlgebraIdentity<F>,
+    EF: ExtensionField<F>,
+    C: CanObserve<F> + CanSample<F> + CanSampleUniformBits<F> + GrindingChallenger<Witness = F>,
+{
+    pub(crate) fn new(challenger: &'a mut C, shape: FormsSumcheckShape) -> Self {
+        let separator = shape.separator::<F, EF>();
+        Self {
+            state: VerifierState::new(challenger, &separator, &[]),
+            _challenge: PhantomData,
+        }
+    }
+
+    pub(crate) fn weight(&mut self) -> EF {
+        self.state
+            .challenge_extension::<F, EF, FieldToFieldCodec<F>>(PACKING_WEIGHT)
+            .into_inner()
+    }
+
+    pub(crate) fn round(
+        &mut self,
+        coefficients: [EF; 2],
+    ) -> Result<EF, p3_challenger::fs::TranscriptError> {
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(COLUMN_ROUND, &coefficients)?;
+        Ok(self
+            .state
+            .challenge_extension::<F, EF, FieldToFieldCodec<F>>(COLUMN_CHALLENGE)
+            .into_inner())
+    }
+
+    pub(crate) fn folds(&mut self, folds: &[EF]) -> Result<(), p3_challenger::fs::TranscriptError> {
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(FOLDED_COLUMNS, folds)?;
+        Ok(())
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.state.abort();
+    }
+
+    pub(crate) fn finish(self) {
+        self.state
+            .finalize()
+            .expect("forms sumcheck transcript is complete");
     }
 }
 
@@ -237,6 +456,7 @@ mod tests {
             width: 3,
             num_batches: 2,
             next,
+            forms: 0,
         }
     }
 
@@ -247,6 +467,7 @@ mod tests {
             width: 5,
             num_batches: 1,
             next,
+            forms: 0,
         }
     }
 
