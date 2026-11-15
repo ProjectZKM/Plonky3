@@ -41,7 +41,7 @@ pub use memory::{
 pub use name::{BusName, BusNameError};
 pub use p3_gkr::{
     DeviceProductTrees, ProductGkrError, ProductGkrLayerProof, ProductGkrOutput, ProductGkrProof,
-    ProductGkrRootShape, ProductGkrShape, ProductGkrShapeError, ProductTrees,
+    ProductGkrRootShape, ProductGkrShape, ProductGkrShapeError, ProductTrees, set_factored_rounds,
 };
 pub use plan::{
     BusBlock, BusBlockOwner, BusDomain, BusExpressionLocation, BusPlan, BusPlanError, BusPlanInput,

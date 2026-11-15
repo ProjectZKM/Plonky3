@@ -17,7 +17,7 @@ use p3_challenger::fs::{
 use p3_challenger::{CanObserve, CanSample};
 use p3_field::ExtensionField;
 
-use crate::{ProductGkrShape, ROUND_POLY_LEN};
+use crate::ProductGkrShape;
 
 /// Version byte bound into the protocol seed.
 const VERSION: u8 = 1;
@@ -96,7 +96,7 @@ impl ProductGkrShape {
                     Hierarchy::Atomic,
                     Kind::Message,
                     ROUND_POLY,
-                    Length::Fixed(ROUND_POLY_LEN),
+                    Length::Fixed(self.round_message_len(arity)),
                 ));
                 steps.push(Interaction::algebra::<F, EF>(
                     Hierarchy::Atomic,
@@ -145,6 +145,10 @@ impl ProductGkrShape {
         // Separate trees bind nothing more, so their seeds predate the batched shape.
         if self.batch_variables() > 0 {
             separator.instance(&(self.batch_variables() as u64).to_le_bytes());
+        }
+        // Unfactored shapes bind nothing more, so their seeds predate factored rounds.
+        if self.factored() {
+            separator.instance(b"factored rounds");
         }
         separator
     }
@@ -195,8 +199,8 @@ where
             .into_inner()
     }
 
-    /// Bind one degree-five sumcheck message before sampling its coordinate.
-    pub(crate) fn round(&mut self, round_poly: &[EF; ROUND_POLY_LEN]) -> EF {
+    /// Bind one sumcheck message before sampling its coordinate.
+    pub(crate) fn round(&mut self, round_poly: &[EF]) -> EF {
         self.state
             .observe_extensions::<F, EF, FieldToFieldCodec<F>>(ROUND_POLY, round_poly);
         self.state
@@ -291,7 +295,7 @@ where
     }
 
     /// Replay one checked-width sumcheck message and redraw its coordinate.
-    pub(crate) fn round(&mut self, round_poly: &[EF; ROUND_POLY_LEN]) -> EF {
+    pub(crate) fn round(&mut self, round_poly: &[EF]) -> EF {
         self.state
             .observe_extensions::<F, EF, FieldToFieldCodec<F>>(ROUND_POLY, round_poly)
             .expect("a fixed-size round message matches the transcript shape");

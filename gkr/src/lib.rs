@@ -27,6 +27,7 @@ extern crate std;
 
 mod device;
 mod error;
+mod factored;
 mod math;
 mod proof;
 mod prover;
@@ -35,12 +36,13 @@ mod transcript;
 
 pub use device::{DeviceProductTrees, ProductTrees};
 pub use error::{ProductGkrError, ProductGkrShapeError};
+pub use factored::{FACTORED_BINARY_LEN, FACTORED_LEN};
 pub use proof::{
     DenseLeaves, PreparedProductGkr, ProductGkrLayerProof, ProductGkrOutput, ProductGkrProof,
     ProductLeaves, ROUND_POLY_LEN,
 };
 pub use prover::{LayerRounds, RadixFourBatch};
-pub use shape::{ProductGkrRootShape, ProductGkrShape};
+pub use shape::{ProductGkrRootShape, ProductGkrShape, set_factored_rounds};
 
 #[cfg(test)]
 mod batched_tests;

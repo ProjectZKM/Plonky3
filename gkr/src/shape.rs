@@ -1,6 +1,7 @@
 //! Verifier-derived dimensions and root encoding for product-tree GKR.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use p3_field::Field;
 use p3_security::gkr::ProductGkrSecurityProfile;
@@ -49,6 +50,19 @@ impl ProductGkrRootShape {
     }
 }
 
+/// Whether shapes built from now on factor their rounds, see [`set_factored_rounds`].
+static FACTORED: AtomicBool = AtomicBool::new(false);
+
+/// Choose whether the shapes built from now on send each sumcheck round with its equality
+/// factor divided out, and return the previous choice.
+///
+/// A factored radix-four round sends four values instead of five, a factored binary round two.
+/// Prover and verifier must build their shapes under the same choice; the shape then fixes the
+/// proof's layer kinds and its transcript, so a proof made under one choice fails under the other.
+pub fn set_factored_rounds(factored: bool) -> bool {
+    FACTORED.swap(factored, Ordering::Relaxed)
+}
+
 /// Verifier-derived dimensions of one batched product reduction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProductGkrShape {
@@ -60,6 +74,8 @@ pub struct ProductGkrShape {
     pub(super) root_shape: ProductGkrRootShape,
     /// Leading coordinates indexing a batch of trees laid out in one table, zero for separate trees.
     pub(super) batch_variables: usize,
+    /// Whether every sumcheck round is sent with its equality factor divided out.
+    pub(super) factored: bool,
 }
 
 impl ProductGkrShape {
@@ -104,6 +120,7 @@ impl ProductGkrShape {
             num_trees,
             root_shape,
             batch_variables: 0,
+            factored: FACTORED.load(Ordering::Relaxed),
         })
     }
 
@@ -114,7 +131,7 @@ impl ProductGkrShape {
     /// # Errors
     ///
     /// Returns an error when the table cannot be addressed by one machine word.
-    pub const fn batched(
+    pub fn batched(
         log_height: usize,
         batch_variables: usize,
     ) -> Result<Self, ProductGkrShapeError> {
@@ -130,6 +147,7 @@ impl ProductGkrShape {
             num_trees: 1,
             root_shape: ProductGkrRootShape::Distinct,
             batch_variables,
+            factored: FACTORED.load(Ordering::Relaxed),
         })
     }
 
@@ -149,6 +167,29 @@ impl ProductGkrShape {
     #[must_use]
     pub const fn batch_variables(&self) -> usize {
         self.batch_variables
+    }
+
+    /// Whether every sumcheck round is sent with its equality factor divided out.
+    #[must_use]
+    pub const fn factored(&self) -> bool {
+        self.factored
+    }
+
+    /// The same dimensions with rounds factored or not, whatever was chosen when they were built.
+    #[must_use]
+    pub const fn with_factored(mut self, factored: bool) -> Self {
+        self.factored = factored;
+        self
+    }
+
+    /// Values one sumcheck round of a layer of `arity` sends.
+    #[must_use]
+    pub const fn round_message_len(&self, arity: usize) -> usize {
+        match (self.factored, arity) {
+            (false, _) => crate::ROUND_POLY_LEN,
+            (true, 4) => crate::FACTORED_LEN,
+            (true, _) => crate::FACTORED_BINARY_LEN,
+        }
     }
 
     /// Root encoding fixed by the statement.

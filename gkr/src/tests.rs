@@ -105,6 +105,82 @@ fn binary_field_matches_the_scalar_reference_across_depths() {
 }
 
 #[test]
+fn factored_rounds_match_the_scalar_reference_across_depths() {
+    let mut rng = Xoroshiro128Plus::seed_from_u64(0xB1A4_0002);
+    for log_height in 0..=10 {
+        let capacity = 1usize << log_height;
+        let inputs = (0..3)
+            .map(|tree| {
+                let explicit = capacity.saturating_sub(tree.min(capacity));
+                (0..explicit)
+                    .map(|_| rng.random::<Binary>())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let borrowed = inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let plain = ProductGkrShape::new(log_height, 3, ProductGkrRootShape::Distinct).unwrap();
+        let shape = plain.with_factored(true);
+
+        let mut prover_challenger = binary_challenger();
+        let (proof, prover_output) =
+            ProductGkrProof::prove::<Binary, _>(&borrowed, shape, &mut prover_challenger);
+        assert!(proof.layers.iter().all(|layer| !matches!(
+            layer,
+            ProductGkrLayerProof::RadixFour { .. } | ProductGkrLayerProof::BinarySumcheck { .. }
+        )));
+        let mut verifier_challenger = binary_challenger();
+        let verifier_output = proof
+            .verify::<Binary, _>(shape, &mut verifier_challenger)
+            .unwrap();
+        assert_eq!(prover_output, verifier_output);
+        check_output(
+            &inputs,
+            log_height,
+            &prover_output.roots,
+            &prover_output.point,
+            &prover_output.values,
+        );
+        // The same trees under the degree-five form reach the same point and values.
+        let (_, plain_output) =
+            ProductGkrProof::prove::<Binary, _>(&borrowed, plain, &mut binary_challenger());
+        assert_eq!(plain_output.roots, prover_output.roots);
+        if log_height > 2 {
+            assert!(
+                proof
+                    .verify::<Binary, _>(plain, &mut binary_challenger())
+                    .is_err()
+            );
+        }
+    }
+
+    // The prime-field path too.
+    let inputs = [256, 191, 1]
+        .map(|length| {
+            (0..length)
+                .map(|_| PrimeChallenge::from_u64(rng.random::<u64>()))
+                .collect::<Vec<_>>()
+        })
+        .to_vec();
+    let borrowed = inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let shape = ProductGkrShape::new(8, 3, ProductGkrRootShape::Distinct)
+        .unwrap()
+        .with_factored(true);
+    let (proof, prover_output) =
+        ProductGkrProof::prove::<PrimeBase, _>(&borrowed, shape, &mut prime_challenger());
+    let verifier_output = proof
+        .verify::<PrimeBase, _>(shape, &mut prime_challenger())
+        .unwrap();
+    assert_eq!(prover_output, verifier_output);
+    check_output(
+        &inputs,
+        8,
+        &prover_output.roots,
+        &prover_output.point,
+        &prover_output.values,
+    );
+}
+
+#[test]
 fn baby_bear_extension_matches_the_scalar_reference() {
     // Unequal prefix lengths exercise identity padding in every tree.
     let mut rng = Xoroshiro128Plus::seed_from_u64(0xBA8E_0001);

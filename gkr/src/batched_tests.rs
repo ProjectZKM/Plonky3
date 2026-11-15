@@ -42,13 +42,16 @@ fn round_trip<F, EF>(
     leaves: &[EF],
     log_height: usize,
     batch_variables: usize,
+    factored: bool,
 ) -> ProductGkrProof<EF>
 where
     F: TranscriptField,
     EF: ExtensionField<F>,
     BinaryChallenger<F, HashChallenger<u8, Keccak256Hash, 32>>: FieldChallenger<F>,
 {
-    let shape = ProductGkrShape::batched(log_height, batch_variables).unwrap();
+    let shape = ProductGkrShape::batched(log_height, batch_variables)
+        .unwrap()
+        .with_factored(factored);
     let mut prover = challenger::<F>();
     let (proof, output) = ProductGkrProof::prove_batched::<F, _, _>(
         &DenseLeaves(leaves.to_vec()),
@@ -89,23 +92,26 @@ where
 fn batched_tables_prove_and_verify_at_every_height() {
     let mut rng = Xoroshiro128Plus::seed_from_u64(0xBA7C_0001);
     for batch_variables in 1..=3 {
-        for log_height in 0..=9 {
+        for (log_height, factored) in (0..=9).flat_map(|h| [(h, false), (h, true)]) {
             let len = 1 << (batch_variables + log_height);
             // The full table, and one whose identity suffix is left implicit.
             round_trip::<Binary, Binary>(
                 &random::<Binary>(&mut rng, len),
                 log_height,
                 batch_variables,
+                factored,
             );
             round_trip::<Binary, Binary>(
                 &random::<Binary>(&mut rng, len / 2 + 1),
                 log_height,
                 batch_variables,
+                factored,
             );
             round_trip::<Poly64, Poly192>(
                 &random::<Poly192>(&mut rng, len),
                 log_height,
                 batch_variables,
+                factored,
             );
         }
     }
@@ -114,7 +120,7 @@ fn batched_tables_prove_and_verify_at_every_height() {
 #[test]
 fn odd_batched_heights_sum_the_binary_layer() {
     let mut rng = Xoroshiro128Plus::seed_from_u64(0xBA7C_0002);
-    let proof = round_trip::<Binary, Binary>(&random::<Binary>(&mut rng, 1 << 7), 5, 2);
+    let proof = round_trip::<Binary, Binary>(&random::<Binary>(&mut rng, 1 << 7), 5, 2, false);
     let ProductGkrLayerProof::BinarySumcheck { round_polys, .. } = &proof.layers[0] else {
         panic!("an odd batched height starts with a summed binary layer");
     };
@@ -201,10 +207,12 @@ impl ProductLeaves<Poly192> for OwnBottom {
 #[test]
 fn own_bottom_layers_leave_proofs_and_transcripts_unchanged() {
     let mut rng = Xoroshiro128Plus::seed_from_u64(0xBA7C_0003);
-    for batch_variables in 1..=2 {
+    for (batch_variables, factored) in [(1, false), (2, false), (1, true), (2, true)] {
         for log_height in 0..=9 {
             let leaves = random::<Poly192>(&mut rng, 1 << (batch_variables + log_height));
-            let shape = ProductGkrShape::batched(log_height, batch_variables).unwrap();
+            let shape = ProductGkrShape::batched(log_height, batch_variables)
+                .unwrap()
+                .with_factored(factored);
             let mut dense = challenger::<Poly64>();
             let expected = ProductGkrProof::prove_batched::<Poly64, _, _>(
                 &DenseLeaves(leaves.clone()),
@@ -234,9 +242,15 @@ fn own_bottom_layers_leave_proofs_and_transcripts_unchanged() {
 
 #[test]
 fn tampering_any_batched_message_or_root_is_rejected() {
+    for factored in [false, true] {
+        tampering_is_rejected(factored);
+    }
+}
+
+fn tampering_is_rejected(factored: bool) {
     let mut rng = Xoroshiro128Plus::seed_from_u64(0xBA7C_0004);
-    let shape = ProductGkrShape::batched(5, 2).unwrap();
-    let proof = round_trip::<Binary, Binary>(&random::<Binary>(&mut rng, 1 << 7), 5, 2);
+    let shape = ProductGkrShape::batched(5, 2).unwrap().with_factored(factored);
+    let proof = round_trip::<Binary, Binary>(&random::<Binary>(&mut rng, 1 << 7), 5, 2, factored);
     let rejects = |proof: &ProductGkrProof<Binary>| {
         matches!(
             proof.verify::<Binary, _>(shape, &mut challenger::<Binary>()),
@@ -249,45 +263,109 @@ fn tampering_any_batched_message_or_root_is_rejected() {
         assert!(rejects(&bad), "root {index}");
     }
     for layer in 0..proof.layers.len() {
-        let (rounds, children) = match &proof.layers[layer] {
-            ProductGkrLayerProof::BinarySumcheck { round_polys, .. } => (round_polys.len(), 2),
-            ProductGkrLayerProof::RadixFour { round_polys, .. } => (round_polys.len(), 4),
-            ProductGkrLayerProof::Binary { .. } => {
-                panic!("a batched table has no plain binary layer")
-            }
-        };
-        for (round, node) in (0..rounds).flat_map(|round| (0..5).map(move |node| (round, node))) {
-            let mut bad = proof.clone();
-            match &mut bad.layers[layer] {
+        let messages: &mut dyn FnMut(&mut ProductGkrLayerProof<Binary>) -> Vec<&mut [Binary]> =
+            &mut |layer| match layer {
                 ProductGkrLayerProof::BinarySumcheck { round_polys, .. }
                 | ProductGkrLayerProof::RadixFour { round_polys, .. } => {
-                    round_polys[round][node] += Binary::ONE;
+                    round_polys.iter_mut().map(|poly| &mut poly[..]).collect()
                 }
+                ProductGkrLayerProof::RadixFourFactored { round_polys, .. } => {
+                    round_polys.iter_mut().map(|poly| &mut poly[..]).collect()
+                }
+                ProductGkrLayerProof::BinarySumcheckFactored { round_polys, .. } => {
+                    round_polys.iter_mut().map(|poly| &mut poly[..]).collect()
+                }
+                ProductGkrLayerProof::Binary { .. } => {
+                    panic!("a batched table has no plain binary layer")
+                }
+            };
+        let children: &mut dyn FnMut(&mut ProductGkrLayerProof<Binary>) -> &mut [Binary] =
+            &mut |layer| match layer {
+                ProductGkrLayerProof::BinarySumcheck { children, .. }
+                | ProductGkrLayerProof::BinarySumcheckFactored { children, .. } => &mut children[0],
+                ProductGkrLayerProof::RadixFour { children, .. }
+                | ProductGkrLayerProof::RadixFourFactored { children, .. } => &mut children[0],
                 ProductGkrLayerProof::Binary { .. } => unreachable!(),
+            };
+        let mut probe = proof.clone();
+        let shape_of: Vec<usize> = messages(&mut probe.layers[layer])
+            .iter()
+            .map(|poly| poly.len())
+            .collect();
+        assert!(
+            shape_of
+                .iter()
+                .all(|&len| len == shape.round_message_len(if layer == 0 { 2 } else { 4 })),
+            "layer {layer} sends messages of the shape's width"
+        );
+        for (round, &width) in shape_of.iter().enumerate() {
+            for node in 0..width {
+                let mut bad = proof.clone();
+                messages(&mut bad.layers[layer])[round][node] += Binary::ONE;
+                assert!(rejects(&bad), "layer {layer} round {round} node {node}");
             }
-            assert!(rejects(&bad), "layer {layer} round {round} node {node}");
         }
-        for child in 0..children {
+        let width = children(&mut probe.layers[layer]).len();
+        for child in 0..width {
             let mut bad = proof.clone();
-            match &mut bad.layers[layer] {
-                ProductGkrLayerProof::BinarySumcheck { children, .. } => {
-                    children[0][child] += Binary::ONE;
-                }
-                ProductGkrLayerProof::RadixFour { children, .. } => {
-                    children[0][child] += Binary::ONE;
-                }
-                ProductGkrLayerProof::Binary { .. } => unreachable!(),
-            }
+            children(&mut bad.layers[layer])[child] += Binary::ONE;
             assert!(rejects(&bad), "layer {layer} child {child}");
         }
     }
 }
 
 #[test]
+fn a_proof_fails_under_the_other_round_form() {
+    let mut rng = Xoroshiro128Plus::seed_from_u64(0xBA7C_0006);
+    let leaves = random::<Binary>(&mut rng, 1 << 7);
+    for factored in [false, true] {
+        let proof = round_trip::<Binary, Binary>(&leaves, 5, 2, factored);
+        let other = ProductGkrShape::batched(5, 2).unwrap().with_factored(!factored);
+        assert_eq!(
+            proof.verify::<Binary, _>(other, &mut challenger::<Binary>()),
+            Err(ProductGkrError::MalformedLayer { layer: 0 })
+        );
+    }
+    // A factored proof sends one value fewer every radix-four round, three fewer every binary one.
+    let values = |proof: &ProductGkrProof<Binary>| -> usize {
+        proof
+            .layers
+            .iter()
+            .map(|layer| match layer {
+                ProductGkrLayerProof::Binary { children } => 2 * children.len(),
+                ProductGkrLayerProof::BinarySumcheck { round_polys, children } => {
+                    5 * round_polys.len() + 2 * children.len()
+                }
+                ProductGkrLayerProof::RadixFour { round_polys, children } => {
+                    5 * round_polys.len() + 4 * children.len()
+                }
+                ProductGkrLayerProof::RadixFourFactored { round_polys, children } => {
+                    4 * round_polys.len() + 4 * children.len()
+                }
+                ProductGkrLayerProof::BinarySumcheckFactored { round_polys, children } => {
+                    2 * round_polys.len() + 2 * children.len()
+                }
+            })
+            .sum()
+    };
+    let plain = round_trip::<Binary, Binary>(&leaves, 5, 2, false);
+    let factored = round_trip::<Binary, Binary>(&leaves, 5, 2, true);
+    let saved: usize = ProductGkrShape::batched(5, 2)
+        .unwrap()
+        .layers()
+        .iter()
+        .map(|&(arity, rounds)| rounds * if arity == 4 { 1 } else { 3 })
+        .sum();
+    assert!(saved > 0);
+    assert_eq!(values(&plain) - values(&factored), saved);
+    assert!(postcard::to_allocvec(&factored).unwrap().len() < postcard::to_allocvec(&plain).unwrap().len());
+}
+
+#[test]
 fn a_binary_layer_of_the_wrong_kind_is_malformed() {
     let mut rng = Xoroshiro128Plus::seed_from_u64(0xBA7C_0005);
     let shape = ProductGkrShape::batched(3, 1).unwrap();
-    let mut proof = round_trip::<Binary, Binary>(&random::<Binary>(&mut rng, 1 << 4), 3, 1);
+    let mut proof = round_trip::<Binary, Binary>(&random::<Binary>(&mut rng, 1 << 4), 3, 1, false);
     let ProductGkrLayerProof::BinarySumcheck { children, .. } = &proof.layers[0] else {
         panic!("an odd batched height starts with a summed binary layer");
     };

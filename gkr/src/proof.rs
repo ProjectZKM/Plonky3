@@ -13,6 +13,7 @@ use p3_sumcheck::generic_degree::RoundPolyInterpolator;
 use serde::{Deserialize, Serialize};
 
 use super::device::{DeviceLayer, DeviceProductTrees, ProductTrees, Trees};
+use super::factored::{FACTORED_BINARY_LEN, FACTORED_LEN, Factoring, factored_step};
 use super::math::{
     combine, has_distinct_round_nodes, interpolate_pair, interpolate_quad, sum_adjacent,
 };
@@ -45,6 +46,109 @@ pub enum ProductGkrLayerProof<EF> {
         /// Two child evaluations.
         children: Vec<[EF; 2]>,
     },
+    /// A radix-four layer whose rounds divide out the bound coordinate's equality factor.
+    RadixFourFactored {
+        /// Each round's cofactor coefficients above the constant, in binding order.
+        round_polys: Vec<[EF; FACTORED_LEN]>,
+        /// Four child evaluations for every batched tree.
+        children: Vec<[EF; 4]>,
+    },
+    /// A root-most binary layer of a batched table whose rounds divide out the equality factor.
+    BinarySumcheckFactored {
+        /// Each round's cofactor coefficients above the constant, in binding order.
+        round_polys: Vec<[EF; FACTORED_BINARY_LEN]>,
+        /// Two child evaluations.
+        children: Vec<[EF; 2]>,
+    },
+}
+
+/// The round messages one summed layer sends, in the form its shape fixes.
+enum LayerMessages<EF> {
+    /// Degree-five messages as the rounds produce them.
+    Plain(Vec<[EF; ROUND_POLY_LEN]>),
+    /// Cofactor coefficients rewritten from them.
+    Factored {
+        /// Rewrites each message and tracks the running sum.
+        factoring: Factoring<EF>,
+        /// The rewritten messages.
+        sent: Vec<Vec<EF>>,
+    },
+}
+
+impl<EF: Field> LayerMessages<EF> {
+    /// The messages of a layer of `arity` over parent point `point`, its running sum starting at `claim`.
+    fn new(shape: ProductGkrShape, arity: usize, point: &[EF], claim: EF) -> Self {
+        if shape.factored {
+            let degree = if arity == 4 { 4 } else { 2 };
+            Self::Factored {
+                factoring: Factoring::new(point, claim, degree),
+                sent: Vec::with_capacity(point.len()),
+            }
+        } else {
+            Self::Plain(Vec::with_capacity(point.len()))
+        }
+    }
+
+    /// Send one round's degree-five message and return its challenge.
+    fn send<F, Challenger>(
+        &mut self,
+        round_poly: [EF; ROUND_POLY_LEN],
+        transcript: &mut ProductGkrProverTranscript<'_, Challenger, F, EF>,
+    ) -> EF
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        Challenger: FieldChallenger<F>,
+    {
+        match self {
+            Self::Plain(sent) => {
+                sent.push(round_poly);
+                transcript.round(&round_poly)
+            }
+            Self::Factored { factoring, sent } => {
+                let message = factoring.message(&round_poly);
+                let challenge = transcript.round(&message);
+                factoring.bind(&round_poly, challenge);
+                sent.push(message);
+                challenge
+            }
+        }
+    }
+
+    /// The radix-four layer proof closing on `children`.
+    fn radix_four(self, children: Vec<[EF; 4]>) -> ProductGkrLayerProof<EF> {
+        match self {
+            Self::Plain(round_polys) => ProductGkrLayerProof::RadixFour {
+                round_polys,
+                children,
+            },
+            Self::Factored { sent, .. } => ProductGkrLayerProof::RadixFourFactored {
+                round_polys: sent.into_iter().map(fixed).collect(),
+                children,
+            },
+        }
+    }
+
+    /// The summed binary layer proof closing on `children`.
+    fn binary(self, children: Vec<[EF; 2]>) -> ProductGkrLayerProof<EF> {
+        match self {
+            Self::Plain(round_polys) => ProductGkrLayerProof::BinarySumcheck {
+                round_polys,
+                children,
+            },
+            Self::Factored { sent, .. } => ProductGkrLayerProof::BinarySumcheckFactored {
+                round_polys: sent.into_iter().map(fixed).collect(),
+                children,
+            },
+        }
+    }
+}
+
+/// A rewritten message as the fixed-width array its layer stores.
+fn fixed<EF, const N: usize>(message: Vec<EF>) -> [EF; N] {
+    message
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("a cofactor has the layer's degree"))
 }
 
 /// Leaves of a batched table whose bottom radix-four layers the caller proves itself.
@@ -391,10 +495,10 @@ impl<EF> ProductGkrProof<EF> {
                     &mut all_layers,
                     child_depth - own_levels,
                 );
-                let mut round_polys = Vec::with_capacity(round_count);
+                let mut messages =
+                    LayerMessages::new(shape, arity, &point, combine(&values, batching));
                 let round_point = batch.prove_rounds(&point, batching, |round_poly| {
-                    round_polys.push(round_poly);
-                    transcript.round(&round_poly)
+                    messages.send(round_poly, &mut transcript)
                 });
                 let children = batch.children();
                 let branches = transcript.end_binary_layer(&children);
@@ -404,30 +508,32 @@ impl<EF> ProductGkrProof<EF> {
                     .collect();
                 point = vec![branches[0]];
                 point.extend(round_point);
-                layer_proofs.push(ProductGkrLayerProof::BinarySumcheck {
-                    round_polys,
-                    children,
-                });
+                layer_proofs.push(messages.binary(children));
             } else {
                 // Four child tables share one eq-weighted degree-five sumcheck.
-                let (round_polys, round_point, children) = match leaves {
+                let mut messages =
+                    LayerMessages::new(shape, arity, &point, combine(&values, batching));
+                let (round_point, children) = match leaves {
                     Some(leaves) if child_depth < own_levels => {
                         let mut layer = leaves.layer(child_depth / 2, &point);
-                        let (polys, round_point) =
-                            Self::layer_rounds(&mut layer, &point, batching, &mut transcript);
-                        (polys, round_point, layer.children())
+                        let round_point = Self::layer_rounds(
+                            &mut layer,
+                            &point,
+                            batching,
+                            &mut messages,
+                            &mut transcript,
+                        );
+                        (round_point, layer.children())
                     }
                     _ => {
                         let mut batch = RadixFourBatch::<F, EF, 4>::new_consuming(
                             &mut all_layers,
                             child_depth - own_levels,
                         );
-                        let mut round_polys = Vec::with_capacity(round_count);
                         let round_point = batch.prove_rounds(&point, batching, |round_poly| {
-                            round_polys.push(round_poly);
-                            transcript.round(&round_poly)
+                            messages.send(round_poly, &mut transcript)
                         });
-                        (round_polys, round_point, batch.children())
+                        (round_point, batch.children())
                     }
                 };
                 let branches = transcript.end_radix_four_layer(&children);
@@ -437,10 +543,7 @@ impl<EF> ProductGkrProof<EF> {
                     .collect();
                 point = vec![branches[0], branches[1]];
                 point.extend(round_point);
-                layer_proofs.push(ProductGkrLayerProof::RadixFour {
-                    round_polys,
-                    children,
-                });
+                layer_proofs.push(messages.radix_four(children));
             }
 
             product_depth = child_depth;
@@ -560,8 +663,15 @@ impl<EF> ProductGkrProof<EF> {
             } else {
                 device.begin_layer(child_depth, &point);
                 let mut layer = DeviceLayer(&mut *device);
-                let (round_polys, round_point) =
-                    Self::layer_rounds(&mut layer, &point, batching, &mut transcript);
+                let mut messages =
+                    LayerMessages::new(shape, arity, &point, combine(&values, batching));
+                let round_point = Self::layer_rounds(
+                    &mut layer,
+                    &point,
+                    batching,
+                    &mut messages,
+                    &mut transcript,
+                );
                 let children = LayerRounds::children(&layer);
                 let branches = transcript.end_radix_four_layer(&children);
                 values = children
@@ -570,10 +680,7 @@ impl<EF> ProductGkrProof<EF> {
                     .collect();
                 point = vec![branches[0], branches[1]];
                 point.extend(round_point);
-                layer_proofs.push(ProductGkrLayerProof::RadixFour {
-                    round_polys,
-                    children,
-                });
+                layer_proofs.push(messages.radix_four(children));
             }
 
             product_depth = child_depth;
@@ -600,8 +707,9 @@ impl<EF> ProductGkrProof<EF> {
         layer: &mut R,
         point: &[EF],
         batching: EF,
+        messages: &mut LayerMessages<EF>,
         transcript: &mut ProductGkrProverTranscript<'_, Challenger, F, EF>,
-    ) -> (Vec<[EF; ROUND_POLY_LEN]>, Vec<EF>)
+    ) -> Vec<EF>
     where
         F: TranscriptField,
         EF: ExtensionField<F>,
@@ -619,13 +727,12 @@ impl<EF> ProductGkrProof<EF> {
         let mut equality_prefix = EF::ONE;
         let mut logical_len = 1usize << point.len();
         let mut round_point = Vec::with_capacity(point.len());
-        let mut round_polys = Vec::with_capacity(point.len());
 
         for &anchor in point {
             let one = equality_prefix * anchor;
             let equality_pair = [equality_prefix - one, one];
             let round_poly = layer.round(&equality, equality_pair, logical_len, batching);
-            let challenge = transcript.round(&round_poly);
+            let challenge = messages.send(round_poly, transcript);
             layer.fold(challenge, logical_len);
             equality_prefix = interpolate_pair(equality_pair, challenge);
             logical_len /= 2;
@@ -635,9 +742,8 @@ impl<EF> ProductGkrProof<EF> {
                 sum_adjacent(&mut equality, &mut spare);
             }
             round_point.push(challenge);
-            round_polys.push(round_poly);
         }
-        (round_polys, round_point)
+        round_point
     }
 
     /// Verifies the internal consistency of several product trees.
@@ -746,6 +852,66 @@ impl<EF> ProductGkrProof<EF> {
                     point = vec![branches[0]];
                     point.extend(round_point);
                 }
+                ProductGkrLayerProof::BinarySumcheckFactored {
+                    round_polys,
+                    children,
+                } => {
+                    debug_assert_eq!(arity, 2);
+                    let mut round_point = Vec::with_capacity(round_polys.len());
+                    for (round_poly, &anchor) in round_polys.iter().zip(&point) {
+                        let challenge = transcript.round(round_poly);
+                        running_sum = factored_step(round_poly, running_sum, anchor, challenge);
+                        round_point.push(challenge);
+                    }
+                    let expected = Point::eval_eq(&point, &round_point)
+                        * combine(
+                            &children
+                                .iter()
+                                .map(|children| children[0] * children[1])
+                                .collect::<Vec<_>>(),
+                            batching,
+                        );
+                    if running_sum != expected {
+                        inconsistent_layer.get_or_insert(layer_index);
+                    }
+                    let branches = transcript.end_binary_layer(children);
+                    values = children
+                        .iter()
+                        .map(|children| interpolate_pair(*children, branches[0]))
+                        .collect();
+                    point = vec![branches[0]];
+                    point.extend(round_point);
+                }
+                ProductGkrLayerProof::RadixFourFactored {
+                    round_polys,
+                    children,
+                } => {
+                    debug_assert_eq!(arity, 4);
+                    let mut round_point = Vec::with_capacity(round_polys.len());
+                    for (round_poly, &anchor) in round_polys.iter().zip(&point) {
+                        let challenge = transcript.round(round_poly);
+                        running_sum = factored_step(round_poly, running_sum, anchor, challenge);
+                        round_point.push(challenge);
+                    }
+                    let expected = Point::eval_eq(&point, &round_point)
+                        * combine(
+                            &children
+                                .iter()
+                                .map(|children| children.iter().copied().product())
+                                .collect::<Vec<_>>(),
+                            batching,
+                        );
+                    if running_sum != expected {
+                        inconsistent_layer.get_or_insert(layer_index);
+                    }
+                    let branches = transcript.end_radix_four_layer(children);
+                    values = children
+                        .iter()
+                        .map(|children| interpolate_quad(*children, branches))
+                        .collect();
+                    point = vec![branches[0], branches[1]];
+                    point.extend(round_point);
+                }
                 ProductGkrLayerProof::RadixFour {
                     round_polys,
                     children,
@@ -813,8 +979,9 @@ impl<EF> ProductGkrProof<EF> {
         }
 
         for (layer_index, ((arity, rounds), layer)) in layers.iter().zip(&self.layers).enumerate() {
-            let valid = match (arity, layer) {
-                (2, ProductGkrLayerProof::Binary { children }) => {
+            // The shape fixes whether summed layers are factored, so the prover cannot choose.
+            let valid = match (arity, layer, shape.factored) {
+                (2, ProductGkrLayerProof::Binary { children }, _) => {
                     *rounds == 0 && children.len() == shape.num_trees
                 }
                 (
@@ -823,6 +990,17 @@ impl<EF> ProductGkrProof<EF> {
                         round_polys,
                         children,
                     },
+                    false,
+                ) => {
+                    *rounds > 0 && round_polys.len() == *rounds && children.len() == shape.num_trees
+                }
+                (
+                    2,
+                    ProductGkrLayerProof::BinarySumcheckFactored {
+                        round_polys,
+                        children,
+                    },
+                    true,
                 ) => {
                     *rounds > 0 && round_polys.len() == *rounds && children.len() == shape.num_trees
                 }
@@ -832,6 +1010,15 @@ impl<EF> ProductGkrProof<EF> {
                         round_polys,
                         children,
                     },
+                    false,
+                ) => round_polys.len() == *rounds && children.len() == shape.num_trees,
+                (
+                    4,
+                    ProductGkrLayerProof::RadixFourFactored {
+                        round_polys,
+                        children,
+                    },
+                    true,
                 ) => round_polys.len() == *rounds && children.len() == shape.num_trees,
                 _ => false,
             };
