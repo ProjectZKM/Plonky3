@@ -315,11 +315,12 @@ const FORMS_NAME: &[u8] = b"p3-boolean-trace-forms-sumcheck";
 /// Every forms batch has bound its row point and forms in its own run's transcript.
 /// This one draws the weight `rho` over all their forms in run order, runs one degree-two
 /// sumcheck over the widest table's column variables (each table's slots zero above its
-/// own width, so it reads the trailing coordinates), and binds each table's fold.
+/// own width, so it reads the trailing coordinates), and binds each column block's fold.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FormsSumcheckShape {
     pub(crate) column_variables: usize,
-    pub(crate) tables: usize,
+    /// Folds bound: one per column block of every forms table.
+    pub(crate) folds: usize,
 }
 
 impl FormsSumcheckShape {
@@ -353,7 +354,7 @@ impl FormsSumcheckShape {
             Hierarchy::Atomic,
             Kind::Message,
             FOLDED_COLUMNS,
-            Length::Fixed(self.tables),
+            Length::Fixed(self.folds),
         ));
         InteractionPattern::new(steps).expect("flat forms sumcheck transcript is valid")
     }
@@ -366,7 +367,7 @@ impl FormsSumcheckShape {
         let mut separator = DomainSeparator::new(VERSION, FORMS_NAME, self.pattern::<F, EF>());
         separator
             .instance(&(self.column_variables as u64).to_be_bytes())
-            .instance(&(self.tables as u64).to_be_bytes())
+            .instance(&(self.folds as u64).to_be_bytes())
             .instance(PACKED_LABEL);
         separator
     }

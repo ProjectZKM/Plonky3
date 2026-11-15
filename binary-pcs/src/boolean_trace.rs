@@ -242,6 +242,54 @@ where
         })
     }
 
+    /// whir-gc experiment: where each column block of a forms run reads its fold, and the
+    /// selector of its place among the run's columns.
+    ///
+    /// The column index is big-endian in the sumcheck's coordinates, and a block of `2^v`
+    /// columns starts at a multiple of `2^v`, so its columns are those whose leading
+    /// `column_variables - v` bits spell `first >> v`: the block reads the trailing `v`
+    /// coordinates, under `eq(first >> v, leading)`.
+    fn forms_blocks(run: &TableRun, suffix: &Point<EF>) -> Vec<(Point<EF>, EF)> {
+        let column_variables = suffix.num_variables();
+        run.blocks
+            .iter()
+            .map(|block| {
+                let lead = column_variables - block.variables;
+                let place = block.first >> block.variables;
+                let selector = suffix.as_slice()[..lead]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &u)| if (place >> (lead - 1 - i)) & 1 == 1 { u } else { EF::ONE - u })
+                    .product();
+                (Point::new(suffix.as_slice()[lead..].to_vec()), selector)
+            })
+            .collect()
+    }
+
+    /// whir-gc experiment: a forms run's bit claims, one per block, each reading its fold.
+    fn forms_block_claims<'a>(
+        run: &'a TableRun,
+        pad: usize,
+        point: &'a Point<EF>,
+        blocks: Vec<(Point<EF>, EF)>,
+        folds: &'a [EF],
+    ) -> impl Iterator<Item = (BitOpening<EF>, BitReadings<EF>)> + 'a {
+        run.blocks.iter().zip(blocks).zip(folds).map(move |((block, (block_point, _)), &fold)| {
+            let readings = BitReadings { current: Some(fold), next: None };
+            let mut local = block_point;
+            local.extend(point);
+            let mut lifted = Point::hypercube(0, pad);
+            lifted.extend(&block.prefix.lift_prefix(&local));
+            let opening = BitOpening {
+                point: lifted,
+                row_variables: run.shape.table_variables,
+                current: true,
+                next: false,
+            };
+            (opening, readings)
+        })
+    }
+
     /// Evaluate the zero-padded column-value vector at its sampled column point.
     fn combine_columns(values: &[EF], column_point: &Point<EF>) -> EF {
         let padded_len = 1usize << column_point.num_variables();
@@ -1327,7 +1375,8 @@ where
             .map(|(run, _, _)| run.shape.column_variables())
             .max()
             .expect("at least one forms run");
-        let shape = FormsSumcheckShape { column_variables, tables: runs.len() };
+        let folds_count = runs.iter().map(|(run, _, _)| run.blocks.len()).sum();
+        let shape = FormsSumcheckShape { column_variables, folds: folds_count };
         let mut transcript =
             FormsSumcheckProverTranscript::<B::Val, EF, Challenger>::new(challenger, shape);
         let rho = transcript.weight();
@@ -1378,17 +1427,28 @@ where
                 Point::new(coordinates[column_variables - run.shape.column_variables()..].to_vec())
             })
             .collect();
-        let folds: Vec<EF> = runs
+        // One fold a column block: the block's columns at the coordinates it reads.
+        let blocks: Vec<Vec<(Point<EF>, EF)>> =
+            runs.iter().zip(&suffixes).map(|((run, _, _), suffix)| Self::forms_blocks(run, suffix)).collect();
+        let folds: Vec<Vec<EF>> = runs
             .iter()
-            .zip(&suffixes)
-            .map(|((_, _, current), suffix)| Self::combine_columns(current, suffix))
+            .zip(&blocks)
+            .map(|((run, _, current), places)| {
+                run.blocks
+                    .iter()
+                    .zip(places)
+                    .map(|(block, (block_point, _))| {
+                        let end = (block.first + (1 << block.variables)).min(current.len());
+                        Self::combine_columns(&current[block.first..end], block_point)
+                    })
+                    .collect()
+            })
             .collect();
-        transcript.folds(&folds);
-        values.extend_from_slice(&folds);
-        for (((run, point, current), suffix), &fold) in runs.iter().zip(&suffixes).zip(&folds) {
-            for (opening, readings) in
-                Self::block_claims(run, pad, point, suffix, current, &[], Some(fold))
-            {
+        let flat: Vec<EF> = folds.iter().flatten().copied().collect();
+        transcript.folds(&flat);
+        values.extend_from_slice(&flat);
+        for (((run, point, _), places), run_folds) in runs.iter().zip(blocks).zip(&folds) {
+            for (opening, readings) in Self::forms_block_claims(run, pad, point, places, run_folds) {
                 openings.push(opening);
                 expected.push(readings);
             }
@@ -1417,7 +1477,8 @@ where
             .map(|(run, _, _)| run.shape.column_variables())
             .max()
             .expect("at least one forms run");
-        let shape = FormsSumcheckShape { column_variables, tables: runs.len() };
+        let folds_count = runs.iter().map(|(run, _, _)| run.blocks.len()).sum();
+        let shape = FormsSumcheckShape { column_variables, folds: folds_count };
         let mut transcript =
             FormsSumcheckVerifierTranscript::<B::Val, EF, Challenger>::new(challenger, shape);
         let rho = transcript.weight();
@@ -1439,13 +1500,19 @@ where
             claim = a + b * r + c * r.square();
             coordinates.push(r);
         }
+        if folds.len() != folds_count {
+            transcript.abort();
+            return Err(BooleanTraceCommitmentError::PackedColumns { batch: 0 });
+        }
         transcript.folds(folds)?;
-        // Each table, zero above its width, is its weight times its fold at the trailing
-        // coordinates, scaled by eq(0, the leading ones) once for each of the two factors.
+        // Each table, zero above its width, is its weight times its column polynomial at the
+        // trailing coordinates, scaled by eq(0, the leading ones) once for each of the two
+        // factors; the column polynomial is its blocks' folds, each under its selector.
         let mut expected = EF::ZERO;
         let mut power = EF::ONE;
-        let mut suffixes = Vec::with_capacity(runs.len());
-        for ((run, _, _), &fold) in runs.iter().zip(folds) {
+        let mut placed = Vec::with_capacity(runs.len());
+        let mut rest = folds;
+        for (run, _, _) in runs {
             let lead = column_variables - run.shape.column_variables();
             let prefix: EF = coordinates[..lead].iter().map(|&u| EF::ONE - u).product();
             let suffix = Point::new(coordinates[lead..].to_vec());
@@ -1454,8 +1521,13 @@ where
                 *weight *= power;
             }
             power *= rho.exp_u64(run.forms.len() as u64);
-            expected += prefix.square() * Self::combine_columns(&weights, &suffix) * fold;
-            suffixes.push(suffix);
+            let places = Self::forms_blocks(run, &suffix);
+            let (run_folds, after) = rest.split_at(run.blocks.len());
+            rest = after;
+            let columns: EF =
+                places.iter().zip(run_folds).map(|((_, selector), &fold)| *selector * fold).sum();
+            expected += prefix.square() * Self::combine_columns(&weights, &suffix) * columns;
+            placed.push((places, run_folds));
         }
         if claim != expected {
             transcript.abort();
@@ -1463,8 +1535,8 @@ where
         }
         transcript.finish();
         // Each fold is what its block's bit claim reads; no column value is needed.
-        for (((run, point, _), suffix), &fold) in runs.iter().zip(&suffixes).zip(folds) {
-            for (opening, reading) in Self::block_claims(run, pad, point, suffix, &[], &[], Some(fold)) {
+        for ((run, point, _), (places, run_folds)) in runs.iter().zip(placed) {
+            for (opening, reading) in Self::forms_block_claims(run, pad, point, places, run_folds) {
                 openings.push(opening);
                 readings.push(reading);
             }

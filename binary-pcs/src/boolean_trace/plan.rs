@@ -410,10 +410,16 @@ fn batched_runs(protocol: &OpeningProtocol) -> Option<Vec<TableRun>> {
                 let blocks = column_blocks(placement, shapes[table], arity, used)?;
                 let column_variables = width.next_power_of_two().trailing_zeros() as usize;
                 let spec = protocol.table(table);
+                // Each block holds an aligned run of the table's columns, so the table's
+                // column polynomial is the blocks' own, each under the selector of its
+                // place: a forms sumcheck over the table's columns ends on one fold a block.
                 let packs = !spec.forms().is_empty()
                     && !next
-                    && blocks.len() == 1
-                    && blocks[0].variables == column_variables;
+                    && blocks.iter().all(|block| {
+                        block.variables <= column_variables
+                            && block.first % (1 << block.variables) == 0
+                            && block.first < width
+                    });
                 let (forms, inverse) = if packs {
                     (spec.forms().to_vec(), spec.inverse().to_vec())
                 } else {
@@ -657,10 +663,12 @@ pub(super) fn wire_value_count(route: &OpeningRoute, protocol: &OpeningProtocol)
     let own = runs
         .iter()
         .try_fold(0usize, |total, run| total.checked_add(run.shape.run_len()?))?;
-    // Two values per round over the widest forms table's column variables, one fold per run.
+    // Two values per round over the widest forms table's column variables, one fold per
+    // column block of each forms run.
     let forms_runs = runs.iter().filter(|run| !run.forms.is_empty());
     let widest = forms_runs.clone().map(|run| run.shape.column_variables()).max()?;
-    own.checked_add(2 * widest + forms_runs.count())
+    let folds: usize = forms_runs.map(|run| run.blocks.len()).sum();
+    own.checked_add(2 * widest + folds)
 }
 
 /// whir-gc experiment: a coefficient from its coordinate representation.

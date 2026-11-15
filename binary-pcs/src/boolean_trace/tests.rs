@@ -3154,3 +3154,71 @@ fn forms_tables_of_different_widths_share_one_sumcheck() {
         );
     }
 }
+
+#[test]
+fn forms_tables_split_into_column_blocks_send_one_fold_a_block() {
+    // Widths 12 and 7 are not powers of two, so the layout splits them into aligned blocks
+    // (8 + 4 and 4 + 2 + 1): one forms sumcheck over four column variables, then one fold
+    // a block, each block's bit claim reading its own.
+    let shapes = vec![TableShape::new(8, 12), TableShape::new(7, 7), TableShape::new(6, 3)];
+    let (first_forms, first_inverse) = group_forms(12, &[(1, 4), (6, 3)]);
+    let (second_forms, second_inverse) = group_forms(7, &[(2, 4)]);
+    let protocol = protocol(&shapes).with_forms(vec![
+        Some((first_forms.clone(), first_inverse)),
+        Some((second_forms.clone(), second_inverse)),
+        None,
+    ]);
+    let tables = vec![
+        table_with_width(0x9AF1, 8, 12),
+        table_with_width(0x9AF2, 7, 7),
+        table_with_width(0x9AF3, 6, 3),
+    ];
+    let mut rng = SmallRng::seed_from_u64(0x9AF4);
+    let points = vec![
+        Point::<EF>::rand(&mut rng, 8),
+        Point::rand(&mut rng, 7),
+        Point::rand(&mut rng, 6),
+    ];
+    let scheme = pcs(&shapes);
+    let mut prover_chal = challenger();
+    let (commitment, data) = scheme.commit(tables.clone(), &mut prover_chal).unwrap();
+    let proof = scheme.open_at(data, &protocol, &points, &mut prover_chal).unwrap();
+    // 7 and 4 forms, the plain table's 3 values, 2 x 4 shared rounds and five folds.
+    assert_eq!(proof.values.len(), 7 + 4 + 3 + 2 * 4 + 5);
+    let mut verifier_chal = challenger();
+    scheme.observe_commitment(&commitment, &mut verifier_chal);
+    let evals = scheme
+        .verify_at(&commitment, &proof, &protocol, &points, &mut verifier_chal)
+        .unwrap();
+    assert_eq!(
+        p3_challenger::CanSample::<EF>::sample(&mut prover_chal),
+        p3_challenger::CanSample::<EF>::sample(&mut verifier_chal)
+    );
+    let truth = |table: usize, column: usize| {
+        Poly::new(tables[table].poly(column).as_slice().to_vec()).eval_base(&points[table])
+    };
+    for (table, forms) in [(0usize, &first_forms), (1, &second_forms)] {
+        let opened = evals[table].current();
+        for form in forms {
+            let value = |columns: &dyn Fn(usize) -> EF| -> EF {
+                form.iter().map(|&(c, k)| plan::coefficient::<EF>(k) * columns(c)).sum()
+            };
+            assert_eq!(value(&|c| opened[c]), value(&|c| truth(table, c)), "table {table}");
+        }
+    }
+    for column in 0..3 {
+        assert_eq!(evals[2].current()[column], truth(2, column));
+    }
+    for index in 0..proof.values.len() {
+        let mut tampered = proof.clone();
+        tampered.values[index] += EF::ONE;
+        let mut verifier_chal = challenger();
+        scheme.observe_commitment(&commitment, &mut verifier_chal);
+        assert!(
+            scheme
+                .verify_at(&commitment, &tampered, &protocol, &points, &mut verifier_chal)
+                .is_err(),
+            "value {index}"
+        );
+    }
+}
