@@ -83,7 +83,7 @@ pub use opening::{
     ProverMultiClaim, ProverVirtualClaim, VerifierMultiClaim, VerifierOpening,
     VerifierVirtualClaim,
 };
-pub use plan::plan_stacked_layout;
+pub use plan::{plan_stacked_layout, set_aligned_layout};
 pub use prover::{
     DeviceSuffix, Layout, PrefixProver, StackedClaims, StackedDevice, SuffixProver,
     SuffixResidualProver, fold_rounds, residual_prover,

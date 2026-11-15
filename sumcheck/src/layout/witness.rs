@@ -2548,7 +2548,7 @@ mod tests {
         //     For any valid set of table shapes:
         //     - every column's evaluations live at selector.index << arity
         //     - num_variables equals log2_ceil of total size
-        //     - trailing slots past the concatenation stay zero
+        //     - slots between tables and past the last stay zero
         #[test]
         fn witness_stacks_columns_and_zeros_the_tail(shapes in arb_table_shapes()) {
             let mut rng = SmallRng::seed_from_u64(123);
@@ -2575,6 +2575,8 @@ mod tests {
             let stacked = witness.stacked_poly();
 
             // Check: each column's evaluations land at the predicted slot.
+            let stacked_len = 1usize << witness.num_variables();
+            let mut occupied = vec![false; stacked_len];
             let mut used = 0usize;
             for placement in &witness.placements {
                 let table = &witness.tables[placement.idx()];
@@ -2583,6 +2585,10 @@ mod tests {
                     let dst = selector.index() << col.num_variables();
                     let slot = &stacked.as_slice()[dst..dst + col.num_evals()];
                     assert_eq!(slot, col.as_slice());
+                    for cell in &mut occupied[dst..dst + col.num_evals()] {
+                        assert!(!*cell, "two slots overlap");
+                        *cell = true;
+                    }
                     used += col.num_evals();
                 }
             }
@@ -2590,13 +2596,11 @@ mod tests {
             // Check: the counted occupied region matches total_used.
             assert_eq!(used, total_used);
 
-            // Check: every entry past the concatenation is the zero element.
-            let stacked_len = 1usize << witness.num_variables();
-            for &v in &stacked.as_slice()[used..stacked_len] {
-                // The specific region of "used" is contiguous here only because
-                // placements are emitted largest-first and slot offsets are the
-                // cursor value. That matches the "unused tail stays zero" rule.
-                assert_eq!(v, F::ZERO);
+            // Check: every entry outside a slot, between tables or past the last, is zero.
+            for (&v, &cell) in stacked.as_slice().iter().zip(&occupied) {
+                if !cell {
+                    assert_eq!(v, F::ZERO);
+                }
             }
         }
 

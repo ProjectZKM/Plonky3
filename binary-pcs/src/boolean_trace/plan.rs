@@ -381,7 +381,8 @@ fn batched_runs(protocol: &OpeningProtocol) -> Option<Vec<TableRun>> {
         return None;
     }
     let (arity, placements) = checked_stacked_layout(&shapes)?;
-    let used = protocol.checked_num_cells()?;
+    protocol.checked_num_cells()?;
+    let used = layout_end(&placements, &shapes)?;
     let mut by_table = alloc::vec![None; shapes.len()];
     for placement in &placements {
         by_table[placement.idx()] = Some(placement);
@@ -447,7 +448,8 @@ fn batched_runs(protocol: &OpeningProtocol) -> Option<Vec<TableRun>> {
 fn hybrid_route(protocol: &OpeningProtocol) -> Option<OpeningRoute> {
     let shapes = protocol.table_shapes();
     let (arity, placements) = checked_stacked_layout(&shapes)?;
-    let used = protocol.checked_num_cells()?;
+    protocol.checked_num_cells()?;
+    let used = layout_end(&placements, &shapes)?;
     let mut by_table = alloc::vec![None; shapes.len()];
     for placement in &placements {
         by_table[placement.idx()] = Some(placement);
@@ -507,6 +509,15 @@ fn hybrid_route(protocol: &OpeningProtocol) -> Option<OpeningRoute> {
         })
         .collect();
     Some(OpeningRoute::Hybrid { runs, residual })
+}
+
+/// The cell after the last table's last slot: the layout may leave zero slots between
+/// tables, so this, not the cell count, says where no table follows.
+fn layout_end(placements: &[TablePlacement], shapes: &[TableShape]) -> Option<usize> {
+    placements.iter().try_fold(0usize, |end, placement| {
+        let last = placement.selectors().last().map_or(Some(0), |selector| selector.index().checked_add(1))?;
+        Some(end.max(last.checked_shl(shapes[placement.idx()].num_variables().try_into().ok()?)?))
+    })
 }
 
 /// Split a table's column slots into aligned blocks, largest first.

@@ -8,6 +8,7 @@
 //! - Running the same planner on both sides removes the invariant entirely.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use p3_util::log2_ceil_usize;
 
@@ -38,6 +39,11 @@ pub(crate) struct LayoutShape {
 /// - Sort source tables by arity ascending.
 /// - Iterate reversed so the largest tables land at the lowest stacked slots.
 /// - Each column gets one contiguous slot of size `2^arity`.
+/// - Under [`set_aligned_layout`], each table starts at a multiple of its width padded to a
+///   power of two, in its own slots, the slots between tables zero: then every aligned block
+///   of a table's slots is also aligned in the table's own column index, which a table read
+///   through linear forms of its columns needs.  If those gaps would grow the stacked arity,
+///   or by default, the tables lie back to back.
 /// - Selector bit-width is the stacked arity minus the table arity.
 ///
 /// # Output ordering
@@ -45,6 +51,21 @@ pub(crate) struct LayoutShape {
 /// - Placements are emitted largest-first.
 /// - Selectors inside a placement appear in source-column order.
 pub(crate) fn plan_layout(shapes: &[LayoutShape]) -> (usize, Vec<TablePlacement>) {
+    plan_layout_aligned(shapes, ALIGNED.load(Ordering::SeqCst))
+}
+
+/// whir-gc experiment: whether the planner aligns each table to its padded width.  The
+/// planner sees only shapes, so this is process-wide: a caller sets it for every commitment,
+/// proof and verification of a schedule that aligns, and clears it for the others.
+static ALIGNED: AtomicBool = AtomicBool::new(false);
+
+/// Make the planner align tables, or lay them back to back; returns the previous setting.
+pub fn set_aligned_layout(aligned: bool) -> bool {
+    ALIGNED.swap(aligned, Ordering::SeqCst)
+}
+
+/// [`plan_layout`] with the alignment given rather than read from [`set_aligned_layout`].
+pub(crate) fn plan_layout_aligned(shapes: &[LayoutShape], aligned: bool) -> (usize, Vec<TablePlacement>) {
     // Sort indices by arity ascending; reverse-iterate to place largest first.
     let mut order = (0..shapes.len()).collect::<Vec<usize>>();
     order.sort_by_key(|&i| shapes[i].arity);
@@ -57,29 +78,41 @@ pub(crate) fn plan_layout(shapes: &[LayoutShape]) -> (usize, Vec<TablePlacement>
             .sum::<usize>(),
     );
 
-    // Running cursor into the stacked polynomial, in scalar units.
-    let mut offset = 0usize;
-    let mut placements = Vec::with_capacity(shapes.len());
-
-    // Lay out largest tables first; each column claims one slot.
-    for &table_idx in order.iter().rev() {
-        let shape = &shapes[table_idx];
-        // Slot size per column: 2^arity.
-        let slot_size = 1usize << shape.arity;
-
-        // Assign one selector per column, advancing the cursor after each.
-        let selectors = (0..shape.width)
-            .map(|_| {
-                // Selector bit-width is stacked arity minus table arity.
-                let selector = Selector::new(k - shape.arity, offset >> shape.arity);
-                // Advance the cursor by one slot.
-                offset += slot_size;
-                selector
+    // Each table's first cell, in scalar units, largest tables first.
+    let starts = |aligned: bool| {
+        let mut offset = 0usize;
+        let starts = order
+            .iter()
+            .rev()
+            .map(|&table_idx| {
+                let shape = &shapes[table_idx];
+                if aligned {
+                    let block = shape.width.next_power_of_two() << shape.arity;
+                    offset = offset.div_ceil(block) * block;
+                }
+                let start = offset;
+                offset += shape.width << shape.arity;
+                (table_idx, start)
             })
-            .collect();
+            .collect::<Vec<_>>();
+        (starts, offset)
+    };
+    let starts = match aligned.then(|| starts(true)) {
+        Some((aligned, end)) if end <= 1usize << k => aligned,
+        _ => starts(false).0,
+    };
 
-        placements.push(TablePlacement::new(table_idx, selectors));
-    }
+    let placements = starts
+        .into_iter()
+        .map(|(table_idx, start)| {
+            let shape = &shapes[table_idx];
+            // Selector bit-width is stacked arity minus table arity; a column is one slot.
+            let selectors = (0..shape.width)
+                .map(|column| Selector::new(k - shape.arity, (start >> shape.arity) + column))
+                .collect();
+            TablePlacement::new(table_idx, selectors)
+        })
+        .collect();
 
     (k, placements)
 }
@@ -112,6 +145,47 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+
+    #[test]
+    fn an_aligned_layout_starts_each_table_at_its_padded_width_within_the_arity() {
+        // Equal arities place the later table first, so the 65-wide table pushes the 8-wide
+        // one off its alignment when the two lie back to back:
+        //     table 1  arity 4, width 65  ->  1040 cells, slots 0..65
+        //     table 0  arity 4, width 8   ->   128 cells, slot 65 back to back, 72 aligned
+        //     table 2  arity 2, width 3   ->    12 cells, cell 1280 aligned
+        //     stacked  log2_ceil(1180) = 11, and the aligned end 1292 still fits 2048
+        let shapes = [
+            LayoutShape { arity: 4, width: 8 },
+            LayoutShape { arity: 4, width: 65 },
+            LayoutShape { arity: 2, width: 3 },
+        ];
+        let start = |plan: &(usize, Vec<TablePlacement>), table: usize| {
+            let placement = plan.1.iter().find(|p| p.idx() == table).unwrap();
+            placement.selectors()[0].index() << shapes[table].arity
+        };
+        let packed = plan_layout_aligned(&shapes, false);
+        let aligned = plan_layout_aligned(&shapes, true);
+        assert_eq!((packed.0, aligned.0), (11, 11));
+        assert_eq!((start(&packed, 1), start(&packed, 0)), (0, 65 << 4));
+        assert_eq!((start(&aligned, 1), start(&aligned, 0), start(&aligned, 2)), (0, 72 << 4, 1280));
+        for (table, shape) in shapes.iter().enumerate() {
+            let block = shape.width.next_power_of_two() << shape.arity;
+            assert_eq!(start(&aligned, table) % block, 0, "table {table}");
+            // Columns stay one slot apart within a table.
+            let placement = aligned.1.iter().find(|p| p.idx() == table).unwrap();
+            for (column, selector) in placement.selectors().iter().enumerate() {
+                assert_eq!(selector.index(), placement.selectors()[0].index() + column);
+            }
+        }
+        // Gaps that would grow the arity fall back to the packed layout: 65 and 33 columns
+        // of 16 rows fill 1568 of 2048 cells, but the 33-wide table aligned at cell 2048
+        // would end past them.
+        let wide = [LayoutShape { arity: 4, width: 33 }, LayoutShape { arity: 4, width: 65 }];
+        let (k, placements) = plan_layout_aligned(&wide, true);
+        assert_eq!(k, 11);
+        let narrow = placements.iter().find(|p| p.idx() == 0).unwrap();
+        assert_eq!(narrow.selectors()[0].index(), 65);
+    }
 
     #[test]
     fn the_public_planner_lays_out_what_the_private_one_does() {
