@@ -59,6 +59,12 @@ pub struct BinaryWhirProfile {
     first_round: Option<(usize, usize)>,
     /// Grinding the derivation starts from, so queries close only the rest of the target.
     query_grinding: usize,
+    /// Every round's folding factor, zeros past the last; all zero for a constant (or
+    /// first-round) schedule.
+    round_folds: [u8; 8],
+    /// Rounds of a per-round schedule that keep their folded domain, so their rate grows by
+    /// their folding factor rather than one less: bit `i` for round `i`.
+    kept_domains: u32,
 }
 
 impl BinaryWhirProfile {
@@ -76,6 +82,8 @@ impl BinaryWhirProfile {
             folding_factor,
             first_round: None,
             query_grinding: 0,
+            round_folds: [0; 8],
+            kept_domains: 0,
         }
     }
 
@@ -95,6 +103,8 @@ impl BinaryWhirProfile {
             folding_factor,
             first_round: None,
             query_grinding: 0,
+            round_folds: [0; 8],
+            kept_domains: 0,
         }
     }
 
@@ -114,6 +124,8 @@ impl BinaryWhirProfile {
             folding_factor,
             first_round: None,
             query_grinding: 0,
+            round_folds: [0; 8],
+            kept_domains: 0,
         }
     }
 
@@ -137,8 +149,45 @@ impl BinaryWhirProfile {
         self
     }
 
+    /// Fold `round_folds[i]` variables in round `i` (zeros past the last round), every round's
+    /// domain shrinking by one bit except those whose bit is set in `kept_domains`.
+    ///
+    /// A schedule these folds do not fit, for the variables a commitment has, falls back to
+    /// the profile's constant folding.  It takes the place of [`Self::with_first_round`].
+    #[must_use]
+    pub const fn with_round_folds(mut self, round_folds: [u8; 8], kept_domains: u32) -> Self {
+        self.round_folds = round_folds;
+        self.kept_domains = kept_domains;
+        self
+    }
+
     /// The folding factors and the explicit round rates of this profile.
     fn schedule(&self, num_variables: usize) -> Result<(FoldingFactor, Vec<usize>), ProfileError> {
+        if self.round_folds[0] != 0 {
+            let folding = FoldingFactor::PerRound(
+                self.round_folds
+                    .iter()
+                    .take_while(|&&fold| fold != 0)
+                    .map(|&fold| usize::from(fold))
+                    .collect(),
+            );
+            if self.kept_domains == 0 {
+                return Ok((folding, Vec::new()));
+            }
+            let schedule = folding
+                .compute_folding_schedule(num_variables)
+                .map_err(|error| ProfileError::Schedule(WhirConfigError::FoldingFactor(error)))?;
+            let mut rate = self.starting_log_inv_rate;
+            let rates = schedule[..schedule.len() - 1]
+                .iter()
+                .enumerate()
+                .map(|(round, &factor)| {
+                    rate += factor - 1 + ((self.kept_domains >> round) & 1) as usize;
+                    rate
+                })
+                .collect();
+            return Ok((folding, rates));
+        }
         let Some((first, reduction)) = self.first_round else {
             return Ok((FoldingFactor::Constant(self.folding_factor), Vec::new()));
         };
@@ -184,6 +233,36 @@ impl BinaryWhirProfile {
     ///
     /// Returns an error when the schedule itself is infeasible.
     pub fn config<EF, F, Challenger, Domain>(
+        &self,
+        num_variables: usize,
+        domain: &Domain,
+    ) -> Result<WhirConfig<EF, F, Challenger>, ProfileError>
+    where
+        F: Field,
+        EF: ExtensionField<F>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+        Domain: WhirDomain<F, EF>,
+    {
+        // A per-round schedule that does not fit these variables falls back to the constant one.
+        if self.round_folds[0] != 0 {
+            let per_round = Self {
+                round_folds: [0; 8],
+                kept_domains: 0,
+                ..*self
+            };
+            return match self.config_exact::<EF, F, Challenger, Domain>(num_variables, domain) {
+                Err(ProfileError::Schedule(error)) => {
+                    tracing::debug!(num_variables, ?error, "per-round folds do not fit: constant schedule");
+                    per_round.config_exact(num_variables, domain)
+                }
+                other => other,
+            };
+        }
+        self.config_exact(num_variables, domain)
+    }
+
+    /// [`Self::config`] for exactly this profile's schedule, with no fallback.
+    fn config_exact<EF, F, Challenger, Domain>(
         &self,
         num_variables: usize,
         domain: &Domain,
@@ -243,6 +322,33 @@ mod tests {
     const SECURITY_LEVEL: usize = 100;
     const LOG_INV_RATE: usize = 2;
     const FOLDING: usize = 3;
+
+    #[test]
+    fn per_round_folds_shape_the_rounds_and_fall_back_when_they_do_not_fit() {
+        // The narrow level-4 schedule: 23 packed variables at 1/1024, folds 4, 5, 4, 4, the
+        // first round keeping its domain.
+        let profile = BinaryWhirProfile::proven_list_decoding(108, 10, 5)
+            .with_round_folds([4, 5, 4, 4, 0, 0, 0, 0], 1);
+        let config = profile
+            .config::<EF, EF, MyChallenger, _>(23, &BooleanWhirDomain::default())
+            .unwrap();
+        let rounds: alloc::vec::Vec<(usize, usize)> = config
+            .round_parameters()
+            .iter()
+            .map(|round| (round.folding_factor, round.log_inv_rate))
+            .collect();
+        assert_eq!(rounds, [(4, 14), (5, 18), (4, 21)]);
+        // Nine variables cannot take these folds: the constant schedule is used instead.
+        let small = BinaryWhirProfile::unique_decoding(SECURITY_LEVEL, LOG_INV_RATE, FOLDING)
+            .with_round_folds([4, 5, 4, 4, 0, 0, 0, 0], 1);
+        let fallback = small
+            .config::<EF, EF, MyChallenger, _>(NUM_VARIABLES, &BooleanWhirDomain::default())
+            .unwrap();
+        let constant = BinaryWhirProfile::unique_decoding(SECURITY_LEVEL, LOG_INV_RATE, FOLDING)
+            .config::<EF, EF, MyChallenger, _>(NUM_VARIABLES, &BooleanWhirDomain::default())
+            .unwrap();
+        assert_eq!(fallback.folding_schedule(), constant.folding_schedule());
+    }
 
     #[test]
     fn a_schedule_that_opens_no_position_is_refused() {

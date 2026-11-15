@@ -285,6 +285,49 @@ fn a_boolean_opening_round_trips_through_whir() {
 }
 
 #[test]
+fn merged_claims_round_trip_through_whir_and_refuse_a_false_value() {
+    // Invariant: claims sharing the coordinates one element absorbs send one tensor when
+    // merging is asked for, open to the bits' values, and a moved value is refused.
+    let bits = witness(0x5741);
+    let reference = embedded(&bits);
+    let mut points = points_at(0x5742, 3);
+    let shared = points[0].as_slice()[LOG_BITS - ABSORBED..].to_vec();
+    for point in &mut points[1..] {
+        let mut coordinates = point.as_slice()[..LOG_BITS - ABSORBED].to_vec();
+        coordinates.extend_from_slice(&shared);
+        *point = Point::new(coordinates);
+    }
+    let profile = BinaryWhirProfile::proven_list_decoding(SECURITY_LEVEL, LOG_INV_RATE, FOLDING);
+    let sizes: Vec<usize> = [false, true]
+        .into_iter()
+        .map(|merge| {
+            let pcs = whir_pcs(profile).with_merged_claims(merge);
+            let mut prover_chal = challenger();
+            let (commitment, data) = pcs.commit_bits(&bits, &mut prover_chal).unwrap();
+            let (values, proof) = pcs.open_at_points(data, &points, &mut prover_chal).unwrap();
+            for (point, &value) in points.iter().zip(&values) {
+                assert_eq!(value, reference.eval_base(point), "merge {merge}");
+            }
+            let mut verifier_chal = challenger();
+            pcs.observe_commitment(&commitment, &mut verifier_chal);
+            pcs.verify_at_points(&commitment, &points, &values, &proof, &mut verifier_chal)
+                .unwrap_or_else(|error| panic!("merge {merge}: {error:?}"));
+            let mut tampered = values.clone();
+            tampered[2] += EF::ONE;
+            let mut verifier_chal = challenger();
+            pcs.observe_commitment(&commitment, &mut verifier_chal);
+            assert!(
+                pcs.verify_at_points(&commitment, &points, &tampered, &proof, &mut verifier_chal)
+                    .is_err(),
+                "merge {merge}: a moved value is refused"
+            );
+            proof.reduction.claims.len()
+        })
+        .collect();
+    assert_eq!(sizes, [3, 1], "merging sends one tensor for the three claims");
+}
+
+#[test]
 fn a_weighted_opening_round_trips_through_whir() {
     // Invariant: a claim weighing the absorbed bit patterns opens to the weighted bit planes.
     let bits = witness(0x5714);

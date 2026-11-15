@@ -7,6 +7,19 @@ use p3_matrix::dense::RowMajorMatrix;
 use crate::boundary::BoundaryPublic;
 use crate::builder::AirBuilder;
 
+/// Linear forms of a trace's columns, with a right inverse (whir-gc experiment).
+///
+/// Coefficients are field elements as their coordinate representations,
+/// little-endian: `sum_k bit_k(c) e_k` over the coordinate basis `e`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinearForms {
+    /// Form `j` is `sum (column, c) in forms[j]` of `c * column`.
+    pub forms: Vec<Vec<(usize, u128)>>,
+    /// Column `i` is `sum (j, c) in inverse[i]` of `c * form_j`: columns the
+    /// forms take the values of, one list per column.
+    pub inverse: Vec<Vec<(usize, u128)>>,
+}
+
 /// The underlying structure of an AIR.
 pub trait BaseAir<F>: Sync {
     /// The number of columns (a.k.a. registers) in this AIR.
@@ -177,6 +190,26 @@ pub trait BaseAir<F>: Sync {
     /// or, in the worst case, a soundness gap.
     fn main_next_row_columns(&self) -> Vec<usize> {
         (0..self.width()).collect()
+    }
+
+    /// The linear forms of its main columns this AIR reads, when it reads its
+    /// main columns only through them (whir-gc experiment).
+    ///
+    /// An opening may then send one value per form instead of one per column,
+    /// and hand the AIR the columns the forms' right inverse makes of them.
+    ///
+    /// # Correctness
+    ///
+    /// Every constraint and bus field must be a polynomial in the forms, and
+    /// the inverse must be a right inverse of them: anything else is checked
+    /// against columns the prover never committed to.
+    fn main_linear_forms(&self) -> Option<LinearForms> {
+        None
+    }
+
+    /// As [`Self::main_linear_forms`], for the preprocessed columns.
+    fn preprocessed_linear_forms(&self) -> Option<LinearForms> {
+        None
     }
 
     /// Which preprocessed trace columns have their next row accessed by this

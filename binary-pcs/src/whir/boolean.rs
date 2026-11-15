@@ -158,6 +158,9 @@ pub struct BooleanWhirPcs<F: Field, EF: ExtensionField<F>, Dft, MT, Challenger> 
     inner: BooleanWhirProver<F, EF, Dft, MT, Challenger>,
     /// Variables the bit witness has, which is the packing's plus the absorbed ones.
     num_variables: usize,
+    /// Whether a batch of readings whose claims share the coordinates an element absorbs sends
+    /// one tensor between them; off unless asked for, and proven on the host only.
+    merge_claims: bool,
 }
 
 impl<F, EF, Dft, MT, Challenger> BooleanWhirPcs<F, EF, Dft, MT, Challenger>
@@ -278,7 +281,25 @@ where
         Ok(Self {
             inner,
             num_variables,
+            merge_claims: false,
         })
+    }
+
+    /// Let each batch of readings send one ring-switch tensor for all of its claims when they
+    /// share the coordinates an element absorbs, instead of one per claim.
+    ///
+    /// Prover and verifier must agree on it.  A merged batch is proven on the host: a packing
+    /// held on a device is refused.
+    #[must_use]
+    pub const fn with_merged_claims(mut self, merge: bool) -> Self {
+        self.merge_claims = merge;
+        self
+    }
+
+    /// Whether batches of readings may send one tensor between their claims.
+    #[must_use]
+    pub const fn merges_claims(&self) -> bool {
+        self.merge_claims
     }
 
     /// Variables the committed bit witness has, so `2^n` bits in all.
@@ -517,7 +538,22 @@ where
     > {
         self.check_openings(openings)?;
         // Every reduction is set up before any runs, so a refused one leaves the transcript alone.
-        let claims = Self::claims(openings)?;
+        let claims = Self::claims(openings)?.with_merging(self.merge_claims);
+        if claims.merged() {
+            assert!(
+                !prover_data.table(0).is_held(),
+                "merged claims are proven on the host, not from a packing held on a device"
+            );
+            let packing = Self::packing(prover_data);
+            let (reduction, surviving_point, _, currents) =
+                tracing::info_span!("bit ring switch").in_scope(|| {
+                    claims.prove_with_readings::<<EF as BitChallengeField<F>>::SumcheckRepr, _, _>(
+                        &packing, challenger,
+                    )
+                });
+            let readings = Self::readings_of(openings, &claims, &reduction, &currents)?;
+            return Ok((readings, reduction, surviving_point));
+        }
         let (reduction, surviving_point) =
             Self::switch_claims(prover_data, &claims, device, challenger);
 
@@ -539,6 +575,36 @@ where
             })
             .collect::<Result<Vec<_>, BooleanWhirError>>()?;
         Ok((readings, reduction, surviving_point))
+    }
+
+    /// The readings a merged batch's proof holds, one per opening.
+    ///
+    /// Each current reading comes from the prover's own element, since the proof sends one
+    /// element for the batch; a merged batch never reads a successor.
+    fn readings_of(
+        openings: &[BitOpening<EF>],
+        claims: &BitRingSwitchClaims<F, EF>,
+        reduction: &BitRingSwitchClaimsProof<F, EF>,
+        currents: &[EF],
+    ) -> Result<Vec<BitReadings<EF>>, BooleanWhirError> {
+        openings
+            .iter()
+            .zip(claims.reductions())
+            .zip(currents)
+            .enumerate()
+            .map(|(index, ((opening, switch), &reading))| {
+                let current = opening.current.then_some(reading);
+                let next = opening
+                    .next
+                    .then(|| {
+                        let elements = &reduction.claims[index];
+                        switch.successor_claim(&elements.tensor, elements.successor.as_ref())
+                    })
+                    .transpose()
+                    .map_err(BooleanWhirError::Reduction)?;
+                Ok(BitReadings { current, next })
+            })
+            .collect()
     }
 
     /// One batched ring switch over a batch of claims, leaving one claim about the packing.
@@ -892,7 +958,9 @@ where
         challenger: &mut Challenger,
     ) -> Result<(Point<EF>, EF), BooleanWhirError> {
         self.check_openings(openings)?;
-        if readings.len() != openings.len() || proof.reduction.claims.len() != openings.len() {
+        let claims = Self::claims(openings)?.with_merging(self.merge_claims);
+        if readings.len() != openings.len() || proof.reduction.claims.len() != claims.elements_sent()
+        {
             return Err(BooleanWhirError::ClaimCount {
                 expected: openings.len(),
                 values: readings.len(),
@@ -910,7 +978,6 @@ where
         {
             return Err(BooleanWhirError::ReadingShape { index });
         }
-        let claims = Self::claims(openings)?;
         let readings = readings
             .iter()
             .map(|reading| (reading.current, reading.next))

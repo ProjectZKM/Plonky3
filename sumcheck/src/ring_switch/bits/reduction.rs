@@ -424,6 +424,11 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitch<F, EF>
         }
     }
 
+    /// Whether the claim also answers a successor view.
+    pub(super) const fn has_successor_view(&self) -> bool {
+        self.successor().is_some()
+    }
+
     /// Set up the reduction of a claim at one point, also answering its successor view.
     ///
     /// The successor view reads the witness one row on, the last row repeating.
@@ -1525,6 +1530,26 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitchBatch<'
             let (carry, last) = self.reduction.successor_elements(r_prime);
             equality + self.successor_rows(alpha, &carry, &last)
         }))
+    }
+
+    /// The closing weight with the claim's equality table scaled by `scale`:
+    /// the weight multilinear of `scale * eq(r_high, .)` where the rounds
+    /// ended, as a merged batch weighs its claims.  No successor share.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the point names the reduction's variables.
+    pub(super) fn closing_weight_scaled(
+        &self,
+        r_prime: &Point<EF>,
+        scale: EF,
+    ) -> Result<EF, BitRingSwitchError> {
+        let (prefix, _) = self.reduction.fixed_prefix();
+        self.reduction
+            .check_width(prefix + r_prime.num_variables())?;
+        let mut equality = self.reduction.equality_element(r_prime);
+        equality.scale_columns(scale);
+        Ok(self.batch_rows(&equality))
     }
 
     /// The rows of an element, batched against the batching challenge.

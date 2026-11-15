@@ -153,6 +153,11 @@ pub struct TableSpec {
     shape: TableShape,
     /// Opening schedule local to this table.
     point_schedule: PointSchedule,
+    /// whir-gc experiment: linear forms the table's columns are read through,
+    /// as coordinate representations, empty when every column is read.
+    forms: Vec<Vec<(usize, u128)>>,
+    /// A right inverse of the forms: one `(form, coefficient)` list per column.
+    inverse: Vec<Vec<(usize, u128)>>,
 }
 
 impl TableSpec {
@@ -196,7 +201,47 @@ impl TableSpec {
         Self {
             shape,
             point_schedule,
+            forms: Vec::new(),
+            inverse: Vec::new(),
         }
+    }
+
+    /// The linear forms this table's columns are read through, empty when every
+    /// column is read.
+    #[must_use]
+    pub fn forms(&self) -> &[Vec<(usize, u128)>] {
+        &self.forms
+    }
+
+    /// The right inverse of the forms, one list per column.
+    #[must_use]
+    pub fn inverse(&self) -> &[Vec<(usize, u128)>] {
+        &self.inverse
+    }
+
+    /// Declare the linear forms the table's columns are read through, and a right inverse.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless every form names columns of the table and the inverse has one
+    /// list per column naming forms only.
+    #[must_use]
+    pub fn with_forms(mut self, forms: Vec<Vec<(usize, u128)>>, inverse: Vec<Vec<(usize, u128)>>) -> Self {
+        if !forms.is_empty() {
+            assert!(
+                forms.iter().flatten().all(|&(column, _)| column < self.shape.width()),
+                "a form reads columns of the table"
+            );
+            assert_eq!(inverse.len(), self.shape.width(), "one inverse list per column");
+            // `usize::MAX` stands for the constant one: an affine inverse.
+            assert!(
+                inverse.iter().flatten().all(|&(form, _)| form < forms.len() || form == usize::MAX),
+                "the inverse names forms"
+            );
+        }
+        self.forms = forms;
+        self.inverse = inverse;
+        self
     }
 
     /// Returns the logical table shape.
@@ -229,6 +274,37 @@ impl OpeningProtocol {
     /// Builds an opening protocol from table specs.
     pub const fn new(tables: Vec<TableSpec>) -> Self {
         Self(tables)
+    }
+
+    /// The table spec of table `table`.
+    #[must_use]
+    pub fn table(&self, table: usize) -> &TableSpec {
+        &self.0[table]
+    }
+
+    /// Declare each table's linear forms and their inverse, `None` for a table read
+    /// column by column.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless there is one entry per table, each valid for its table.
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn with_forms(
+        self,
+        forms: Vec<Option<(Vec<Vec<(usize, u128)>>, Vec<Vec<(usize, u128)>>)>>,
+    ) -> Self {
+        assert_eq!(forms.len(), self.0.len(), "one entry per table");
+        Self(
+            self.0
+                .into_iter()
+                .zip(forms)
+                .map(|(table, forms)| match forms {
+                    Some((forms, inverse)) => table.with_forms(forms, inverse),
+                    None => table,
+                })
+                .collect(),
+        )
     }
 
     /// Returns the table shapes in protocol order.
