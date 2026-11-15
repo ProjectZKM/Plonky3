@@ -150,13 +150,22 @@ impl<K: BitCoordinates> TraceBasis<K> {
                 mask.set(j);
             }
         }
-        // The Gram matrix of the trace form, inverted over F_2 by elimination on [G | I].
+        // The Gram matrix of the trace form, inverted over F_2 by elimination on [G | I]. The
+        // trace is F_2-linear, so each entry is a parity against the basis traces.
+        let parity = |x: K| {
+            Coefficients::<K>::of(x)
+                .iter_set()
+                .filter(|&j| mask.get(j))
+                .count()
+                % 2
+                == 1
+        };
         let mut gram: Vec<BitRow> = basis
             .iter()
             .map(|&bi| {
                 let mut row = BitRow::default();
                 for (j, &bj) in basis.iter().enumerate() {
-                    if Self::absolute_trace(bi * bj) {
+                    if parity(bi * bj) {
                         row.set(j);
                     }
                 }

@@ -95,6 +95,7 @@ use super::reduction::{
     BitRingSwitchProofError, SuccessorTensors, check_no_grinding, slot_packing,
 };
 use super::tensor::{BitTensor, SuffixTensors};
+use super::trace::TraceBasis;
 use super::transcript::{
     BitRingSwitchClaimsProverTranscript, BitRingSwitchClaimsShape,
     BitRingSwitchClaimsVerifierTranscript, ClaimStatement, ClaimsDraws, TranscriptWidth,
@@ -1144,8 +1145,8 @@ where
     /// ```
     ///
     /// with `gate_c` the claim's Boolean slot coordinates against `r'`, and `E_c` lifted into the
-    /// tensor algebra one factor per coordinate, as [`BitRingSwitchBatch::closing_weight_scaled`]
-    /// forms it for one claim.
+    /// tensor algebra one factor per coordinate, as [`BitRingSwitchBatch::closing_weight`] forms
+    /// it for one claim.
     ///
     /// # Algorithm
     ///
@@ -1164,6 +1165,25 @@ where
     ///
     /// Two coordinates share a node only when their values are equal; a recording verifier
     /// records each comparison as the condition it enforces.
+    ///
+    /// # Galois components
+    ///
+    /// The fold runs in the components of the algebra, not on its bit matrix. With `n` the
+    /// dimension, `phi_j(a ⊗ b) = a^(2^j) * b` for `j < n` is a ring map `EF ⊗ EF -> EF`, and
+    /// together they are an isomorphism onto `EF^n`. A factor is `1 + a^(2^j) + b` in component
+    /// `j`, so applying it costs `n` products, where scaling the matrix's columns and rows costs
+    /// `2n`. The `2^j`-th powers are squarings, which are linear.
+    ///
+    /// The rows come back through the trace-dual basis `delta_u`: the element is
+    /// `sum_u beta_u ⊗ row_u`, so `phi_j = sum_u beta_u^(2^j) * row_u`, and the trace form
+    /// inverts that:
+    ///
+    /// ```text
+    ///     row_u        =  sum_j delta_u^(2^j) * phi_j
+    ///     rows(total)  =  sum_u w_u * row_u  =  sum_j c_j * phi_j,     c_j = sum_u w_u * delta_u^(2^j)
+    /// ```
+    ///
+    /// with `w_u` the batching rows' weights. Each `c_j` takes the weights against constants.
     fn merged_closing(
         &self,
         batch: &BitRingSwitchBatch<'_, F, EF>,
@@ -1177,8 +1197,9 @@ where
         // empty tail. Children are created after their parents.
         let mut nodes: Vec<(usize, usize, EF)> = alloc::vec![(0, width, EF::ZERO)];
         let mut children: Vec<Vec<usize>> = alloc::vec![Vec::new()];
-        let mut sums: Vec<Option<BitTensor<EF, EF>>> = alloc::vec![None];
-        for (reduction, &weight) in self.reductions.iter().zip(weights) {
+        // Each claim's node and the second leg of its term `weight ⊗ gate`.
+        let mut ends: Vec<(usize, EF)> = Vec::with_capacity(self.reductions.len());
+        for reduction in &self.reductions {
             let fixed = reduction.fixed_prefix().0;
             reduction.check_width(prefix + r.len())?;
             let high = reduction.high();
@@ -1191,32 +1212,40 @@ where
                     let child = nodes.len();
                     nodes.push((node, k, value));
                     children.push(Vec::new());
-                    sums.push(None);
                     children[node].push(child);
                     child
                 });
             }
-            // weight ⊗ gate: the first leg's basis carries the weight, the second leg the gate.
-            let mut own = BitTensor::<EF, EF>::one();
-            own.scale_columns(weight);
-            own.scale_rows(gate);
-            match &mut sums[node] {
-                Some(total) => *total += own,
-                slot => *slot = Some(own),
-            }
+            ends.push((node, gate));
         }
-        for node in (1..nodes.len()).rev() {
-            let (parent, k, value) = nodes[node];
-            let Some(mut sum) = sums[node].take() else {
-                continue;
-            };
-            sum.mul_equality_factor(value, r[k - prefix]);
-            match &mut sums[parent] {
-                Some(total) => *total += sum,
-                slot => *slot = Some(sum),
+
+        // Component j of the first-leg values: the values raised to 2^j, squared once per step.
+        let mut values: Vec<EF> = nodes.iter().map(|node| node.2).collect();
+        let mut first: Vec<EF> = weights.to_vec();
+        let trace = TraceBasis::<EF>::new();
+        let rows = batch.row_weights();
+        let mut sums = alloc::vec![EF::ZERO; nodes.len()];
+        let mut closing = EF::ZERO;
+        for j in 0..rows.len() {
+            if j > 0 {
+                for x in values.iter_mut().chain(&mut first) {
+                    *x = x.square();
+                }
             }
+            sums.fill(EF::ZERO);
+            for (&(node, gate), &weight) in ends.iter().zip(&first) {
+                sums[node] += weight * gate;
+            }
+            for node in (1..nodes.len()).rev() {
+                let (parent, k, _) = nodes[node];
+                let folded = sums[node] * (EF::ONE + values[node] + r[k - prefix]);
+                sums[parent] += folded;
+            }
+            let coefficient: EF =
+                rows.iter().enumerate().map(|(u, &w)| w * trace.dual_conjugate(u, j)).sum();
+            closing += coefficient * sums[0];
         }
-        Ok(sums[0].take().map_or(EF::ZERO, |total| batch.closing_rows(&total)))
+        Ok(closing)
     }
 
     /// What every claim binds, borrowed from the claims and their elements.
