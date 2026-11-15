@@ -1338,6 +1338,11 @@ mod pair {
 
     /// One trace commitment at the main trace's arity, for either side.
     fn trace_pcs() -> TracePcs {
+        trace_pcs_with(false, false)
+    }
+
+    /// [`trace_pcs`] with merged claims and a joint pair switch as asked.
+    fn trace_pcs_with(merge: bool, joint: bool) -> TracePcs {
         let (arity, _) = plan_stacked_layout(&[MAIN]);
         let domain = BooleanWhirDomain::default();
         let config = BinaryWhirProfile::unique_decoding(SECURITY_LEVEL, LOG_INV_RATE, FOLDING)
@@ -1345,7 +1350,10 @@ mod pair {
             .unwrap();
         let cap_height = recommended_cap_height(&config);
         TracePcs::from_commitment(
-            BooleanWhirPcs::new(Prover::new(config, domain, mmcs(cap_height)), arity).unwrap(),
+            BooleanWhirPcs::new(Prover::new(config, domain, mmcs(cap_height)), arity)
+                .unwrap()
+                .with_merged_claims(merge)
+                .with_joint_pair(joint),
         )
     }
 
@@ -1366,6 +1374,14 @@ mod pair {
         )])
     }
 
+    /// Every column of the table at the current row only.
+    fn current_protocol(shape: TableShape) -> OpeningProtocol {
+        OpeningProtocol::new(vec![TableSpec::new(
+            shape,
+            vec![OpeningBatch::new(vec![0, 1, 2, 3], Vec::new())],
+        )])
+    }
+
     fn row_point(shape: TableShape, seed: u64) -> Vec<Point<EF>> {
         vec![Point::<EF>::rand(
             &mut SmallRng::seed_from_u64(seed),
@@ -1379,11 +1395,29 @@ mod pair {
         MainValue,
         SecondValue,
         Swapped,
+        /// The second side's empty switch given the first side's.
+        SecondSwitch,
     }
 
+    /// How the pair is committed and read.
+    #[derive(Clone, Copy, Debug)]
+    struct Mode {
+        merge: bool,
+        joint: bool,
+        next: bool,
+    }
+
+    const SEPARATE: Mode = Mode { merge: false, joint: false, next: true };
+
     fn run(tamper: Tamper) -> Result<(), String> {
-        let (main_pcs, second_pcs) = (trace_pcs(), trace_pcs());
-        let (main_protocol, second_protocol) = (protocol(MAIN), protocol(SECOND));
+        run_in(SEPARATE, tamper)
+    }
+
+    fn run_in(mode: Mode, tamper: Tamper) -> Result<(), String> {
+        let (main_pcs, second_pcs) =
+            (trace_pcs_with(mode.merge, mode.joint), trace_pcs_with(mode.merge, mode.joint));
+        let read = if mode.next { protocol } else { current_protocol };
+        let (main_protocol, second_protocol) = (read(MAIN), read(SECOND));
         let (main_points, second_points) = (row_point(MAIN, 1), row_point(SECOND, 2));
 
         let mut prover = challenger();
@@ -1426,11 +1460,19 @@ mod pair {
             second_proof.opening.opening,
             BooleanWhirOpening::Pair(_)
         ));
+        // A joint pair's one switch rides on the first side.
+        assert_eq!(second_proof.opening.reduction.claims.is_empty(), mode.joint);
 
         match tamper {
             Tamper::MainValue => main_proof.values[0] += EF::ONE,
-            Tamper::SecondValue => second_proof.values[5] += EF::ONE,
+            Tamper::SecondValue => {
+                let last = second_proof.values.len() - 1;
+                second_proof.values[last] += EF::ONE;
+            }
             Tamper::Swapped => core::mem::swap(&mut main_proof, &mut second_proof),
+            Tamper::SecondSwitch => {
+                second_proof.opening.reduction = main_proof.opening.reduction.clone();
+            }
             Tamper::None => {}
         }
 
@@ -1484,6 +1526,21 @@ mod pair {
     #[test]
     fn two_traces_open_under_one_proximity_opening() {
         run(Tamper::None).unwrap();
+    }
+
+    #[test]
+    fn a_joint_pair_switches_both_sides_at_once_and_refuses_tampering() {
+        for mode in [
+            Mode { merge: true, joint: true, next: false },
+            Mode { merge: false, joint: true, next: true },
+        ] {
+            run_in(mode, Tamper::None).unwrap_or_else(|error| panic!("{mode:?}: {error}"));
+            for tamper in
+                [Tamper::MainValue, Tamper::SecondValue, Tamper::Swapped, Tamper::SecondSwitch]
+            {
+                assert!(run_in(mode, tamper).is_err(), "{mode:?} {tamper:?}");
+            }
+        }
     }
 
     #[test]

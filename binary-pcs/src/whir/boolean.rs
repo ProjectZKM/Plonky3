@@ -48,11 +48,11 @@ use p3_sumcheck::ring_switch::bits::{
     PackingRoundsDevice, SuffixTensors, TraceReduction,
 };
 use p3_sumcheck::{
-    OpeningBatch, OpeningProtocol, PrescribedOpeningSecurity, PrescribedPointPcs, TableShape,
-    TableSpec,
+    OpeningBatch, OpeningProtocol, PrescribedOpeningSecurity, PrescribedPointPcs, SumcheckData,
+    TableShape, TableSpec,
 };
 use p3_whir::{
-    InitialWeightCheck, PairDevices, PcsProof, SingleDevices, WhirDomain, WhirProver,
+    InitialWeightCheck, PairDevices, PairProof, PcsProof, SingleDevices, WhirDomain, WhirProver,
     WhirProverData, pair_batching_error,
 };
 
@@ -161,6 +161,9 @@ pub struct BooleanWhirPcs<F: Field, EF: ExtensionField<F>, Dft, MT, Challenger> 
     /// Whether a batch of readings whose claims share the coordinates an element absorbs sends
     /// one tensor between them; off unless asked for, and proven on the host only.
     merge_claims: bool,
+    /// Whether a pair's two ring switches run as one over both packings; off unless asked for,
+    /// and proven on the host only.
+    joint_pair: bool,
 }
 
 impl<F, EF, Dft, MT, Challenger> BooleanWhirPcs<F, EF, Dft, MT, Challenger>
@@ -282,6 +285,7 @@ where
             inner,
             num_variables,
             merge_claims: false,
+            joint_pair: false,
         })
     }
 
@@ -300,6 +304,18 @@ where
     #[must_use]
     pub const fn merges_claims(&self) -> bool {
         self.merge_claims
+    }
+
+    /// Let a pair of witnesses run one ring switch for both sides' readings, over their two
+    /// packings behind a leading selector variable, instead of one switch a side: one tensor
+    /// and one sumcheck fewer, and the pair's two surviving points one.
+    ///
+    /// Prover and verifier must agree on it, and it holds for pairs this commitment opens
+    /// first.  A joint pair is proven on the host: a packing held on a device is refused.
+    #[must_use]
+    pub const fn with_joint_pair(mut self, joint: bool) -> Self {
+        self.joint_pair = joint;
+        self
     }
 
     /// Variables the committed bit witness has, so `2^n` bits in all.
@@ -1207,6 +1223,9 @@ where
     ) -> Result<PairReadings<EF, BooleanWhirProof<F, EF, MT>>, BooleanWhirError> {
         self.check_partner(second)?;
         second.check_openings(second_side.1)?;
+        if self.joint_pair {
+            return self.open_readings_joint(first_side, second_side, challenger);
+        }
         let (first_readings, first_reduction, first_point) = self.switch(
             &first_side.0,
             first_side.1,
@@ -1282,6 +1301,9 @@ where
             return Err(BooleanWhirError::OpeningKind);
         };
         second.check_openings(second_side.openings)?;
+        if self.joint_pair {
+            return self.verify_readings_joint(first_side, second_side, pair, challenger);
+        }
         let (first_point, first_value) = self.check_switch(
             first_side.openings,
             first_side.readings,
@@ -1314,6 +1336,163 @@ where
             {
                 Ok(())
             }
+            _ => Err(BooleanWhirError::SurvivingClaim),
+        }
+    }
+
+    /// Both sides' openings over the two packings behind a leading selector variable: the
+    /// first side's at zero, the second side's at one.
+    fn joint_openings(first: &[BitOpening<EF>], second: &[BitOpening<EF>]) -> Vec<BitOpening<EF>> {
+        let lift = |opening: &BitOpening<EF>, selector: EF| {
+            let mut point = Point::new(vec![selector]);
+            point.extend(&opening.point);
+            BitOpening { point, ..opening.clone() }
+        };
+        first
+            .iter()
+            .map(|opening| lift(opening, EF::ZERO))
+            .chain(second.iter().map(|opening| lift(opening, EF::ONE)))
+            .collect()
+    }
+
+    /// [`Self::open_readings_pair`] with one ring switch for both sides.
+    ///
+    /// ```text
+    ///     packing     t(s, w) = (1 - s) f(w) + s g(w), the two packings end to end
+    ///     switch      first's openings at (0, z), second's at (1, z)  ->  t at (r0, r)
+    ///     pair        f and g both at r, one WHIR run; t(r0, r) = (1 - r0) f(r) + r0 g(r)
+    /// ```
+    ///
+    /// The first side's proof carries the switch; the second side's carries an empty one.
+    #[allow(clippy::type_complexity)]
+    fn open_readings_joint(
+        &self,
+        first_side: (BooleanWhirData<F, EF, MT>, &[BitOpening<EF>]),
+        second_side: (&BooleanWhirData<F, EF, MT>, &[BitOpening<EF>]),
+        challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, BooleanWhirProof<F, EF, MT>>, BooleanWhirError> {
+        self.check_openings(first_side.1)?;
+        assert!(
+            !first_side.0.table(0).is_held() && !second_side.0.table(0).is_held(),
+            "a joint pair is proven on the host, not from a packing held on a device"
+        );
+        let openings = Self::joint_openings(first_side.1, second_side.1);
+        // Every reduction is set up before any runs, so a refused one leaves the transcript alone.
+        let claims = Self::claims(&openings)?.with_merging(self.merge_claims);
+        let mut values = Self::packing(&first_side.0).poly().as_slice().to_vec();
+        values.extend_from_slice(Self::packing(second_side.0).poly().as_slice());
+        let packing = BitPacking::from_packed(Poly::new(values))
+            .expect("two packings of one arity end to end are a packing of the next");
+        let (reduction, surviving_point, _, currents) =
+            tracing::info_span!("bit ring switch").in_scope(|| {
+                claims.prove_with_readings::<<EF as BitChallengeField<F>>::SumcheckRepr, _, _>(
+                    &packing, challenger,
+                )
+            });
+        drop(packing);
+        let mut first_readings = Self::readings_of(&openings, &claims, &reduction, &currents)?;
+        let second_readings = first_readings.split_off(first_side.1.len());
+        // The selector is the leading coordinate; both packings are read at the rest.
+        let point = Point::new(surviving_point.as_slice()[1..].to_vec());
+
+        let pair = tracing::info_span!("pair opening")
+            .in_scope(|| {
+                self.inner.open_pair_at(
+                    first_side.0,
+                    second_side.0,
+                    &self.protocol(1),
+                    &[point.clone(), point],
+                    challenger,
+                )
+            })
+            .map_err(BooleanWhirError::Commit)?;
+        let empty = BitRingSwitchClaimsProof {
+            claims: Vec::new(),
+            sumcheck: SumcheckData::default(),
+            final_eval: EF::ZERO,
+        };
+        Ok((
+            (
+                first_readings,
+                BooleanWhirProof {
+                    reduction,
+                    opening: BooleanWhirOpening::Paired,
+                },
+            ),
+            (
+                second_readings,
+                BooleanWhirProof {
+                    reduction: empty,
+                    opening: BooleanWhirOpening::Pair(pair),
+                },
+            ),
+        ))
+    }
+
+    /// Check what [`Self::open_readings_joint`] produced.
+    fn verify_readings_joint(
+        &self,
+        first_side: &ReadingsCheck<'_, EF, MT::Commitment, BooleanWhirProof<F, EF, MT>>,
+        second_side: &ReadingsCheck<'_, EF, MT::Commitment, BooleanWhirProof<F, EF, MT>>,
+        pair: &PairProof<F, EF, MT>,
+        challenger: &mut Challenger,
+    ) -> Result<(), BooleanWhirError> {
+        self.check_openings(first_side.openings)?;
+        let openings = Self::joint_openings(first_side.openings, second_side.openings);
+        let claims = Self::claims(&openings)?.with_merging(self.merge_claims);
+        let reduction = &first_side.proof.reduction;
+        let empty = &second_side.proof.reduction;
+        if first_side.readings.len() != first_side.openings.len()
+            || second_side.readings.len() != second_side.openings.len()
+            || reduction.claims.len() != claims.elements_sent()
+            || !empty.claims.is_empty()
+            || empty.sumcheck.num_rounds() != 0
+            || !empty.sumcheck.pow_witnesses.is_empty()
+            || empty.final_eval != EF::ZERO
+        {
+            return Err(BooleanWhirError::ClaimCount {
+                expected: openings.len(),
+                values: first_side.readings.len() + second_side.readings.len(),
+                reductions: reduction.claims.len() + empty.claims.len(),
+            });
+        }
+        // The openings fix which readings are checked, so a missing one is never skipped.
+        let readings: Vec<&BitReadings<EF>> =
+            first_side.readings.iter().chain(second_side.readings).collect();
+        if let Some(index) = openings.iter().zip(&readings).position(|(opening, reading)| {
+            reading.current.is_some() != opening.current || reading.next.is_some() != opening.next
+        }) {
+            return Err(BooleanWhirError::ReadingShape { index });
+        }
+        let readings: Vec<(Option<EF>, Option<EF>)> =
+            readings.iter().map(|reading| (reading.current, reading.next)).collect();
+        // One batch turns both sides' readings into one claim about the joint packing.
+        let (surviving_point, surviving_value) = claims
+            .verify_readings(reduction, &readings, challenger)
+            .map_err(BooleanWhirError::ReductionProof)?;
+        let (&selector, rest) = surviving_point
+            .as_slice()
+            .split_first()
+            .ok_or(BooleanWhirError::SurvivingClaim)?;
+        let point = Point::new(rest.to_vec());
+        let evals = self
+            .inner
+            .verify_pair_at(
+                [first_side.commitment, second_side.commitment],
+                pair,
+                &self.protocol(1),
+                &[point.clone(), point],
+                challenger,
+            )
+            .map_err(BooleanWhirError::Opening)?;
+        // The joint claim closes against the two values the pair bound, under the selector.
+        match evals.as_slice() {
+            [first, second] => match (first.current().first(), second.current().first()) {
+                (Some(&f), Some(&g)) if (EF::ONE - selector) * f + selector * g == surviving_value => {
+                    Ok(())
+                }
+                _ => Err(BooleanWhirError::SurvivingClaim),
+            },
             _ => Err(BooleanWhirError::SurvivingClaim),
         }
     }
