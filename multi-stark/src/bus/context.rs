@@ -418,17 +418,22 @@ where
         }
         let weights = output.challenges.fingerprint_weights();
         let mut terminal = EF::ZERO;
+        // Once a share's row suffix is checked to span its rows, its all-one selector, row weight
+        // and boundary selectors depend on its row count alone: shares of one height share them.
+        let mut by_rows: alloc::collections::BTreeMap<
+            usize,
+            (EF, crate::selectors::BoundaryEvals<EF>),
+        > = alloc::collections::BTreeMap::new();
 
         for direction in [BusDirection::Push, BusDirection::Pull] {
             let direction_weight = match direction {
                 BusDirection::Push => EF::ONE,
                 BusDirection::Pull => direction_challenge,
             };
+            let mut shares = EF::ZERO;
             for share in self.plan.terminal_shares(direction) {
                 let air = share.owner.air;
                 let row_point = &point.as_slice()[point.num_variables() - share.row_variables..];
-                let unused = &point.as_slice()[..point.num_variables() - share.row_variables];
-                let fixed_all_one_selector = unused.iter().copied().product::<EF>();
                 let block_weight = share.prefix_weight(&output.product.point).ok_or(
                     BusBindingError::ProductPointDimension {
                         expected: expected_product_dimension,
@@ -443,8 +448,14 @@ where
                         actual: output.product.point.len(),
                     });
                 }
-                let row_weight = Point::eval_eq(row_suffix, row_point);
-                let boundary = crate::selectors::BoundaryEvals::at(row_point);
+                let (row_weight, boundary) = *by_rows.entry(share.row_variables).or_insert_with(|| {
+                    let unused = &point.as_slice()[..point.num_variables() - share.row_variables];
+                    let fixed_all_one_selector = unused.iter().copied().product::<EF>();
+                    (
+                        fixed_all_one_selector * Point::eval_eq(row_suffix, row_point),
+                        crate::selectors::BoundaryEvals::at(row_point),
+                    )
+                });
                 let factor = self.plan.evaluate_factor(
                     share.bus,
                     self.interaction(share.owner),
@@ -460,12 +471,9 @@ where
                     &weights,
                     output.challenges.offset,
                 )?;
-                terminal += direction_weight
-                    * block_weight
-                    * fixed_all_one_selector
-                    * row_weight
-                    * (factor - EF::ONE);
+                shares += block_weight * row_weight * (factor - EF::ONE);
             }
+            terminal += direction_weight * shares;
         }
         Ok(terminal)
     }
