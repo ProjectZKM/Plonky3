@@ -1659,6 +1659,7 @@ mod tests {
             &[public_values],
             lookup,
             DEFAULT_SLICED_ROUNDS,
+            &GenericBackend,
             &mut prover_challenger,
         );
 
@@ -1780,6 +1781,7 @@ mod tests {
                 &[public_values],
                 lookup,
                 DEFAULT_SLICED_ROUNDS,
+                &GenericBackend,
                 &mut prover_challenger,
             );
 
@@ -1849,6 +1851,7 @@ mod tests {
             &public_values,
             lookup,
             DEFAULT_SLICED_ROUNDS,
+            &GenericBackend,
             &mut prover_challenger,
         );
 
@@ -1940,6 +1943,7 @@ mod tests {
             &publics,
             lookup,
             DEFAULT_SLICED_ROUNDS,
+            &GenericBackend,
             &mut prover_challenger,
         );
 

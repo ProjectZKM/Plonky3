@@ -782,6 +782,7 @@ fn multi_stark_cases() -> Vec<Case> {
         pow_bits: 0,
         has_indexed: false,
         has_bus: false,
+        pair_openings: false,
     };
 
     let mut wider = plain.clone();

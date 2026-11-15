@@ -225,6 +225,7 @@ fn generic_backend_prime_field_transcript_is_pinned() {
             .collect::<Vec<_>>(),
         lookup,
         DEFAULT_SLICED_ROUNDS,
+        &GenericBackend,
         &mut challenger,
     );
     let next_challenge: EF = challenger.sample_algebra_element();

@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use p3_binary_field::Gf2;
 use p3_field::{Algebra, Field};
+use p3_maybe_rayon::prelude::*;
 use p3_multilinear_util::point::Point;
 use p3_multilinear_util::poly::Poly;
 #[cfg(test)]
@@ -14,16 +15,49 @@ use p3_word::{ConstraintKind, OperandRole, Shift, Word};
 use super::ShiftClaim;
 use super::polynomial::SumOfProducts;
 use super::transcript::BatchWeights;
+use crate::keys::BlockView;
 use crate::{CompiledKey, CompiledKeyLayout, CompiledSegment, PackedWitness, PackedWord};
 
 /// Equality and batching tables shared by both proving phases.
 pub(super) struct PreparedWeights<F> {
     /// One equality weight per padded constraint row.
-    constraint: Vec<F>,
+    constraint: Constraints<F>,
+    /// The statement point the constraint weights are the equality table of.
+    point: Vec<F>,
     /// One equality weight per relation-family slot.
     operation: Vec<F>,
     /// One equality weight per operand-position slot.
     operand: Vec<F>,
+}
+
+/// The equality weights of the constraint rows: a table of every row, or the point alone, each
+/// row's weight then evaluated when it is read.
+enum Constraints<F> {
+    Table(Vec<F>),
+    Point(Vec<F>),
+}
+
+impl<F: Field> Constraints<F> {
+    /// The equality weight of `row`, its leading bit matched to the point's first coordinate.
+    fn weight(&self, row: usize) -> F {
+        match self {
+            Self::Table(table) => table[row],
+            Self::Point(point) => {
+                let n = point.len();
+                point
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &r)| {
+                        if (row >> (n - 1 - i)) & 1 == 1 {
+                            r
+                        } else {
+                            F::ONE - r
+                        }
+                    })
+                    .product()
+            }
+        }
+    }
 }
 
 impl<F: Field> PreparedWeights<F> {
@@ -31,9 +65,47 @@ impl<F: Field> PreparedWeights<F> {
     pub(super) fn new(claim: &ShiftClaim<F>, batch: BatchWeights<F>) -> Self {
         // Every compiled reference reads one entry from each table.
         Self {
-            constraint: Point::new(claim.constraint_point()).equality_weights_msb(),
+            constraint: Constraints::Table(
+                Point::new(claim.constraint_point()).equality_weights_msb(),
+            ),
+            point: claim.constraint_point().to_vec(),
             operation: batch.operation,
             operand: batch.operand,
+        }
+    }
+
+    /// As [`Self::new`], each row's weight evaluated only when it is read: for a verifier,
+    /// which reads the rows of the public words alone.
+    pub(super) fn sparse(claim: &ShiftClaim<F>, batch: BatchWeights<F>) -> Self {
+        Self {
+            constraint: Constraints::Point(claim.constraint_point().to_vec()),
+            point: claim.constraint_point().to_vec(),
+            operation: batch.operation,
+            operand: batch.operand,
+        }
+    }
+
+    /// The tables of the statement point `constraint_point` and the batching weights.
+    pub(super) fn from_parts(constraint_point: &[F], operation: Vec<F>, operand: Vec<F>) -> Self {
+        Self {
+            constraint: Constraints::Table(Point::new(constraint_point).equality_weights_msb()),
+            point: constraint_point.to_vec(),
+            operation,
+            operand,
+        }
+    }
+
+    /// As [`Self::from_parts`], each row's weight evaluated only when it is read.
+    pub(super) fn sparse_from_parts(
+        constraint_point: &[F],
+        operation: Vec<F>,
+        operand: Vec<F>,
+    ) -> Self {
+        Self {
+            constraint: Constraints::Point(constraint_point.to_vec()),
+            point: constraint_point.to_vec(),
+            operation,
+            operand,
         }
     }
 
@@ -48,10 +120,15 @@ impl<F: Field> PreparedWeights<F> {
             .map(|reference| {
                 // The compiled role is translated into its family-local operand position.
                 let operand = operand_index(key.operation(), reference.operand());
-                self.operand[operand] * self.constraint[reference.constraint() as usize]
+                self.operand[operand] * self.constraint.weight(reference.constraint() as usize)
             })
             .sum::<F>();
         operation * occurrences
+    }
+
+    /// The family weights, then the operand weights.
+    pub(super) fn batching(&self) -> (&[F], &[F]) {
+        (&self.operation, &self.operand)
     }
 
     /// Batches the supplied operand claims with these transcript weights.
@@ -62,7 +139,7 @@ impl<F: Field> PreparedWeights<F> {
 }
 
 /// Returns a role's position in the operand batching cube.
-fn operand_index(kind: ConstraintKind, role: OperandRole) -> usize {
+pub(super) fn operand_index(kind: ConstraintKind, role: OperandRole) -> usize {
     // Each family uses the semantic order exposed by its relation type.
     match (kind, role) {
         (ConstraintKind::Zero, OperandRole::Value)
@@ -86,6 +163,38 @@ pub(super) fn evaluate_word<W: Word, F: Field>(word: W, weights: &[F]) -> F {
         .map(|bit| weights[bit])
         .sum()
 }
+
+/// Returns one subset-sum table per byte of a word, so a word evaluates in one lookup per byte.
+///
+/// ```text
+///     tables[j][b] = sum_{t in b} weights[8 * j + t]
+/// ```
+pub(crate) fn byte_tables<F: Field>(weights: &[F]) -> Vec<[F; 256]> {
+    weights
+        .chunks(8)
+        .map(|weights| {
+            // Each subset extends the one without its lowest bit.
+            let mut table = [F::ZERO; 256];
+            for byte in 1..256_usize {
+                let low = byte.trailing_zeros() as usize;
+                table[byte] = table[byte & (byte - 1)] + weights[low];
+            }
+            table
+        })
+        .collect()
+}
+
+/// Evaluates one word's bit multilinear through its byte tables.
+pub(crate) fn evaluate_bytes<F: Field>(bits: u64, tables: &[[F; 256]]) -> F {
+    tables
+        .iter()
+        .enumerate()
+        .map(|(byte, table)| table[((bits >> (8 * byte)) & 0xff) as usize])
+        .sum()
+}
+
+/// Words one task scatters before its rows join the shared sum.
+const SCATTER_CHUNK: usize = 1 << 14;
 
 /// Applies the transpose of one fixed shift to a bit-evaluation table.
 fn shift_transpose<W: Word, F: Field>(shift: Shift<W>, output: &[F]) -> Vec<F> {
@@ -127,6 +236,7 @@ fn shift_weights<W: Word, F: Field>(shifts: [Shift<W>; 2], output: &[F]) -> Vec<
 pub(super) fn public_contribution<W, F>(
     segment: &CompiledSegment<W>,
     words: &[W],
+    first: usize,
     prepared: &PreparedWeights<F>,
     bit_point: &[F],
 ) -> F
@@ -138,7 +248,7 @@ where
     let output = Point::new(bit_point).equality_weights_msb();
     let mut contribution = F::ZERO;
 
-    for (word_index, &word) in words.iter().enumerate() {
+    for (word_index, &word) in words.iter().enumerate().map(|(i, w)| (first + i, w)) {
         // Every key fixes one shift sequence and one relation family.
         let keys = segment
             .keys(word_index)
@@ -158,6 +268,42 @@ where
     contribution
 }
 
+/// Per public word from `0` to `count`, the weight of each of its bits in [`public_contribution`]:
+/// the contribution of words `0..count` is the sum of the weights of their set bits.
+pub(super) fn public_bit_weights<W, F>(
+    segment: &CompiledSegment<W>,
+    count: usize,
+    prepared: &PreparedWeights<F>,
+    bit_point: &[F],
+) -> Vec<Vec<F>>
+where
+    W: Word,
+    F: Field + Algebra<Gf2>,
+{
+    // Every shift is linear over GF(2), so a word's share is the sum of its bits' shares.
+    let output = Point::new(bit_point).equality_weights_msb();
+    (0..count)
+        .map(|word_index| {
+            let mut weights = vec![F::ZERO; W::BITS as usize];
+            let keys = segment
+                .keys(word_index)
+                .expect("the checked public segment contains this word");
+            for key in keys {
+                let coefficient = prepared.key(&key);
+                if coefficient == F::ZERO {
+                    continue;
+                }
+                let [inner, outer] = key.shifts();
+                for (bit, weight) in weights.iter_mut().enumerate() {
+                    let shifted = outer.apply(inner.apply(W::from_low_bits(1 << bit)));
+                    *weight += coefficient * evaluate_word(shifted, &output);
+                }
+            }
+            weights
+        })
+        .collect()
+}
+
 /// Constructs the sparse bit-index sumcheck and its shift rows.
 pub(super) fn bit_prover<W, F>(
     layout: &CompiledKeyLayout<W>,
@@ -172,31 +318,65 @@ where
     // One row is retained per shift spelling used by the committed segment.
     let segment = layout.witness();
     let sequences = segment.shift_sequences();
-    let mut witness_rows = (0..sequences.len())
-        .map(|_| F::zero_vec(W::BITS as usize))
-        .collect::<Vec<_>>();
+    let width = W::BITS as usize;
 
-    for (word_index, &packed) in values.witness().iter().enumerate() {
-        // Source words remain bit-packed while coefficients are scattered into sparse rows.
-        let bits = W::unpack(packed).to_u64();
-        let keys = segment
-            .keys(word_index)
-            .expect("the checked witness segment contains this word");
-        for key in keys {
-            let coefficient = prepared.key(&key);
-            if coefficient == F::ZERO {
-                continue;
-            }
-            let row = &mut witness_rows[key.shift_index() as usize];
-            let mut remaining = bits;
-            while remaining != 0 {
-                // Visit only set lanes; random 64-bit words halve the scatter work.
-                let bit = remaining.trailing_zeros() as usize;
-                row[bit] += coefficient;
-                remaining &= remaining - 1;
-            }
-        }
-    }
+    // Each task scatters whole chunks into its own rows, and the rows add at the end.
+    let rows = values
+        .witness()
+        .par_chunks(SCATTER_CHUNK)
+        .enumerate()
+        .par_fold_reduce(
+            || F::zero_vec(sequences.len() * width),
+            |mut rows, (chunk, words)| {
+                for (offset, &packed) in words.iter().enumerate() {
+                    // Source words remain bit-packed while coefficients are scattered into rows.
+                    let bits = W::unpack(packed).to_u64();
+                    let keys = segment
+                        .keys(chunk * SCATTER_CHUNK + offset)
+                        .expect("the checked witness segment contains this word");
+                    for key in keys {
+                        let coefficient = prepared.key(&key);
+                        if coefficient == F::ZERO {
+                            continue;
+                        }
+                        let row = &mut rows[key.shift_index() as usize * width..][..width];
+                        let mut remaining = bits;
+                        while remaining != 0 {
+                            // Visit only set lanes; random 64-bit words halve the scatter work.
+                            let bit = remaining.trailing_zeros() as usize;
+                            row[bit] += coefficient;
+                            remaining &= remaining - 1;
+                        }
+                    }
+                }
+                rows
+            },
+            |mut rows, other| {
+                rows.iter_mut()
+                    .zip(other)
+                    .for_each(|(row, value)| *row += value);
+                rows
+            },
+        );
+    bit_pairs(layout, &rows, bit_point)
+}
+
+/// The bit phase over the witness rows `rows`, `W::BITS` per shift sequence of the committed
+/// segment, each paired with its sequence's transpose action at `bit_point`.
+pub(super) fn bit_pairs<W, F>(
+    layout: &CompiledKeyLayout<W>,
+    rows: &[F],
+    bit_point: &[F],
+) -> SumOfProducts<F>
+where
+    W: Word,
+    F: Field,
+{
+    let sequences = layout.witness().shift_sequences();
+    let witness_rows = rows
+        .chunks(W::BITS as usize)
+        .map(<[F]>::to_vec)
+        .collect::<Vec<_>>();
 
     // The other factor is the transpose action of each fixed shift sequence.
     let output = Point::new(bit_point).equality_weights_msb();
@@ -226,15 +406,16 @@ where
     F: Field + Algebra<Gf2>,
 {
     // The bit point folds each packed source word directly to one challenge-field element.
-    let bit_weights = Point::new(bit_point).equality_weights_msb();
+    let tables = byte_tables(&Point::new(bit_point).equality_weights_msb());
     let mut witness = values
         .witness()
-        .iter()
-        .map(|&packed| evaluate_word(W::unpack(packed), &bit_weights))
+        .par_iter()
+        .map(|&packed| evaluate_bytes(W::unpack(packed).to_u64(), &tables))
         .collect::<Vec<_>>();
 
     // The public wiring contributes one scalar per committed word.
     let mut wiring = (0..values.witness().len())
+        .into_par_iter()
         .map(|word| word_weight(layout.witness(), word, prepared, shift_evaluations))
         .collect::<Vec<_>>();
 
@@ -249,6 +430,10 @@ where
 }
 
 /// Evaluates the committed wiring polynomial at a word point.
+///
+/// An interleaved block costs its gadget's references, whatever its instance count: the
+/// equality weights of its words and relations factor into the instance's low bits, which
+/// sum to one product over the block, and the slot's and relation's high bits.
 pub(super) fn wiring_evaluation<W, F>(
     layout: &CompiledKeyLayout<W>,
     prepared: &PreparedWeights<F>,
@@ -259,13 +444,107 @@ where
     W: Word,
     F: Field + Algebra<Gf2>,
 {
+    let segment = layout.witness();
+    let blocks = segment.block_views().collect::<Vec<_>>();
+    let flat = blocks
+        .iter()
+        .any(|block| block.interleaved.is_none_or(|log| log == 0));
     // Missing words in the final power-of-two domain carry zero wiring weight.
-    let word_weights = Point::new(word_point).equality_weights_msb();
-    (0..layout.witness().len())
-        .map(|word| {
-            word_weights[word] * word_weight(layout.witness(), word, prepared, shift_evaluations)
+    let word_weights = flat.then(|| Point::new(word_point).equality_weights_msb());
+    blocks
+        .into_par_iter()
+        .map(|block| match block.interleaved {
+            Some(log) if log > 0 => {
+                interleaved_weight(segment, &block, log, prepared, shift_evaluations, word_point)
+            }
+            _ => {
+                let word_weights = word_weights
+                    .as_ref()
+                    .expect("the word table is built when a block reads it");
+                (block.word_base..block.word_base + block.slots * block.instances)
+                    .into_par_iter()
+                    .map(|word| {
+                        word_weights[word]
+                            * word_weight(segment, word, prepared, shift_evaluations)
+                    })
+                    .sum()
+            }
         })
         .sum()
+}
+
+/// The equality weight at `point` of the index `index`, its leading bit matched to the
+/// point's first coordinate.
+fn equality_at<F: Field>(point: &[F], index: usize) -> F {
+    let n = point.len();
+    point
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| {
+            if (index >> (n - 1 - i)) & 1 == 1 {
+                r
+            } else {
+                F::ONE - r
+            }
+        })
+        .product()
+}
+
+/// One interleaved block of `2^log` instances' share of the wiring evaluation.
+///
+/// Its word `base + slot * 2^log + i` and relation `base_f + relation * 2^log + i` share the
+/// low `log` bits `i`, both bases being multiples of `2^log`, so the sum over `i` is the
+/// product of the low coordinates' equality factors.
+fn interleaved_weight<W: Word, F: Field>(
+    segment: &CompiledSegment<W>,
+    block: &BlockView,
+    log: usize,
+    prepared: &PreparedWeights<F>,
+    shift_evaluations: &[F],
+    word_point: &[F],
+) -> F {
+    let constraint_point = &prepared.point;
+    if log > word_point.len() || log > constraint_point.len() {
+        return F::ZERO;
+    }
+    let (word_high, word_low) = word_point.split_at(word_point.len() - log);
+    let (row_high, row_low) = constraint_point.split_at(constraint_point.len() - log);
+    let low = word_low
+        .iter()
+        .zip(row_low)
+        .map(|(&w, &r)| w * r + (F::ONE - w) * (F::ONE - r))
+        .product::<F>();
+
+    let rows: [Vec<F>; 3] = core::array::from_fn(|family| {
+        let first = block.constraint_base[family] >> log;
+        (0..block.strides[family])
+            .map(|relation| equality_at(row_high, first + relation))
+            .collect()
+    });
+    let first_word = block.word_base >> log;
+    let high = (0..block.slots)
+        .into_par_iter()
+        .map(|slot| {
+            let keys = segment
+                .slot_keys(block.slot_base + slot)
+                .map(|key| {
+                    let family = key.operation().code() as usize;
+                    let occurrences = key
+                        .references()
+                        .map(|reference| {
+                            let operand = operand_index(key.operation(), reference.operand());
+                            prepared.operand[operand] * rows[family][reference.constraint() as usize]
+                        })
+                        .sum::<F>();
+                    prepared.operation[family]
+                        * occurrences
+                        * shift_evaluations[key.shift_index() as usize]
+                })
+                .sum::<F>();
+            equality_at(word_high, first_word + slot) * keys
+        })
+        .sum::<F>();
+    low * high
 }
 
 /// Accumulates every compiled key attached to one source word.
@@ -470,5 +749,91 @@ mod tests {
                 .iter()
                 .flat_map(|&inner| shifts.iter().map(move |&outer| [inner, outer])),
         );
+    }
+
+    /// A gadget of every relation family with shifted operands, `width` private words wide.
+    fn interleaving_gadget(width: usize) -> p3_word::Component<Word64> {
+        use p3_word::{
+            AndConstraint, IntegerMulConstraint, Operand, ShiftedValue, ValueIndex,
+            ZeroConstraint,
+        };
+        let input = ValueIndex::public(0).unwrap();
+        let local = |slot: usize| ValueIndex::witness(slot).unwrap();
+        let rotated = |slot: usize, amount: usize| {
+            ShiftedValue::single(local(slot), Shift::new(ShiftKind::RotateRight, amount).unwrap())
+        };
+        let zero = (1..width)
+            .map(|slot| {
+                ZeroConstraint::new(Operand::new(alloc::vec![
+                    ShiftedValue::plain(local(slot)),
+                    rotated(slot - 1, slot),
+                ]))
+            })
+            .collect();
+        let and = (0..width)
+            .map(|slot| {
+                AndConstraint::new(
+                    Operand::single(ShiftedValue::plain(input)),
+                    Operand::single(rotated(slot, 3)),
+                    Operand::single(ShiftedValue::plain(local((slot + 1) % width))),
+                )
+            })
+            .collect();
+        let product = alloc::vec![IntegerMulConstraint::new(
+            Operand::single(ShiftedValue::plain(local(0))),
+            Operand::single(rotated(width - 1, 7)),
+            Operand::single(ShiftedValue::plain(local(1))),
+            Operand::single(ShiftedValue::plain(input)),
+        )];
+        let body = ConstraintSystem::new(1, width, zero, and, product).unwrap();
+        p3_word::Component::new(body, 1, 0).unwrap()
+    }
+
+    #[test]
+    fn an_interleaved_wiring_evaluates_as_its_lowered_statement() {
+        use p3_word::{ComponentCall, Composition};
+
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut sample = || {
+            let mut word = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            F::from_repr(u128::from(word()) << 64 | u128::from(word()))
+        };
+        for counts in [[5_usize, 3], [1, 1], [8, 6], [0, 7]] {
+            let composition = Composition::interleaved(alloc::vec![
+                ComponentCall::new(interleaving_gadget(3), counts[0]),
+                ComponentCall::new(interleaving_gadget(5), counts[1]),
+            ])
+            .unwrap();
+            let composed = CompiledKeyLayout::compose(&composition).unwrap();
+            let flat = CompiledKeyLayout::new(&composition.lower().unwrap()).unwrap();
+            assert_eq!(composed.witness().len(), flat.witness().len());
+
+            let rows = composition.relation_counts().into_iter().max().unwrap();
+            let constraint_point = (0..rows.next_power_of_two().ilog2())
+                .map(|_| sample())
+                .collect::<Vec<_>>();
+            let words = composition.witness_len().max(1).next_power_of_two().ilog2();
+            let word_point = (0..words).map(|_| sample()).collect::<Vec<_>>();
+            let output = (0..6).map(|_| sample()).collect::<Vec<_>>();
+            let input = (0..6).map(|_| sample()).collect::<Vec<_>>();
+            let operation = (0..3).map(|_| sample()).collect::<Vec<_>>();
+            let operand = (0..8).map(|_| sample()).collect::<Vec<_>>();
+
+            let evaluate = |layout: &CompiledKeyLayout<Word64>| {
+                let prepared = PreparedWeights::from_parts(
+                    &constraint_point,
+                    operation.clone(),
+                    operand.clone(),
+                );
+                let shifts = shift_evaluations(layout, &output, &input);
+                wiring_evaluation(layout, &prepared, &shifts, &word_point)
+            };
+            assert_eq!(evaluate(&composed), evaluate(&flat), "counts {counts:?}");
+        }
     }
 }

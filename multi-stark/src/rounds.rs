@@ -2,12 +2,14 @@
 //!
 //! Builds round polynomials for `sum_x eq(tau, x) * g(x)` and folds state across challenges.
 
+pub mod device;
 mod repr;
 pub(crate) mod sliced;
 mod subfield;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::{Deref, Range};
 
@@ -236,6 +238,8 @@ pub(crate) struct RoundStateBase<'air, 'data, A, F: Field, EF> {
     periodic: Vec<Option<Table<F>>>,
     /// Main trace tables, one row per original trace column.
     tables: Vec<&'data Table<F>>,
+    /// Each table's instance in the proof, in table order.
+    instances: Vec<usize>,
     /// Beta power for each AIR in canonical input order.
     betas: Vec<EF>,
     /// Ordinary AIR constraints grouped by their native round-polynomial degree.
@@ -268,6 +272,7 @@ pub(crate) struct RoundStateBase<'air, 'data, A, F: Field, EF> {
     sliced: Option<sliced::SlicedColumns<'data, EF>>,
     /// Rounds this stage evaluates on its planes, when the sliced kernel takes it.
     sliced_rounds: usize,
+    device: Option<Box<dyn device::DeviceStage<EF>>>,
 }
 
 /// Extension-round column storage.
@@ -467,6 +472,7 @@ pub(crate) struct RoundStateExt<'air, 'data, A, F: Field, EF: ExtensionField<F>,
     coupling: InteractionCoupling<R>,
     /// Common scalar applied to lookup claims and evaluations after grouping.
     lookup_scale: EF,
+    device: Option<Box<dyn device::DeviceStage<EF>>>,
 }
 
 /// One AIR's column values at the fully bound sumcheck point.
@@ -1473,6 +1479,7 @@ where
             "zerocheck point must match the stage height"
         );
 
+        let instances = stage.indices.clone();
         let Stage {
             indices,
             airs,
@@ -1586,10 +1593,12 @@ where
             fits_subfield: false,
             sliced: None,
             sliced_rounds,
+            device: None,
+            instances,
         }
     }
 
-    fn num_evals(&self) -> usize {
+    pub(crate) fn num_evals(&self) -> usize {
         1 << self
             .tables
             .first()
@@ -2123,6 +2132,7 @@ where
             next_tail,
             coupling: self.coupling,
             lookup_scale: self.eta,
+            device: None,
             boundary: BoundaryEvals::new(EF::ONE - r, r, EF::ONE - r),
         }
     }
@@ -2208,7 +2218,10 @@ where
     R: Field + From<EF>,
 {
     fn num_evals(&self) -> usize {
-        self.columns.num_evals()
+        match &self.device {
+            Some(device) => device.num_evals(),
+            None => self.columns.num_evals(),
+        }
     }
 
     const fn width(&self) -> usize {

@@ -8,8 +8,8 @@ use p3_air::{Air, BoundaryIoError, boundary};
 use p3_challenger::{CanObserve, CanSampleUniformBits, FieldChallenger, GrindingChallenger};
 use p3_commit::MultilinearPcs;
 use p3_field::{ExtensionField, Field};
-use p3_lookup::{IndexedLookups, InteractionSymbolicBuilder, Lookups, TraceWindow};
-use p3_sumcheck::{OpeningEvals, PrescribedPointPcs};
+use p3_lookup::{IndexedLookups, IndexedPosition, InteractionSymbolicBuilder, Lookups, TraceWindow};
+use p3_sumcheck::{OpeningEvals, PairCheck, PrescribedPointPcs};
 use thiserror::Error;
 
 use crate::VerifierInstances;
@@ -18,6 +18,7 @@ use crate::config::{Commitment, MultiStarkConfig, PcsError};
 use crate::folder::VerifierAir;
 use crate::indexed::IndexedPlan;
 use crate::instance::{BatchRole, RunPoints, trace_suffix};
+use crate::logup_star::position;
 use crate::lookup::{LookupError, LookupPlan, verify_lookup};
 use crate::opening::TableOpening;
 use crate::proof::MultiStarkProof;
@@ -350,7 +351,8 @@ where
             pow_bits,
             indexed_plan.is_some(),
             bus.is_some(),
-        ),
+        )
+        .with_pair_openings(config.pair_openings()),
     );
 
     // 1. Replay the reusable batched preprocessed commitment before any challenge
@@ -500,51 +502,86 @@ where
     let main_schedule = instances.main_schedule(indexed_plan.as_ref(), |role, rows| {
         trace_suffix(points.at(role), rows)
     });
-    let main_evals = match transcript.main_opening(|challenger| {
-        config.pcs().verify_at(
-            &proof.commitment,
-            &proof.opening,
-            main_schedule.protocol(),
-            &main_schedule.against(),
-            challenger,
-        )
-    }) {
-        Ok(evals) => evals,
-        // Nothing below can change this verdict, so the preprocessed opening never runs.
-        Err(error) => {
-            transcript.abort();
-            return Err(VerificationError::Opening(error));
-        }
-    };
-
-    // 9. Open the preprocessed tables at every point a claim was left at.
-    // The owned batches are kept local so the closing check can borrow them.
     let preprocessed_schedule = instances
         .preprocessed_schedule(indexed_plan.as_ref(), |role, rows| {
             trace_suffix(points.at(role), rows)
         });
-    let opened_preprocessed = transcript.preprocessed_opening(|challenger| {
+    let main_against = main_schedule.against();
+    let preprocessed_against = preprocessed_schedule.against();
+
+    // 8 and 9 as one step: both traces under one opening, the main side first.
+    let (main_evals, preprocessed_evals) = if transcript.pairs() {
         let commitment = preprocessed_commitment
             .expect("a described preprocessed commitment is checked before the replay");
         let opening = proof
             .preprocessed_opening
             .as_ref()
             .expect("missing preprocessed opening rejected before verification");
-        config.preprocessed_pcs().verify_at(
-            commitment,
-            opening,
-            preprocessed_schedule.protocol(),
-            &preprocessed_schedule.against(),
-            challenger,
-        )
-    });
+        let opened = transcript.pair_opening(|challenger| {
+            config.pcs().verify_pair_at(
+                config.preprocessed_pcs(),
+                PairCheck {
+                    commitment: &proof.commitment,
+                    proof: &proof.opening,
+                    protocol: main_schedule.protocol(),
+                    points: &main_against,
+                },
+                PairCheck {
+                    commitment,
+                    proof: opening,
+                    protocol: preprocessed_schedule.protocol(),
+                    points: &preprocessed_against,
+                },
+                challenger,
+            )
+        });
+        transcript.finish();
+        let (main_evals, preprocessed_evals) = opened.map_err(VerificationError::Opening)?;
+        (main_evals, Some(preprocessed_evals))
+    } else {
+        let main_evals = match transcript.main_opening(|challenger| {
+            config.pcs().verify_at(
+                &proof.commitment,
+                &proof.opening,
+                main_schedule.protocol(),
+                &main_against,
+                challenger,
+            )
+        }) {
+            Ok(evals) => evals,
+            // Nothing below can change this verdict, so the preprocessed opening never runs.
+            Err(error) => {
+                transcript.abort();
+                return Err(VerificationError::Opening(error));
+            }
+        };
 
-    // Every described step has now been replayed.
-    transcript.finish();
+        // 9. Open the preprocessed tables at every point a claim was left at.
+        // The owned batches are kept local so the closing check can borrow them.
+        let opened_preprocessed = transcript.preprocessed_opening(|challenger| {
+            let commitment = preprocessed_commitment
+                .expect("a described preprocessed commitment is checked before the replay");
+            let opening = proof
+                .preprocessed_opening
+                .as_ref()
+                .expect("missing preprocessed opening rejected before verification");
+            config.preprocessed_pcs().verify_at(
+                commitment,
+                opening,
+                preprocessed_schedule.protocol(),
+                &preprocessed_against,
+                challenger,
+            )
+        });
 
-    let preprocessed_evals = opened_preprocessed
-        .transpose()
-        .map_err(VerificationError::Opening)?;
+        // Every described step has now been replayed.
+        transcript.finish();
+
+        let preprocessed_evals = opened_preprocessed
+            .transpose()
+            .map_err(VerificationError::Opening)?;
+        (main_evals, preprocessed_evals)
+    };
 
     let preprocessed_next_columns = instances.preprocessed_next_columns();
     let next_columns = instances.next_columns();
@@ -588,12 +625,28 @@ where
             let claims = &output.tables[table];
 
             for (reader, claimed) in claims.position_claims.iter().enumerate() {
-                let role = BatchRole::Position { table, reader };
+                let placement = &planned.readers[reader];
+                let role = BatchRole::Position { air: placement.air };
                 let opened = main_schedule
                     .batch_answering(role)
                     .and_then(|batch| main_evals.get(batch))
-                    .and_then(|batch| batch.current().first());
-                if opened != Some(claimed) {
+                    .map(|batch| batch.current());
+                // A column names the entry under the embedding; bit columns name it through
+                // the embedding's own linearity, each weighed by the element its bit switches on.
+                let rebuilt = match (&placement.position, opened) {
+                    (IndexedPosition::Column(column), Some(opened)) => opened.get(*column).copied(),
+                    (IndexedPosition::Bits(bits), Some(opened)) => bits
+                        .iter()
+                        .enumerate()
+                        .map(|(bit, &column)| {
+                            opened
+                                .get(column)
+                                .map(|&value| value * position::embed::<C::Val>(1 << bit))
+                        })
+                        .sum::<Option<C::Challenge>>(),
+                    _ => None,
+                };
+                if rebuilt.as_ref() != Some(claimed) {
                     return Err(VerificationError::IndexedClaimsUnopened);
                 }
             }
@@ -610,7 +663,15 @@ where
                     .and_then(|batch| preprocessed_evals.iter().flatten().nth(batch))
                     .map(OpeningEvals::current),
             };
-            if opened != Some(claims.column_claims.as_slice()) {
+            let opened = opened.and_then(|opened| {
+                planned
+                    .table
+                    .columns
+                    .iter()
+                    .map(|&column| opened.get(column).copied())
+                    .collect::<Option<Vec<_>>>()
+            });
+            if opened.as_deref() != Some(claims.column_claims.as_slice()) {
                 return Err(VerificationError::IndexedClaimsUnopened);
             }
         }

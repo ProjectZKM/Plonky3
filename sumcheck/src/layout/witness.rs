@@ -106,6 +106,8 @@ enum TableStorage<F: Field> {
         words: RowMajorMatrix<u64>,
         num_variables: usize,
     },
+    /// Columns whose values a device holds, the host keeping their shape alone.
+    Held { num_variables: usize, width: usize },
 }
 
 /// A borrowed, representation-independent view of one logical table column.
@@ -283,6 +285,42 @@ impl<F: Field> Table<F> {
         }
     }
 
+    /// A table of one column over `num_variables` whose values the device that committed it
+    /// holds: the host keeps its shape alone, and reading its values panics.
+    #[must_use]
+    pub fn held(num_variables: usize) -> Self {
+        Self {
+            storage: Arc::new(TableStorage::Held { num_variables, width: 1 }),
+        }
+    }
+
+    /// A table of `width` columns over `num_variables` whose values a device holds, as
+    /// [`Self::held`] holds one.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a table of no columns.
+    #[must_use]
+    pub fn held_columns(width: usize, num_variables: usize) -> Self {
+        assert!(width > 0, "a table holds at least one column");
+        Self {
+            storage: Arc::new(TableStorage::Held { num_variables, width }),
+        }
+    }
+
+    /// The key a device finds a held table's values by: one table and all its clones share it,
+    /// and no other table living beside it has it. `None` for a table the host holds.
+    #[must_use]
+    pub fn held_key(&self) -> Option<usize> {
+        self.is_held().then_some(Arc::as_ptr(&self.storage) as *const () as usize)
+    }
+
+    /// Whether a device holds the table's values, the host its shape alone.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        matches!(&*self.storage, TableStorage::Held { .. })
+    }
+
     /// Creates a packed Boolean table from words in physical row-block-major order.
     ///
     /// The matrix width is the logical column count. Physical row `w` stores rows
@@ -332,6 +370,53 @@ impl<F: Field> Table<F> {
                 num_variables,
             }),
         }
+    }
+
+    /// Packs a row-major trace whose every cell is zero or one, one column per polynomial.
+    ///
+    /// The result is the table [`Self::from_packed_bits`] builds: a bit per cell, sixty-four
+    /// rows to a word. No dense column-major copy of the trace is made on the way.
+    ///
+    /// # Returns
+    ///
+    /// Nothing when a cell is neither zero nor one.
+    ///
+    /// # Panics
+    ///
+    /// When the trace has no column, or a height that is not a power of two.
+    pub fn from_boolean_rows(trace: &RowMajorMatrix<F>) -> Option<Self> {
+        let (width, height) = (trace.width, trace.height());
+        assert!(width > 0, "packed table must have at least one column");
+        assert!(
+            height.is_power_of_two(),
+            "table height must be a power of two"
+        );
+        let mut words = alloc::vec![0u64; width * height.div_ceil(64)];
+        let all_bits = words
+            .par_chunks_mut(width)
+            .enumerate()
+            .all(|(block, word_row)| {
+                let rows = 64 * block..(64 * block + 64).min(height);
+                trace.values[rows.start * width..rows.end * width]
+                    .chunks_exact(width)
+                    .enumerate()
+                    .all(|(lane, row)| {
+                        row.iter().zip(word_row.iter_mut()).all(|(&cell, word)| {
+                            if cell == F::ONE {
+                                *word |= 1 << lane;
+                                true
+                            } else {
+                                cell == F::ZERO
+                            }
+                        })
+                    })
+            });
+        all_bits.then(|| {
+            Self::from_packed_bits(
+                RowMajorMatrix::new(words, width),
+                height.trailing_zeros() as usize,
+            )
+        })
     }
 
     /// Creates a zero-filled table.
@@ -412,6 +497,7 @@ impl<F: Field> Table<F> {
                 column: id,
                 len: 1usize << num_variables,
             },
+            TableStorage::Held { .. } => panic!("a held table's values are on its device"),
         }
     }
 
@@ -430,7 +516,7 @@ impl<F: Field> Table<F> {
     /// Returns the packed backing matrix, if this table is Boolean-packed.
     pub fn packed_bits(&self) -> Option<&RowMajorMatrix<u64>> {
         match &*self.storage {
-            TableStorage::Dense(_) => None,
+            TableStorage::Dense(_) | TableStorage::Held { .. } => None,
             TableStorage::Boolean { words, .. } => Some(words),
         }
     }
@@ -440,7 +526,7 @@ impl<F: Field> Table<F> {
     /// An already dense table is returned without copying.
     pub fn into_dense(self) -> Self {
         match &*self.storage {
-            TableStorage::Dense(_) => self,
+            TableStorage::Dense(_) | TableStorage::Held { .. } => self,
             &TableStorage::Boolean {
                 ref words,
                 num_variables,
@@ -466,6 +552,7 @@ impl<F: Field> Table<F> {
             TableStorage::Boolean { .. } => {
                 panic!("dense table access is unavailable for packed Boolean storage")
             }
+            TableStorage::Held { .. } => panic!("a held table's values are on its device"),
         }
     }
 
@@ -474,6 +561,7 @@ impl<F: Field> Table<F> {
         match &*self.storage {
             TableStorage::Dense(columns) => columns.height(),
             TableStorage::Boolean { words, .. } => words.width,
+            TableStorage::Held { width, .. } => *width,
         }
     }
 
@@ -481,7 +569,8 @@ impl<F: Field> Table<F> {
     pub fn num_variables(&self) -> usize {
         match &*self.storage {
             TableStorage::Dense(columns) => columns.width.ilog2() as usize,
-            TableStorage::Boolean { num_variables, .. } => *num_variables,
+            TableStorage::Boolean { num_variables, .. }
+            | TableStorage::Held { num_variables, .. } => *num_variables,
         }
     }
 
@@ -500,6 +589,7 @@ impl<F: Field> Table<F> {
                 TableStorage::Boolean { .. } => {
                     panic!("packed tables must be converted to dense before padding")
                 }
+                TableStorage::Held { .. } => panic!("a held table is committed at its own height"),
             }
         }
     }
@@ -1143,11 +1233,24 @@ impl<F: Field> Witness<F> {
     /// Its slot is then the entire contiguous stacked layout, so the column is that layout.
     pub(super) fn lone_column(&self) -> Option<&[F]> {
         match self.tables.as_slice() {
-            [table] if table.num_polys() == 1 && table.num_variables() == self.num_variables => {
+            [table]
+                if !table.is_held()
+                    && table.num_polys() == 1
+                    && table.num_variables() == self.num_variables =>
+            {
                 table.column(0).as_dense()
             }
             _ => None,
         }
+    }
+
+    /// Whether the witness is one held column filling the hypercube: a message its device
+    /// holds and commits.
+    pub(super) fn is_held_message(&self) -> bool {
+        matches!(
+            self.tables.as_slice(),
+            [table] if table.is_held() && table.num_variables() == self.num_variables
+        )
     }
 
     /// Returns the retained stacked polynomial.
@@ -1267,14 +1370,41 @@ mod tests {
     use p3_field::extension::BinomialExtensionField;
     use p3_util::log2_ceil_usize;
     use proptest::prelude::*;
-    use rand::SeedableRng;
     use rand::rngs::SmallRng;
+    use rand::{RngExt, SeedableRng};
 
     use super::*;
     use crate::layout::{Layout, PrefixProver, SuffixProver};
 
     type F = BabyBear;
     type EF = BinomialExtensionField<F, 4>;
+
+    #[test]
+    fn boolean_rows_pack_to_the_cells_a_dense_table_holds() {
+        // Heights below, at and above one word; three columns, so words interleave.
+        for log_height in [3, 6, 9] {
+            let height = 1 << log_height;
+            let mut rng = SmallRng::seed_from_u64(log_height as u64);
+            let cells: Vec<F> = (0..3 * height)
+                .map(|_| F::from_bool(rng.random::<bool>()))
+                .collect();
+            let trace = RowMajorMatrix::new(cells, 3);
+            let packed = Table::from_boolean_rows(&trace).expect("every cell is a bit");
+            let dense = Table::new(trace.clone().transpose());
+            assert!(packed.packed_bits().is_some());
+            for column in 0..3 {
+                for row in 0..height {
+                    assert_eq!(
+                        packed.column(column).value(row),
+                        dense.column(column).value(row)
+                    );
+                }
+            }
+        }
+        // A cell that is not a bit is refused.
+        let trace = RowMajorMatrix::new(vec![F::ONE, F::TWO], 1);
+        assert!(Table::from_boolean_rows(&trace).is_none());
+    }
 
     struct ChunkedSource {
         /// Logical dimensions exposed to the placement plan.

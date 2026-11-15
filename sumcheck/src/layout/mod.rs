@@ -84,7 +84,10 @@ pub use opening::{
     VerifierVirtualClaim,
 };
 pub use plan::plan_stacked_layout;
-pub use prover::{Layout, PrefixProver, StackedClaims, SuffixProver, SuffixResidualProver};
+pub use prover::{
+    DeviceSuffix, Layout, PrefixProver, StackedClaims, StackedDevice, SuffixProver,
+    SuffixResidualProver, fold_rounds, residual_prover,
+};
 pub use transcript::{commitment_domain_separator, observe_commitment};
 pub use verifier::Verifier;
 pub use weight::InitialWeight;

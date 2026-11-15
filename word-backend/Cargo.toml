@@ -9,17 +9,23 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+parallel = ["p3-maybe-rayon/parallel"]
+
 [dependencies]
 p3-binary-field.workspace = true
 p3-binary-pcs.workspace = true
 p3-challenger.workspace = true
 p3-field.workspace = true
+p3-gkr.workspace = true
+p3-maybe-rayon.workspace = true
 p3-multilinear-util.workspace = true
 p3-security.workspace = true
 p3-sumcheck.workspace = true
 p3-word.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 p3-commit = { path = "../commit" }
@@ -28,6 +34,7 @@ p3-merkle-tree = { path = "../merkle-tree" }
 p3-symmetric = { path = "../symmetric" }
 postcard = { workspace = true, features = ["alloc"] }
 proptest.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 criterion.workspace = true
 

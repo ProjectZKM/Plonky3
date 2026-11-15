@@ -46,9 +46,12 @@ where
 {
     /// Where each table's columns land in the bit witness, planned from the shapes.
     ///
+    /// Shapes stacking below the committed arity fill the witness's first cells, the rest
+    /// zero: each slot keeps its index, and its address gains leading zero coordinates.
+    ///
     /// # Errors
     ///
-    /// Returns an error unless the shapes stack to the committed arity.
+    /// Returns an error when the shapes stack past the committed arity.
     pub(super) fn placements(
         &self,
         shapes: &[TableShape],
@@ -56,16 +59,52 @@ where
         // Prover and verifier both plan from the public shapes, so neither picks its own.
         let arity = checked_layout_arity(shapes)
             .ok_or(BooleanTraceCommitmentError::InvalidOpeningProtocol)?;
-        if arity != self.num_variables() {
-            return Err(BooleanTraceCommitmentError::StackedArity {
+        let pad = self.stacked_pad(arity)?;
+        // Reject a mismatched arity before allocating one selector per public column.
+        let (_, placements) = checked_stacked_layout(shapes)
+            .ok_or(BooleanTraceCommitmentError::InvalidOpeningProtocol)?;
+        Ok(placements
+            .into_iter()
+            .map(|placement| {
+                let selectors = placement
+                    .selectors()
+                    .iter()
+                    .map(|selector| Selector::new(selector.num_variables() + pad, selector.index()))
+                    .collect();
+                TablePlacement::new(placement.idx(), selectors)
+            })
+            .collect())
+    }
+
+    /// Leading coordinates the committed arity has beyond what the shapes stack to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shapes stack past the committed arity.
+    pub(super) fn stacked_pad(
+        &self,
+        arity: usize,
+    ) -> Result<usize, BooleanTraceCommitmentError<B::Error>> {
+        self.num_variables()
+            .checked_sub(arity)
+            .ok_or(BooleanTraceCommitmentError::StackedArity {
                 expected: self.num_variables(),
                 actual: arity,
-            });
-        }
-        // Reject a mismatched arity before allocating one selector per public column.
-        checked_stacked_layout(shapes)
-            .map(|(_, placements)| placements)
-            .ok_or(BooleanTraceCommitmentError::InvalidOpeningProtocol)
+            })
+    }
+
+    /// Leading coordinates the committed arity has beyond what the protocol's shapes stack to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shapes overflow or stack past the committed arity.
+    pub(super) fn protocol_pad(
+        &self,
+        shapes: &[TableShape],
+    ) -> Result<usize, BooleanTraceCommitmentError<B::Error>> {
+        let arity = checked_layout_arity(shapes)
+            .ok_or(BooleanTraceCommitmentError::InvalidOpeningProtocol)?;
+        self.stacked_pad(arity)
     }
 
     /// Validate protocol counts and arity without allocating placements or sampling.
@@ -80,12 +119,7 @@ where
         value_count(protocol).ok_or(BooleanTraceCommitmentError::InvalidOpeningProtocol)?;
         let actual = checked_layout_arity(&protocol.table_shapes())
             .ok_or(BooleanTraceCommitmentError::InvalidOpeningProtocol)?;
-        if actual != self.num_variables() {
-            return Err(BooleanTraceCommitmentError::StackedArity {
-                expected: self.num_variables(),
-                actual,
-            });
-        }
+        self.stacked_pad(actual)?;
         Ok(())
     }
 

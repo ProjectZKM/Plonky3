@@ -3,8 +3,10 @@
 use alloc::vec::Vec;
 use core::array;
 
+#[cfg(test)]
 use p3_field::Field;
-use p3_word::{ConstraintSystem, Operand, ValueIndex};
+use p3_maybe_rayon::prelude::*;
+use p3_word::{CallBlock, Composition, ConstraintSystem, Operand, Placement, ValueIndex};
 
 use crate::statement::Statement;
 use crate::{Packed, PackedWitness, PackedWord, WitnessError};
@@ -42,6 +44,13 @@ impl<W: PackedWord> OperationColumns<W> {
         match statement {
             // A flat statement addresses the composed segments directly.
             Statement::Flat(system) => columns.extend(system, values, |index| index),
+            Statement::Composed(composition)
+                if composition.placement() == Placement::Interleaved =>
+            {
+                for block in composition.blocks() {
+                    columns.extend_block(composition, block, values);
+                }
+            }
             Statement::Composed(composition) => {
                 for (call, index) in composition.calls().iter().zip(0_usize..) {
                     let component = call.component();
@@ -59,12 +68,59 @@ impl<W: PackedWord> OperationColumns<W> {
         Ok(columns)
     }
 
+    /// Appends one interleaved block: each family's relations by the gadget's relation, then
+    /// by the instance.
+    fn extend_block(
+        &mut self,
+        composition: &Composition<W>,
+        block: &CallBlock,
+        values: &PackedWitness<W>,
+    ) {
+        let body = composition.calls()[block.call()].component().body();
+        let instances = block.instances();
+        let evaluate = |operand: &Operand<W>, local: usize| {
+            let mut result = W::pack(W::ZERO);
+            for term in operand.terms() {
+                let at = composition
+                    .resolve(block.call(), block.first_instance() + local, term.index())
+                    .expect("a checked body only names slots the call declares");
+                let word = values
+                    .get(at)
+                    .expect("the checked system only contains in-bounds indices");
+                result += W::pack(term.apply(word));
+            }
+            result
+        };
+        let rows = |operands: Vec<&Operand<W>>| {
+            (0..operands.len() * instances)
+                .into_par_iter()
+                .map(|row| evaluate(operands[row / instances], row % instances))
+                .collect::<Vec<_>>()
+        };
+
+        let zero = body.zero_constraints();
+        self.zero.extend(rows(zero.iter().map(|c| c.value()).collect()));
+
+        let and = body.and_constraints();
+        let [left, right, output] = &mut self.bitwise_and;
+        left.extend(rows(and.iter().map(|c| c.left()).collect()));
+        right.extend(rows(and.iter().map(|c| c.right()).collect()));
+        output.extend(rows(and.iter().map(|c| c.output()).collect()));
+
+        let mul = body.integer_mul_constraints();
+        let [left, right, low, high] = &mut self.integer_mul;
+        left.extend(rows(mul.iter().map(|c| c.left()).collect()));
+        right.extend(rows(mul.iter().map(|c| c.right()).collect()));
+        low.extend(rows(mul.iter().map(|c| c.low()).collect()));
+        high.extend(rows(mul.iter().map(|c| c.high()).collect()));
+    }
+
     /// Appends one relation block, readdressing every term as it is read.
     fn extend(
         &mut self,
         system: &ConstraintSystem<W>,
         values: &PackedWitness<W>,
-        remap: impl Fn(ValueIndex) -> ValueIndex,
+        remap: impl Fn(ValueIndex) -> ValueIndex + Sync,
     ) {
         let evaluate = |operand: &Operand<W>| {
             let mut result = W::pack(W::ZERO);
@@ -77,28 +133,41 @@ impl<W: PackedWord> OperationColumns<W> {
             result
         };
 
+        // Each column is one parallel pass over its family, appended in relation order.
+        let fill = |column: &mut Vec<Packed<W>>, operands: Vec<Packed<W>>| {
+            if column.is_empty() {
+                *column = operands;
+            } else {
+                column.extend(operands);
+            }
+        };
+
         // The linear family has one semantic operand per relation.
-        self.zero.extend(
-            system
-                .zero_constraints()
-                .iter()
-                .map(|constraint| evaluate(constraint.value())),
+        let zero = system.zero_constraints();
+        fill(
+            &mut self.zero,
+            zero.par_iter()
+                .map(|constraint| evaluate(constraint.value()))
+                .collect(),
         );
 
-        // One constraint-major pass fills all three bitwise reduction columns.
-        for constraint in system.and_constraints() {
-            self.bitwise_and[0].push(evaluate(constraint.left()));
-            self.bitwise_and[1].push(evaluate(constraint.right()));
-            self.bitwise_and[2].push(evaluate(constraint.output()));
-        }
+        // The bitwise reduction reads the left, right, and output operands.
+        let and = system.and_constraints();
+        let [left, right, output] = &mut self.bitwise_and;
+        fill(left, and.par_iter().map(|c| evaluate(c.left())).collect());
+        fill(right, and.par_iter().map(|c| evaluate(c.right())).collect());
+        fill(
+            output,
+            and.par_iter().map(|c| evaluate(c.output())).collect(),
+        );
 
-        // One constraint-major pass fills all four integer-product columns.
-        for constraint in system.integer_mul_constraints() {
-            self.integer_mul[0].push(evaluate(constraint.left()));
-            self.integer_mul[1].push(evaluate(constraint.right()));
-            self.integer_mul[2].push(evaluate(constraint.low()));
-            self.integer_mul[3].push(evaluate(constraint.high()));
-        }
+        // The integer products read both factors, then the low and high limbs.
+        let mul = system.integer_mul_constraints();
+        let [left, right, low, high] = &mut self.integer_mul;
+        fill(left, mul.par_iter().map(|c| evaluate(c.left())).collect());
+        fill(right, mul.par_iter().map(|c| evaluate(c.right())).collect());
+        fill(low, mul.par_iter().map(|c| evaluate(c.low())).collect());
+        fill(high, mul.par_iter().map(|c| evaluate(c.high())).collect());
     }
 
     /// Returns the operand of each linear relation.
@@ -121,6 +190,7 @@ impl<W: PackedWord> OperationColumns<W> {
 }
 
 /// Expands one packed column into its bit multilinear over the padded cube.
+#[cfg(test)]
 pub(crate) fn bit_table<W: PackedWord, EF: Field>(column: &[Packed<W>], rows: usize) -> Vec<EF> {
     // Row index leads the flat address and within-word bit index trails it.
     let width = W::BITS as usize;

@@ -341,6 +341,7 @@ fn check<F, EF, R>(
                         num_variables,
                         to_repr,
                         from_repr,
+                        None,
                     )
                 };
                 let mut projected = make();
@@ -508,6 +509,7 @@ where
                 5,
                 to_repr,
                 from_repr,
+                None,
             )
         };
         let mut projected = make();

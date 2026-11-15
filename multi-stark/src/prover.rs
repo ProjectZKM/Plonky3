@@ -9,12 +9,15 @@ use p3_commit::MultilinearPcs;
 use p3_field::PrimeCharacteristicRing;
 use p3_field::{ExtensionField, Field};
 use p3_lookup::InteractionSymbolicBuilder;
-use p3_sumcheck::{OpeningEvals, PrescribedPointPcs};
+use p3_sumcheck::{OpeningEvals, PairOpening, PrescribedPointPcs};
 
 use crate::ProverInstances;
+use p3_sumcheck::layout::Table;
+
 use crate::backend::{GenericBackend, ZerocheckBackend};
-use crate::bus::{BusBindingError, BusContext};
-use crate::config::{Commitment, MultiStarkConfig, PcsProverError, ProverData};
+use crate::bus::BusLeafBlock;
+use crate::bus::{BusBindingError, BusContext, BusFamilyDevice};
+use crate::config::{Commitment, MultiStarkConfig, PcsProof, PcsProverError, ProverData};
 use crate::folder::ProverAir;
 use crate::indexed::{IndexedPlan, IndexedWitness};
 use crate::instance::{ProverParts, RunPoints, trace_suffix};
@@ -219,19 +222,152 @@ where
     A: BaseAir<C::Val>
         + Air<InteractionSymbolicBuilder<C::Val, C::Challenge>>
         + Air<p3_bus::BusSymbolicBuilder<C::Val, C::Challenge>>,
-    B: ZerocheckBackend<C::Val, C::Challenge, A>,
+    B: ZerocheckBackend<C::Val, C::Challenge, A> + Default,
 {
-    prove_forged::<C, A, B>(config, instances, pow_bits, caller_challenger, None)
+    prove_on::<C, A, B, HostProver>(
+        config,
+        instances,
+        pow_bits,
+        caller_challenger,
+        &B::default(),
+        &HostProver,
+    )
 }
 
-/// The proving flow, with what the indexed reduction reads open to substitution.
+/// [`prove_with_backend`] with the zerocheck's rounds on `zerocheck` and the trace
+/// commitment and the bus's product trees on `prover`, wherever each keeps its data.
 ///
-/// Callers reach this through the entry points above, which substitute nothing.
-pub(crate) fn prove_forged<'a, C, A, B>(
+/// # Errors
+/// As [`prove`].
+#[tracing::instrument(name = "prove", skip_all)]
+pub fn prove_on<'a, C, A, Z, P>(
     config: &C,
     instances: ProverInstances<'a, C, A>,
     pow_bits: usize,
     caller_challenger: &mut C::Challenger,
+    zerocheck: &Z,
+    prover: &P,
+) -> Result<MultiStarkProof<C>, ProvingError<PcsProverError<C>>>
+where
+    C: MultiStarkConfig,
+    C::Pcs: PrescribedPointPcs<C::Challenge, C::Challenger>,
+    C::Challenger: Clone
+        + FieldChallenger<C::Val>
+        + GrindingChallenger<Witness = C::Val>
+        + CanSampleUniformBits<C::Val>
+        + CanObserve<Commitment<C>>,
+    Commitment<C>: Clone,
+    ProverData<C>: Clone,
+    A: BaseAir<C::Val>
+        + Air<InteractionSymbolicBuilder<C::Val, C::Challenge>>
+        + Air<p3_bus::BusSymbolicBuilder<C::Val, C::Challenge>>,
+    Z: ZerocheckBackend<C::Val, C::Challenge, A>,
+    P: ProverBackend<C, A> + ?Sized,
+{
+    prove_forged::<C, A, Z, P>(
+        config,
+        instances,
+        pow_bits,
+        caller_challenger,
+        zerocheck,
+        prover,
+        None,
+    )
+}
+
+/// Where a proof's phases keep their data: the trace commitment, the bus's product trees and,
+/// through [`ZerocheckBackend`], the zerocheck's rows.  The defaults are the host's; a backend
+/// that keeps the trace on a device overrides them to read it there.
+pub trait ProverBackend<C: MultiStarkConfig, A> {
+    /// Commit the main tables; `preprocessed` are the instances' preprocessed tables, which
+    /// the later phases read beside the main ones.
+    ///
+    /// # Errors
+    /// Returns the commitment scheme's error.
+    fn commit(
+        &self,
+        config: &C,
+        tables: Vec<Table<C::Val>>,
+        preprocessed: &[Option<&Table<C::Val>>],
+        challenger: &mut C::Challenger,
+    ) -> Result<(Commitment<C>, ProverData<C>), PcsProverError<C>> {
+        let _ = preprocessed;
+        config.pcs().commit(config.build_witness(tables), challenger)
+    }
+
+    /// Open the main commitment and the preprocessed one as one step, the main side first.
+    ///
+    /// # Errors
+    /// Returns the commitment scheme's error.
+    #[allow(clippy::type_complexity)]
+    fn open_pair(
+        &self,
+        config: &C,
+        first: PairOpening<'_, ProverData<C>, C::Challenge>,
+        second: PairOpening<'_, &ProverData<C>, C::Challenge>,
+        challenger: &mut C::Challenger,
+    ) -> Result<(PcsProof<C>, PcsProof<C>), PcsProverError<C>>
+    where
+        C::Pcs: PrescribedPointPcs<C::Challenge, C::Challenger>,
+        C::Challenger: FieldChallenger<C::Val>
+            + GrindingChallenger
+            + CanSampleUniformBits<C::Val>
+            + CanObserve<Commitment<C>>,
+        ProverData<C>: Clone,
+    {
+        config
+            .pcs()
+            .open_pair_at(config.preprocessed_pcs(), first, second, challenger)
+    }
+
+    /// The device that holds the committed tables and runs the bus family inside the
+    /// zerocheck, or `None` for the host prover.
+    fn bus_family_device(&self) -> Option<&dyn BusFamilyDevice<C::Val, C::Challenge>> {
+        None
+    }
+
+    /// The bus's product trees, the push tree then the pull tree, over the leaves
+    /// `leaves` describes.
+    fn bus_trees(
+        &self,
+        leaves: BusLeaves<'_, C::Challenge>,
+        shape: p3_bus::ProductGkrShape,
+    ) -> p3_bus::ProductTrees<C::Challenge> {
+        let leaves = (leaves.materialize)();
+        tracing::info_span!("bus trees")
+            .in_scope(|| p3_bus::ProductTrees::host::<C::Val>(leaves, shape))
+    }
+}
+
+/// The bus's leaves as a backend may build them: block by block from the committed tables,
+/// or materialized on the host.
+pub struct BusLeaves<'a, EF> {
+    /// The push blocks then the pull blocks, in leaf order.
+    pub blocks: [Vec<BusLeafBlock<EF>>; 2],
+    /// The push leaves then the pull leaves, materialized on the host.
+    pub materialize: &'a mut dyn FnMut() -> [Vec<EF>; 2],
+    /// The leaves of one block, the direction's index then the block's, materialized on the
+    /// host.
+    pub block: &'a mut dyn FnMut(usize, usize) -> Vec<EF>,
+}
+
+/// The host's prover backend: the trace committed by the configuration's scheme, the bus
+/// trees in host memory.
+#[derive(Debug, Default)]
+pub struct HostProver;
+
+impl<C: MultiStarkConfig, A> ProverBackend<C, A> for HostProver {}
+
+/// The proving flow, with what the indexed reduction reads open to substitution.
+///
+/// Callers reach this through the entry points above, which substitute nothing.
+pub(crate) fn prove_forged<'a, C, A, Z, P>(
+    config: &C,
+    instances: ProverInstances<'a, C, A>,
+    pow_bits: usize,
+    caller_challenger: &mut C::Challenger,
+    zerocheck: &Z,
+    prover: &P,
     #[cfg(test)] forgery: Option<&Forgery>,
     #[cfg(not(test))] _forgery: Option<core::convert::Infallible>,
 ) -> Result<MultiStarkProof<C>, ProvingError<PcsProverError<C>>>
@@ -248,7 +384,8 @@ where
     A: BaseAir<C::Val>
         + Air<InteractionSymbolicBuilder<C::Val, C::Challenge>>
         + Air<p3_bus::BusSymbolicBuilder<C::Val, C::Challenge>>,
-    B: ZerocheckBackend<C::Val, C::Challenge, A>,
+    Z: ZerocheckBackend<C::Val, C::Challenge, A>,
+    P: ProverBackend<C, A> + ?Sized,
 {
     let mut candidate = caller_challenger.clone();
     let challenger = &mut candidate;
@@ -323,34 +460,6 @@ where
         None
     };
 
-    // IndexedWitness currently borrows dense field slices for both payload and position columns.
-    // Reject a packed source before the statement transcript or commitment can mutate the caller's
-    // challenger; silently decoding here would expand the complete indexed payload.
-    if indexed_plan.is_some() {
-        assert!(
-            tables.iter().all(|table| table.packed_bits().is_none()),
-            "packed Boolean source tables are unsupported for active indexed lookups"
-        );
-        let preprocessed_data = proving_key
-            .preprocessed
-            .as_ref()
-            .map(|preprocessed| &preprocessed.prover_data);
-        let mut next_preprocessed = 0;
-        for instance in instances.iter() {
-            if instance.air.preprocessed_width() != 0 {
-                let data = preprocessed_data.expect(
-                    "preprocessed proving key is missing for an AIR with preprocessed columns",
-                );
-                let table = config.committed_table(data, next_preprocessed);
-                next_preprocessed += 1;
-                assert!(
-                    table.packed_bits().is_none(),
-                    "packed Boolean preprocessed tables are unsupported for active indexed lookups"
-                );
-            }
-        }
-    }
-
     // Describe the statement before binding anything into it.
     //
     // Every number comes from the AIRs, from the tables this caller holds, and from `pow_bits`.
@@ -365,7 +474,8 @@ where
             pow_bits,
             indexed_plan.is_some(),
             bus.is_some(),
-        ),
+        )
+        .with_pair_openings(config.pair_openings()),
     );
 
     // 1. Bind the reusable batched preprocessed commitment before any challenge depends on it.
@@ -375,22 +485,6 @@ where
             .as_ref()
             .map(|preprocessed| preprocessed.commitment.clone()),
     );
-
-    // 2. Commit all main trace tables in instance order, inside the delegation bracket.
-    // The scheme absorbs the commitment it produces, so the bracket records where that lands.
-    let witness = config.build_witness(tables);
-    let (commitment, prover_data) = transcript
-        .main_commitment(|challenger| config.pcs().commit(witness, challenger))
-        .inspect_err(|_| transcript.abort())
-        .map_err(|source| ProvingError::Pcs {
-            phase: "main commitment",
-            source,
-        })?;
-
-    // Keep commitment-bound table views for zerocheck, one per instance.
-    let tables = (0..num_instances)
-        .map(|table_index| config.committed_table(&prover_data, table_index))
-        .collect::<Vec<_>>();
 
     // One entry per instance, in instance order.
     // An AIR with preprocessed columns takes the next committed table in setup order.
@@ -412,6 +506,26 @@ where
         })
         .collect::<Vec<_>>();
 
+    let mut phase = tracing::info_span!("main commitment").entered();
+    // 2. Commit all main trace tables in instance order, inside the delegation bracket.
+    // The scheme absorbs the commitment it produces, so the bracket records where that lands.
+    let (commitment, prover_data) = transcript
+        .main_commitment(|challenger| {
+            prover.commit(config, tables, &preprocessed_tables, challenger)
+        })
+        .inspect_err(|_| transcript.abort())
+        .map_err(|source| ProvingError::Pcs {
+            phase: "main commitment",
+            source,
+        })?;
+
+    // Keep commitment-bound table views for zerocheck, one per instance.
+    let tables = (0..num_instances)
+        .map(|table_index| config.committed_table(&prover_data, table_index))
+        .collect::<Vec<_>>();
+
+    drop(phase);
+    phase = tracing::info_span!("public values").entered();
     // 3. Bind the public values, one step per instance.
     // They belong to the whole statement, so they land before either phase samples anything.
     transcript.public_values(&public_values);
@@ -440,6 +554,8 @@ where
     #[cfg(not(test))]
     let bus_tables = tables.clone();
 
+    drop(phase);
+    phase = tracing::info_span!("bus argument").entered();
     // 4. Reduce each planned bus product to its two terminal claims.
     // Nothing authenticates them yet; the shared sumcheck below binds them to the tables.
     let bus_round = transcript
@@ -452,15 +568,39 @@ where
             let periodic = context.periodic_tables(&airs, &instances.num_variables());
             context
                 .plan()
-                .prove::<C::Val, C::Challenge, _>(
-                    |challenges| {
-                        context.materialize(
-                            &bus_tables,
-                            &preprocessed_tables,
-                            &periodic,
-                            &public_values,
-                            challenges,
-                        )
+                .prove_trees::<C::Val, C::Challenge, _>(
+                    |challenges, shape| {
+                        let blocks = context.leaf_blocks(&public_values, challenges);
+                        let mut materialize = || {
+                            let _span = tracing::info_span!("bus leaves").entered();
+                            context.materialize(
+                                &bus_tables,
+                                &preprocessed_tables,
+                                &periodic,
+                                &public_values,
+                                challenges,
+                            )
+                        };
+                        let mut block = |direction: usize, index: usize| {
+                            let _span = tracing::info_span!("bus leaf block").entered();
+                            context.materialize_one(
+                                direction,
+                                index,
+                                &bus_tables,
+                                &preprocessed_tables,
+                                &periodic,
+                                &public_values,
+                                challenges,
+                            )
+                        };
+                        Ok(prover.bus_trees(
+                            BusLeaves {
+                                blocks,
+                                materialize: &mut materialize,
+                                block: &mut block,
+                            },
+                            shape,
+                        ))
                     },
                     challenger,
                 )
@@ -480,6 +620,8 @@ where
         .zip(bus_output.as_ref())
         .map(|(context, output)| BusFamily { context, output });
 
+    drop(phase);
+    phase = tracing::info_span!("lookup argument").entered();
     // 5. Materialize the lookup fractions and reduce them, inside the delegation bracket.
     // The resulting claim feeds the coupled AIR sumcheck below.
     //
@@ -497,6 +639,8 @@ where
         )
     });
 
+    drop(phase);
+    phase = tracing::info_span!("zerocheck").entered();
     // 6. Reduce AIR constraints, lookup links, and bus shares to one sumcheck and one point.
     // The committed prover opens columns through the commitment schemes below, so
     // the zerocheck's own opened values reach the proof only through an opening that
@@ -504,18 +648,22 @@ where
     //
     // Under test the bus tables may stand in for the committed ones.
     // The closing check then meets openings the sumcheck never folded, and rejects.
-    let zerocheck = AirZerocheck::with_profiles(&airs, &proving_key.air_profiles, pow_bits);
+    let air_zerocheck = AirZerocheck::with_profiles(&airs, &proving_key.air_profiles, pow_bits);
     let (zerocheck_proof, point) = transcript.zerocheck(|challenger| {
-        zerocheck.prove_with_lookup_and_bus::<C::Val, C::Challenge, B, _>(
+        air_zerocheck.prove_with_lookup_and_bus::<C::Val, C::Challenge, Z, _>(
             &preprocessed_tables,
             &bus_tables,
             &public_values,
             lookup_data,
             bus_family,
+            prover.bus_family_device(),
             config.sliced_rounds(),
+            zerocheck,
             challenger,
         )
     });
+    drop(phase);
+    phase = tracing::info_span!("indexed lookup").entered();
     // 7. Reduce every indexed lookup against the point the zerocheck bound.
     //
     // The reduction needs what each reader pulled there.
@@ -562,7 +710,9 @@ where
 
         let readers = statement.readers();
         let lookups = statement.lookups(&readers);
-        let witness = IndexedWitness::build(plan, &tables, &preprocessed_tables);
+        let mut indexed_dense = Vec::new();
+        let witness =
+            IndexedWitness::build(plan, &tables, &preprocessed_tables, &mut indexed_dense);
 
         // Under test a substitution may stand in for what the commitment holds, so the
         // verifier's discharge of these claims can be driven.
@@ -602,49 +752,35 @@ where
     drop(tables);
     drop(preprocessed_tables);
 
+    drop(phase);
+    phase = tracing::info_span!("openings").entered();
     // 8. Open each main trace table at every point a claim was left at.
     //
     // A table's first batch reads its AIR's columns at the suffix of the bound point.
     // The zerocheck folded each of those columns down to exactly that value, so the scheme is
     // handed them rather than left to evaluate the table again.
     let points = RunPoints::new(&point, indexed_output.as_ref());
-    let opening = transcript.main_opening(|challenger| {
-        let schedule = instances.main_schedule(indexed_plan.as_ref(), |role, rows| {
-            trace_suffix(points.at(role), rows)
-        });
-        let mut known = alloc::vec![None; schedule.protocol().num_openings()];
-        let first_batches = schedule.first_batch_per_table();
-        debug_assert_eq!(
-            (zerocheck_proof.local.len(), zerocheck_proof.next.len()),
-            (first_batches.len(), first_batches.len()),
-            "the zerocheck opens every committed table once"
-        );
-        for ((batch, local), next) in first_batches
-            .into_iter()
-            .zip(zerocheck_proof.local)
-            .zip(zerocheck_proof.next)
-        {
-            known[batch] = Some(OpeningEvals::new(local, next));
-        }
-        config.pcs().open_at_known(
-            prover_data,
-            schedule.protocol(),
-            &schedule.against(),
-            &known,
-            challenger,
-        )
+    let main_schedule = instances.main_schedule(indexed_plan.as_ref(), |role, rows| {
+        trace_suffix(points.at(role), rows)
     });
+    let mut known = alloc::vec![None; main_schedule.protocol().num_openings()];
+    let first_batches = main_schedule.first_batch_per_table();
+    debug_assert_eq!(
+        (zerocheck_proof.local.len(), zerocheck_proof.next.len()),
+        (first_batches.len(), first_batches.len()),
+        "the zerocheck opens every committed table once"
+    );
+    for ((batch, local), next) in first_batches
+        .into_iter()
+        .zip(zerocheck_proof.local)
+        .zip(zerocheck_proof.next)
+    {
+        known[batch] = Some(OpeningEvals::new(local, next));
+    }
+    let main_against = main_schedule.against();
 
-    let opening = opening
-        .inspect_err(|_| transcript.abort())
-        .map_err(|source| ProvingError::Pcs {
-            phase: "main opening",
-            source,
-        })?;
-
-    // 9. Open each non-empty preprocessed table at every point a claim was left at.
-    // The setup commitment data is reused rather than rebuilt.
-    let preprocessed_opening = transcript.preprocessed_opening(|challenger| {
+    // 8 and 9 as one step: both traces under one opening, the main side first.
+    let (opening, preprocessed_opening) = if transcript.pairs() {
         let preprocessed = proving_key
             .preprocessed
             .as_ref()
@@ -652,23 +788,82 @@ where
         let schedule = instances.preprocessed_schedule(indexed_plan.as_ref(), |role, rows| {
             trace_suffix(points.at(role), rows)
         });
-        config.preprocessed_pcs().open_at(
-            preprocessed.prover_data.clone(),
-            schedule.protocol(),
-            &schedule.against(),
-            challenger,
-        )
-    });
+        let against = schedule.against();
+        let none = alloc::vec![None; schedule.protocol().num_openings()];
+        let opened = transcript.pair_opening(|challenger| {
+            prover.open_pair(
+                config,
+                PairOpening {
+                    prover_data,
+                    protocol: main_schedule.protocol(),
+                    points: &main_against,
+                    known: &known,
+                },
+                PairOpening {
+                    prover_data: &preprocessed.prover_data,
+                    protocol: schedule.protocol(),
+                    points: &against,
+                    known: &none,
+                },
+                challenger,
+            )
+        });
+        let (opening, preprocessed_opening) =
+            opened
+                .inspect_err(|_| transcript.abort())
+                .map_err(|source| ProvingError::Pcs {
+                    phase: "pair opening",
+                    source,
+                })?;
+        (opening, Some(preprocessed_opening))
+    } else {
+        let opening = transcript.main_opening(|challenger| {
+            config.pcs().open_at_known(
+                prover_data,
+                main_schedule.protocol(),
+                &main_against,
+                &known,
+                challenger,
+            )
+        });
 
-    let preprocessed_opening = preprocessed_opening
-        .transpose()
-        .inspect_err(|_| transcript.abort())
-        .map_err(|source| ProvingError::Pcs {
-            phase: "preprocessed opening",
-            source,
-        })?;
+        let opening = opening
+            .inspect_err(|_| transcript.abort())
+            .map_err(|source| ProvingError::Pcs {
+                phase: "main opening",
+                source,
+            })?;
+
+        // 9. Open each non-empty preprocessed table at every point a claim was left at.
+        // The setup commitment data is reused rather than rebuilt.
+        let preprocessed_opening = transcript.preprocessed_opening(|challenger| {
+            let preprocessed = proving_key
+                .preprocessed
+                .as_ref()
+                .expect("preprocessed proving key is missing for an AIR with preprocessed columns");
+            let schedule = instances.preprocessed_schedule(indexed_plan.as_ref(), |role, rows| {
+                trace_suffix(points.at(role), rows)
+            });
+            config.preprocessed_pcs().open_at(
+                preprocessed.prover_data.clone(),
+                schedule.protocol(),
+                &schedule.against(),
+                challenger,
+            )
+        });
+
+        let preprocessed_opening = preprocessed_opening
+            .transpose()
+            .inspect_err(|_| transcript.abort())
+            .map_err(|source| ProvingError::Pcs {
+                phase: "preprocessed opening",
+                source,
+            })?;
+        (opening, preprocessed_opening)
+    };
 
     // Every described step has now been played.
+    drop(phase);
     transcript.finish();
     *caller_challenger = candidate;
 
@@ -691,7 +886,6 @@ mod tests {
     use alloc::string::String;
     use alloc::vec;
     use core::cell::Cell;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::OnceLock;
 
     use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
@@ -1139,11 +1333,13 @@ mod tests {
             )
             .collect();
 
-        let proof = prove_forged::<_, _, GenericBackend>(
+        let proof = prove_forged::<_, _, GenericBackend, HostProver>(
             &config,
             ProverInstances::new(proving),
             0,
             &mut challenger(),
+            &GenericBackend,
+            &HostProver,
             forgery,
         )
         .expect("a forged reduction input still produces a proof");
@@ -1207,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_indexed_sources_are_rejected_before_commitment_and_transcript() {
+    fn packed_indexed_sources_prove() {
         let table_air = Squares::Table("t");
         let reader_air = Squares::Reader("t");
         let config = config(FOLDING + 2, FOLDING);
@@ -1220,102 +1416,16 @@ mod tests {
             ProverInstance::new(&reader_air, reader_table, &proving_key, &[]),
         ]);
         let mut challenger = challenger();
-        let mut expected = challenger.clone();
-        let panic = match catch_unwind(AssertUnwindSafe(|| {
-            prove_forged::<_, _, GenericBackend>(
-                &config,
-                proving_instances,
-                0,
-                &mut challenger,
-                None,
-            )
-        })) {
-            Ok(_) => panic!("packed indexed input must be rejected"),
-            Err(panic) => panic,
-        };
-        let message = panic
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or_default();
-        assert!(
-            message.contains("packed Boolean source tables"),
-            "{message}"
-        );
-        assert_eq!(
-            config.main_pcs_uses.get(),
+        prove_forged::<_, _, GenericBackend, HostProver>(
+            &config,
+            proving_instances,
             0,
-            "packed indexed rejection must precede the main PCS commitment"
-        );
-        for _ in 0..4 {
-            assert_eq!(
-                CanSample::<F>::sample(&mut challenger),
-                CanSample::<F>::sample(&mut expected),
-                "caller challenger changed before packed indexed rejection"
-            );
-        }
-    }
-
-    #[test]
-    fn packed_indexed_preprocessed_sources_are_rejected_before_pcs_and_transcript() {
-        let height = packed_floor();
-        let log_height = log2_strict_usize(height);
-        let fixed_air = Squares::Fixed("t", vec![0; height]);
-        let reader_air = Squares::Reader("t");
-        let airs = [&fixed_air, &reader_air];
-        let mut config = config(log_height + 2, log_height);
-        let (proving_key, _) = setup(&config, &airs, &mut challenger()).unwrap();
-        static PACKED_PREPROCESSED: OnceLock<Table<F>> = OnceLock::new();
-        let packed_preprocessed = PACKED_PREPROCESSED.get_or_init(|| {
-            let height = packed_floor();
-            Table::from_packed_bits(
-                RowMajorMatrix::new(vec![0u64; height.div_ceil(64)], 1),
-                log_height,
-            )
-        });
-        config.committed_table_override = Some(packed_preprocessed);
-
-        let fixed_table = Table::zero(1, log_height);
-        let reader_table = Table::zero(2, log_height);
-        let proving_instances = ProverInstances::new(vec![
-            ProverInstance::new(&fixed_air, fixed_table, &proving_key, &[]),
-            ProverInstance::new(&reader_air, reader_table, &proving_key, &[]),
-        ]);
-        let mut challenger = challenger();
-        let mut expected = challenger.clone();
-        let panic = match catch_unwind(AssertUnwindSafe(|| {
-            prove_forged::<_, _, GenericBackend>(
-                &config,
-                proving_instances,
-                0,
-                &mut challenger,
-                None,
-            )
-        })) {
-            Ok(_) => panic!("packed indexed preprocessed input must be rejected"),
-            Err(panic) => panic,
-        };
-        let message = panic
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or_default();
-        assert!(
-            message.contains("packed Boolean preprocessed tables"),
-            "{message}"
-        );
-        assert_eq!(
-            config.main_pcs_uses.get(),
-            0,
-            "packed preprocessed rejection must precede the main PCS commitment"
-        );
-        for _ in 0..4 {
-            assert_eq!(
-                CanSample::<F>::sample(&mut challenger),
-                CanSample::<F>::sample(&mut expected),
-                "caller challenger changed before packed preprocessed rejection"
-            );
-        }
+            &mut challenger,
+            &GenericBackend,
+            &HostProver,
+            None,
+        )
+            .expect("a packed source is read like a dense one");
     }
 
     #[test]
@@ -1622,7 +1732,7 @@ mod tests {
                 values.len() / 2,
             ))
         };
-        let proof = prove_forged::<_, _, GenericBackend>(
+        let proof = prove_forged::<_, _, GenericBackend, HostProver>(
             &config,
             ProverInstances::new(vec![
                 ProverInstance::new(&push, table(push_columns), &pk, &[]),
@@ -1630,6 +1740,8 @@ mod tests {
             ]),
             0,
             &mut challenger(),
+            &GenericBackend,
+            &HostProver,
             forgery,
         )
         .unwrap();

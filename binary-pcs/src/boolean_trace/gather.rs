@@ -6,6 +6,7 @@ use p3_binary_field::{BitCoordinates, TowerLevel};
 use p3_challenger::fs::TranscriptField;
 use p3_field::{ExtensionField, Field};
 use p3_maybe_rayon::prelude::*;
+use p3_sumcheck::TableShape;
 use p3_sumcheck::layout::{Table, TablePlacement};
 
 use super::{BooleanTraceCommitment, BooleanTraceCommitmentError, WORD_BITS};
@@ -14,12 +15,52 @@ use crate::boolean::BooleanBackend;
 /// Adjacent packed columns one gather task copies, one source line's worth of words.
 pub(super) const GATHER_GROUP: usize = 8;
 
+/// Where one column's cells go in the stacked bit witness: the `len` cells of column `column`
+/// of table `table`, from bit `offset`, a multiple of `len`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatherSlot {
+    pub table: usize,
+    pub column: usize,
+    pub offset: usize,
+    pub len: usize,
+}
+
 impl<EF, B> BooleanTraceCommitment<EF, B>
 where
     EF: BitCoordinates + ExtensionField<B::Val>,
     B: BooleanBackend<EF>,
     B::Val: TranscriptField + TowerLevel,
 {
+    /// Where [`Self::gather_bits`] puts each column of tables of these shapes, for a device
+    /// that gathers the bits it holds the same way; every bit no slot covers is zero.
+    ///
+    /// # Errors
+    ///
+    /// The shapes do not stack to the committed arity.
+    pub fn gather_plan(
+        &self,
+        shapes: &[TableShape],
+    ) -> Result<Vec<GatherSlot>, BooleanTraceCommitmentError<B::Error>> {
+        let placements = self.placements(shapes)?;
+        Ok(placements
+            .iter()
+            .flat_map(|placement| {
+                let table = placement.idx();
+                let len = 1usize << shapes[table].num_variables();
+                placement
+                    .selectors()
+                    .iter()
+                    .enumerate()
+                    .map(move |(column, selector)| GatherSlot {
+                        table,
+                        column,
+                        offset: selector.index() * len,
+                        len,
+                    })
+            })
+            .collect())
+    }
+
     /// Gather the Boolean cells of every table into one bit witness.
     ///
     /// `words` holds one word per sixty-four bits of the padded witness, zeroed, and bit `j` of

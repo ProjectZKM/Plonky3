@@ -525,6 +525,7 @@ fn zk_whir_rejects_missing_query_opening() {
     let dropped = match &mut proven.proof.rounds[0].openings {
         QueryOpenings::Base(opening) => opening.rows.pop().is_some(),
         QueryOpenings::Extension(opening) => opening.rows.pop().is_some(),
+        QueryOpenings::Batched(batch) => batch[0].rows.pop().is_some(),
     };
     assert!(dropped, "fixture has query openings");
     let err = proven.verify().unwrap_err();
@@ -565,6 +566,7 @@ fn zk_whir_rejects_wrong_leaf_width_before_folding() {
             QueryOpenings::Extension(opening) => {
                 opening.rows[0].pop();
             }
+            QueryOpenings::Batched(_) => unreachable!("a single commitment opens unbatched"),
         }
         let expected = if final_round {
             ZkVerifierError::BaseCase(BaseCaseZkError::SourceOpeningsRejected)
@@ -596,6 +598,7 @@ fn zk_whir_rejects_wrong_leaf_field_before_checking_rows() {
                 rows: vec![],
                 proof: opening.proof.clone(),
             }),
+            QueryOpenings::Batched(_) => unreachable!("a single commitment opens unbatched"),
         };
         let expected = if final_round {
             ZkVerifierError::BaseCase(BaseCaseZkError::SourceOpeningsRejected)

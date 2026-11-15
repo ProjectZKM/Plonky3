@@ -417,7 +417,7 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitch<F, EF>
     }
 
     /// The trailing coordinates the successor view steps within, when there is one.
-    const fn successor(&self) -> Option<usize> {
+    pub(super) const fn successor(&self) -> Option<usize> {
         match self.low {
             LowWeights::Equality { successor, .. } => successor,
             LowWeights::Supplied(_) => None,
@@ -479,6 +479,12 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitch<F, EF>
         self.successor()
             .filter(|&rows| rows > Self::ABSORBED)
             .map(|rows| rows - Self::ABSORBED)
+    }
+
+    /// The elements of one column of the packing, when the reduction sends the carry and last
+    /// elements beside the tensor.
+    pub(super) fn successor_column(&self) -> Option<usize> {
+        self.kept_row_variables().map(|kept| 1usize << kept)
     }
 
     /// Whether the reduction sends the carry and last elements beside the tensor.
@@ -1083,10 +1089,11 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitch<F, EF>
     ///
     /// # Algorithm
     ///
-    /// The equality polynomial factors over the variables:
+    /// The equality polynomial factors over the variables, and in characteristic two each
+    /// factor is affine:
     ///
     /// ```text
-    ///     eq(X, Y) = prod_i ( X_i*Y_i + (1 - X_i)(1 - Y_i) )
+    ///     eq(X, Y) = prod_i ( X_i*Y_i + (1 + X_i)(1 + Y_i) ) = prod_i ( 1 + X_i + Y_i )
     /// ```
     ///
     /// In characteristic two each factor is `1 + a ⊗ 1 + 1 ⊗ b`.
@@ -1198,6 +1205,27 @@ impl<'a, F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitchBat
     /// One batching weight per coordinate of `EF`, the padding past them dropped.
     pub(super) fn coordinate_weights(&self) -> &[EF] {
         &self.eq_batch.as_slice()[..Coefficients::<EF>::DIMENSION]
+    }
+
+    /// What [`Self::add_scaled_weights_over`] adds with `scale`, for a device: the coordinate
+    /// tables of the scaled batching weights, and the column length and challenge of the
+    /// successor shift when the reduction sends successor elements.
+    pub(super) fn device_weights(&self, scale: EF) -> (Vec<EF>, Option<(usize, EF)>) {
+        let batching: Vec<EF> = self
+            .coordinate_weights()
+            .iter()
+            .map(|&w| scale * w)
+            .collect();
+        let sums = CoordinateSums::<EF, EF>::new(&batching);
+        let tables = sums.tables().iter().flatten().copied().collect();
+        let successor = self.alpha.map(|alpha| {
+            let kept = self
+                .reduction
+                .kept_row_variables()
+                .expect("a batch carries alpha only for a reduction sending successor elements");
+            (1usize << kept, alpha)
+        });
+        (tables, successor)
     }
 }
 

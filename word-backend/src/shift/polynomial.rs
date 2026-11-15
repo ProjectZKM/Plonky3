@@ -1,21 +1,21 @@
 //! Sumcheck state for a sum of multilinear products.
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use p3_field::Field;
+use p3_maybe_rayon::prelude::*;
 use p3_multilinear_util::poly::Poly;
 use p3_sumcheck::generic_degree::RoundProver;
 
 /// A degree-two polynomial represented as a sum of multilinear products.
-pub(super) struct SumOfProducts<F> {
+pub(crate) struct SumOfProducts<F> {
     /// Left and right factors sharing one Boolean variable space.
     pairs: Vec<[Poly<F>; 2]>,
 }
 
 impl<F: Field> SumOfProducts<F> {
     /// Creates a prover state from equally sized factor pairs.
-    pub(super) fn new(mut pairs: Vec<[Poly<F>; 2]>, num_variables: usize) -> Self {
+    pub(crate) fn new(mut pairs: Vec<[Poly<F>; 2]>, num_variables: usize) -> Self {
         // An empty wiring polynomial is represented by one zero product.
         if pairs.is_empty() {
             pairs.push([
@@ -45,7 +45,7 @@ impl<F: Field> SumOfProducts<F> {
     }
 
     /// Returns both terminal evaluations of the first product.
-    pub(super) fn first_constants(&self) -> [F; 2] {
+    pub(crate) fn first_constants(&self) -> [F; 2] {
         // The word phase contains exactly one product pair.
         debug_assert_eq!(self.pairs.len(), 1);
         self.pairs[0].each_ref().map(|factor| {
@@ -73,6 +73,7 @@ impl<F: Field> SumOfProducts<F> {
     }
 
     /// Evaluates one round polynomial at a selected node.
+    #[cfg(test)]
     fn round_at(&self, node: F) -> F {
         // Prefix binding pairs the lower and upper table halves.
         self.pairs
@@ -107,15 +108,38 @@ impl<F: Field> RoundProver<F> for SumOfProducts<F> {
     fn round_poly(&self) -> Vec<F> {
         // Degree two needs the values at zero and two.
         // The running claim reconstructs the omitted value at one.
-        vec![
-            self.round_at(F::ZERO),
-            self.round_at(F::interpolation_node(2)),
-        ]
+        let two = F::interpolation_node(2);
+        let add = |[a, b]: [F; 2], [c, d]: [F; 2]| [a + c, b + d];
+        let sums = self
+            .pairs
+            .par_iter()
+            .map(|[left, right]| {
+                let (left, right) = (left.as_slice(), right.as_slice());
+                let half = left.len() / 2;
+
+                // One pass reads both halves once and accumulates both nodes.
+                (0..half).into_par_iter().par_fold_reduce(
+                    || [F::ZERO; 2],
+                    |[zero, at_two], row| {
+                        let (l0, l1) = (left[row], left[row + half]);
+                        let (r0, r1) = (right[row], right[row + half]);
+                        [
+                            zero + l0 * r0,
+                            at_two + (l0 + (l1 - l0) * two) * (r0 + (r1 - r0) * two),
+                        ]
+                    },
+                    add,
+                )
+            })
+            .par_fold_reduce(|| [F::ZERO; 2], add, add);
+        sums.to_vec()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use p3_binary_field::{BinaryField128, TowerLevel};
     use p3_field::PrimeCharacteristicRing;
 

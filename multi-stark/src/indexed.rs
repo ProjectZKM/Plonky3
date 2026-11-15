@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 use p3_air::{Air, BaseAir};
 use p3_field::{ExtensionField, Field};
-use p3_lookup::indexed::{IndexedLookupError, IndexedLookups, TraceWindow};
+use p3_lookup::indexed::{IndexedLookupError, IndexedLookups, IndexedPosition, TraceWindow};
 use p3_lookup::symbolic::InteractionSymbolicBuilder;
 use p3_multilinear_util::point::Point;
 use p3_sumcheck::layout::Table;
@@ -48,8 +48,8 @@ pub struct TablePlacement {
 pub struct ReaderPlacement {
     /// Position of the reading AIR in caller order.
     pub air: usize,
-    /// Main-trace column holding the entry each row names.
-    pub position: usize,
+    /// Where each row names the entry it reads.
+    pub position: IndexedPosition,
     /// Main-trace columns holding the values pulled, in table-column order.
     pub payload: Vec<usize>,
     /// Base-two logarithm of the reading AIR's trace height.
@@ -235,7 +235,7 @@ impl IndexedPlan {
 
                 plan.readers.push(ReaderPlacement {
                     air,
-                    position: read.position,
+                    position: read.position.clone(),
                     payload: read.payload.clone(),
                     num_variables: num_variables[air],
                 });
@@ -476,6 +476,11 @@ impl<'a, F: Field> IndexedWitness<'a, F> {
     ///
     /// It also makes an out-of-range row a miss rather than a wrong answer.
     ///
+    /// Position bits name the entry directly, bit by bit, and need no map.
+    ///
+    /// A table's columns are borrowed where they are dense and copied into `dense` where they
+    /// are packed bits, so a packed Boolean trace may provide a table or read one.
+    ///
     /// # Panics
     ///
     /// Panics when a position column names something no entry of its table embeds to.
@@ -485,13 +490,14 @@ impl<'a, F: Field> IndexedWitness<'a, F> {
         plan: &IndexedPlan,
         main: &'a [&'a Table<F>],
         preprocessed: &'a [Option<&'a Table<F>>],
+        dense: &'a mut Vec<Vec<F>>,
     ) -> Self {
         let mut positions = Vec::with_capacity(plan.tables().len());
-        let mut columns = Vec::with_capacity(plan.tables().len());
 
         // The embedding is the same whichever table an entry belongs to.
         //
-        // One map sized by the largest table therefore serves the whole batch.
+        // One map sized by the largest table therefore serves every reader naming its entry
+        // through one column; readers naming it by bits need none.
         //
         // A map of 2^m field elements is the dominant allocation here.
         //
@@ -499,33 +505,62 @@ impl<'a, F: Field> IndexedWitness<'a, F> {
         let widest = plan
             .tables()
             .iter()
+            .filter(|table| {
+                table
+                    .readers
+                    .iter()
+                    .any(|reader| matches!(reader.position, IndexedPosition::Column(_)))
+            })
             .map(|table| table.table.num_variables)
-            .max()
-            .expect("a plan exists only when some table is declared");
-        let mut entry_of = HashMap::with_capacity(1usize << widest);
-        for entry in 0..1usize << widest {
+            .max();
+        let mut entry_of = HashMap::with_capacity(widest.map_or(0, |widest| 1usize << widest));
+        for entry in 0..widest.map_or(0, |widest| 1usize << widest) {
             entry_of.insert(position::embed::<F>(entry), entry);
         }
 
+        // Every packed table column is copied out once, in plan order, before anything borrows.
+        dense.clear();
+        let mut copied: Vec<Vec<Option<usize>>> = Vec::with_capacity(plan.tables().len());
         for table in plan.tables() {
-            // Where the table's own columns live decides which commitment holds them.
-            let source = match table.table.window {
-                TraceWindow::Main => *main
-                    .get(table.table.air)
-                    .expect("a table's AIR carries a main trace"),
-                TraceWindow::Preprocessed => preprocessed
-                    .get(table.table.air)
-                    .copied()
-                    .flatten()
-                    .expect("a preprocessed table's AIR carries a preprocessed trace"),
-            };
+            let source = Self::source(table, main, preprocessed);
+            copied.push(
+                table
+                    .table
+                    .columns
+                    .iter()
+                    .map(|&column| {
+                        let poly = source.column(column);
+                        if poly.as_dense().is_some() {
+                            None
+                        } else {
+                            let mut values = alloc::vec![F::ZERO; poly.len()];
+                            poly.copy_into(&mut values);
+                            dense.push(values);
+                            Some(dense.len() - 1)
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        let dense: &'a Vec<Vec<F>> = dense;
+
+        let mut columns = Vec::with_capacity(plan.tables().len());
+        for (table, copied) in plan.tables().iter().zip(&copied) {
+            let source = Self::source(table, main, preprocessed);
             columns.push(
                 table
                     .table
                     .columns
                     .iter()
-                    .map(|&column| source.poly(column).into_slice())
-                    .collect(),
+                    .zip(copied)
+                    .map(|(&column, copied)| match copied {
+                        Some(index) => dense[*index].as_slice(),
+                        None => source
+                            .column(column)
+                            .as_dense()
+                            .expect("a column not copied out is dense"),
+                    })
+                    .collect::<Vec<&'a [F]>>(),
             );
 
             let entries = 1usize << table.table.num_variables;
@@ -534,30 +569,91 @@ impl<'a, F: Field> IndexedWitness<'a, F> {
                     .readers
                     .iter()
                     .map(|reader| {
-                        let named = main
+                        let trace = main
                             .get(reader.air)
-                            .expect("a reader's AIR carries a main trace")
-                            .poly(reader.position)
-                            .into_slice();
-                        named
-                            .iter()
-                            .map(|value| {
-                                // The map covers the largest table.
-                                //
-                                // A row of a smaller one is checked against its own size.
-                                let entry = *entry_of
-                                    .get(value)
-                                    .expect("a row names an entry outside its table");
-                                assert!(entry < entries, "a row names an entry outside its table");
-                                entry
-                            })
-                            .collect()
+                            .expect("a reader's AIR carries a main trace");
+                        let rows = 1usize << reader.num_variables;
+                        match &reader.position {
+                            IndexedPosition::Column(column) => {
+                                let named = trace.column(*column);
+                                (0..rows)
+                                    .map(|row| {
+                                        // The map covers the largest table.
+                                        //
+                                        // A row of a smaller one is checked against its own size.
+                                        let entry = *entry_of
+                                            .get(&named.value(row))
+                                            .expect("a row names an entry outside its table");
+                                        assert!(
+                                            entry < entries,
+                                            "a row names an entry outside its table"
+                                        );
+                                        entry
+                                    })
+                                    .collect()
+                            }
+                            IndexedPosition::Bits(bits) => {
+                                let polys = bits
+                                    .iter()
+                                    .map(|&bit| trace.column(bit))
+                                    .collect::<Vec<_>>();
+                                // A packed column yields sixty-four rows per word; a dense one is
+                                // read a value at a time.
+                                let bit_at =
+                                    |poly: &p3_sumcheck::layout::ColumnView<'_, F>, row: usize| {
+                                        match poly.boolean_word(row / 64) {
+                                            Some(word) => (word >> (row % 64)) & 1 == 1,
+                                            None => {
+                                                let value = poly.value(row);
+                                                assert!(
+                                                    value == F::ZERO || value == F::ONE,
+                                                    "a position bit column holds a bit"
+                                                );
+                                                value == F::ONE
+                                            }
+                                        }
+                                    };
+                                (0..rows)
+                                    .map(|row| {
+                                        let entry = polys.iter().enumerate().fold(
+                                            0usize,
+                                            |entry, (bit, poly)| {
+                                                entry | (usize::from(bit_at(poly, row)) << bit)
+                                            },
+                                        );
+                                        assert!(
+                                            entry < entries,
+                                            "a row names an entry outside its table"
+                                        );
+                                        entry
+                                    })
+                                    .collect()
+                            }
+                        }
                     })
                     .collect(),
             );
         }
 
         Self { positions, columns }
+    }
+
+    /// The committed trace holding `table`'s columns.
+    fn source(
+        table: &IndexedTablePlan,
+        main: &'a [&'a Table<F>],
+        preprocessed: &'a [Option<&'a Table<F>>],
+    ) -> &'a Table<F> {
+        match table.table.window {
+            TraceWindow::Main => *main
+                .get(table.table.air)
+                .expect("a table's AIR carries a main trace"),
+            TraceWindow::Preprocessed => preprocessed
+                .get(table.table.air)
+                .copied()
+                .flatten()
+                .expect("a preprocessed table's AIR carries a preprocessed trace"),
+        }
     }
 
     /// Replace what the reduction reads, leaving the committed traces alone.
@@ -790,7 +886,7 @@ mod tests {
             entry.readers,
             vec![ReaderPlacement {
                 air: 0,
-                position: 3,
+                position: IndexedPosition::Column(3),
                 payload: vec![1, 2],
                 num_variables: 3,
             }]

@@ -12,6 +12,7 @@ use p3_multilinear_util::point::Point;
 use p3_sumcheck::generic_degree::RoundPolyInterpolator;
 use serde::{Deserialize, Serialize};
 
+use super::device::{DeviceLayer, DeviceProductTrees, ProductTrees, Trees};
 use super::math::{
     combine, has_distinct_round_nodes, interpolate_pair, interpolate_quad, sum_adjacent,
 };
@@ -449,6 +450,136 @@ impl<EF> ProductGkrProof<EF> {
 
         // Internal folds bind low-order address bits first.
         // The public convention addresses subcubes with leading coordinates.
+        point.reverse();
+
+        (
+            Self {
+                roots: root_messages,
+                layers: layer_proofs,
+            },
+            ProductGkrOutput {
+                roots,
+                point,
+                values,
+            },
+        )
+    }
+
+    /// Proves separate product trees wherever they are held.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::prove`].
+    pub fn prove_trees<F, Challenger>(
+        trees: ProductTrees<EF>,
+        shape: ProductGkrShape,
+        challenger: &mut Challenger,
+    ) -> (Self, ProductGkrOutput<EF>)
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        Challenger: FieldChallenger<F>,
+    {
+        match trees.trees {
+            Trees::Host(prepared) => {
+                assert_eq!(prepared.shape, shape, "the trees were built for another shape");
+                prepared.prove::<F, Challenger>(challenger)
+            }
+            Trees::Device(mut device) => {
+                Self::prove_device::<F, Challenger>(&mut *device, shape, challenger)
+            }
+        }
+    }
+
+    /// [`Self::prove_trees`] over separate trees `device` holds, borrowed.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::prove`].
+    pub fn prove_on<F, Challenger>(
+        device: &mut dyn DeviceProductTrees<EF>,
+        shape: ProductGkrShape,
+        challenger: &mut Challenger,
+    ) -> (Self, ProductGkrOutput<EF>)
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        Challenger: FieldChallenger<F>,
+    {
+        Self::prove_device::<F, Challenger>(device, shape, challenger)
+    }
+
+    /// The transcript of [`Self::prove_inner`] over separate trees a device holds.
+    fn prove_device<F, Challenger>(
+        device: &mut dyn DeviceProductTrees<EF>,
+        shape: ProductGkrShape,
+        challenger: &mut Challenger,
+    ) -> (Self, ProductGkrOutput<EF>)
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        Challenger: FieldChallenger<F>,
+    {
+        assert!(
+            has_distinct_round_nodes::<EF>(),
+            "product GKR requires six distinct challenge-field interpolation nodes"
+        );
+        assert_eq!(
+            shape.batch_variables, 0,
+            "a device holds separate trees, not a batched table"
+        );
+        let roots = device.roots();
+        assert_eq!(roots.len(), shape.num_trees, "product GKR tree count mismatch");
+        let root_messages = shape
+            .root_shape
+            .encode(&roots)
+            .expect("a shared-root statement requires equal roots");
+
+        let mut transcript =
+            ProductGkrProverTranscript::<Challenger, F, EF>::new(challenger, shape, &root_messages);
+        let mut point = transcript.batch_point(shape.batch_variables);
+        let mut values = roots.clone();
+        let mut layer_proofs = Vec::with_capacity(shape.layers().len());
+        let mut product_depth = shape.log_height;
+
+        for (arity, round_count) in shape.layers() {
+            let batching = transcript.begin_layer();
+            debug_assert_eq!(round_count, point.len());
+            let child_depth = product_depth - arity.trailing_zeros() as usize;
+
+            if arity == 2 {
+                assert_eq!(round_count, 0, "separate trees open with an unsummed binary layer");
+                let children = device.binary_children(child_depth);
+                let branches = transcript.end_binary_layer(&children);
+                values = children
+                    .iter()
+                    .map(|children| interpolate_pair(*children, branches[0]))
+                    .collect();
+                point = vec![branches[0]];
+                layer_proofs.push(ProductGkrLayerProof::Binary { children });
+            } else {
+                device.begin_layer(child_depth, &point);
+                let mut layer = DeviceLayer(&mut *device);
+                let (round_polys, round_point) =
+                    Self::layer_rounds(&mut layer, &point, batching, &mut transcript);
+                let children = LayerRounds::children(&layer);
+                let branches = transcript.end_radix_four_layer(&children);
+                values = children
+                    .iter()
+                    .map(|children| interpolate_quad(*children, branches))
+                    .collect();
+                point = vec![branches[0], branches[1]];
+                point.extend(round_point);
+                layer_proofs.push(ProductGkrLayerProof::RadixFour {
+                    round_polys,
+                    children,
+                });
+            }
+
+            product_depth = child_depth;
+        }
+
+        transcript.finish();
         point.reverse();
 
         (

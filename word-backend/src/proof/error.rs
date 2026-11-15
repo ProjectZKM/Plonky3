@@ -1,6 +1,8 @@
 //! Errors returned by the complete word-level proof.
 
 use p3_sumcheck::generic_degree::GenericDegreeError;
+
+use crate::{PortError, PortProofError};
 use p3_word::Segment;
 use thiserror::Error;
 
@@ -54,6 +56,21 @@ pub enum WordProofError<E> {
     /// The Boolean commitment refused the trace, the opening, or its proof.
     #[error("boolean commitment failed: {0}")]
     Commitment(E),
+    /// The committed ports break a copy constraint.
+    #[error("port routing failed: {0}")]
+    Ports(PortError),
+    /// The port reduction was refused.
+    #[error("port reduction failed: {0}")]
+    PortProof(PortProofError),
+    /// A key that routes ports was given a device, whose pair opening is not built yet.
+    #[error("a key that routes ports is proven on the host")]
+    DevicePorts,
+    /// A key that routes ports was verified without its routing commitment.
+    #[error("the key routes ports, but no routing commitment was supplied")]
+    PortCommitment,
+    /// The proof's port record does not match the key's routing.
+    #[error("the port record does not match the key's routing")]
+    PortRecord,
     /// The opened trace value differs from the value the reduction pinned.
     #[error("the opened trace value differs from the reduced claim")]
     OpeningValue,

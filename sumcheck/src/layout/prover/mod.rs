@@ -7,6 +7,7 @@
 
 mod banked;
 mod claims;
+mod device;
 mod prefix;
 mod residual;
 mod suffix;
@@ -14,17 +15,18 @@ mod suffix;
 use alloc::vec::Vec;
 
 pub use claims::StackedClaims;
+pub use device::{DeviceSuffix, StackedDevice, fold_rounds, residual_prover};
 use p3_challenger::fs::TranscriptField;
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_commit::{Encoder, Mmcs};
 use p3_field::{ExtensionField, Field};
-use p3_matrix::dense::DenseMatrix;
+use p3_matrix::dense::{DenseMatrix, RowMajorMatrixView};
 use p3_multilinear_util::point::Point;
 pub use prefix::PrefixProver;
 pub use residual::SuffixResidualProver;
 pub use suffix::SuffixProver;
 
-use crate::commit::{commit_base, commit_borrowed_base};
+use crate::commit::{CodewordCommitter, commit_base, commit_base_with, commit_borrowed_base};
 use crate::layout::transcript::{
     BatchingShape, LayoutBinding, OpeningProverTranscript, OpeningShape, PointSource,
     VirtualProverTranscript, VirtualShape, prover_batching_challenge,
@@ -137,6 +139,43 @@ pub trait Layout<F: Field, EF: ExtensionField<F>>: Sized {
     }
 
     /// Returns the total number of concrete openings recorded so far.
+    /// [`Self::commit`] through `committer`, which encodes and commits the message
+    /// wherever it keeps the codeword.
+    fn commit_with<MT, K>(
+        committer: &K,
+        witness: Witness<F>,
+        folding: usize,
+        starting_log_inv_rate: usize,
+    ) -> (Self, MT::Commitment, MT::ProverData<DenseMatrix<F>>)
+    where
+        MT: Mmcs<F>,
+        K: CodewordCommitter<F, MT>,
+    {
+        if witness.is_held_message() {
+            let (root, prover_data) =
+                committer.commit_held(witness.num_variables(), folding, starting_log_inv_rate);
+            return (Self::from_witness(witness), root, prover_data);
+        }
+        let (root, prover_data) = Self::borrowed_message(&witness).map_or_else(
+            || {
+                commit_base_with(
+                    committer,
+                    witness.num_variables(),
+                    folding,
+                    starting_log_inv_rate,
+                    |message| Self::write_message(&witness, folding, message),
+                )
+            },
+            |message| {
+                committer.commit_message(
+                    RowMajorMatrixView::new(message, 1 << folding),
+                    starting_log_inv_rate,
+                )
+            },
+        );
+        (Self::from_witness(witness), root, prover_data)
+    }
+
     fn num_claims(&self) -> usize {
         self.claims().num_claims()
     }

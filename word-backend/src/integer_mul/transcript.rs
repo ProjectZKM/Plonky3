@@ -2,8 +2,10 @@
 //!
 //! ```text
 //!     row point -> shared root
-//!               -> factor layers (sumcheck, halves, line) x 2k -> factor leaf, factor values
-//!               -> result layers (sumcheck, halves, line) x (k + 1) -> result leaf, limb values
+//!               -> power layers (sumcheck, halves, line) x k -> power leaves -> fold point
+//!               -> selector sumcheck -> base lift and right bits -> right point
+//!               -> base layers (sumcheck, halves, line) x k -> left bits -> left point
+//!               -> result layers (sumcheck, halves, line) x (k + 1) -> limb bits -> limb point
 //! ```
 //!
 //! Every value the prover sends is absorbed before the challenge that consumes it.
@@ -39,14 +41,20 @@ const HALVES: &str = "halves";
 /// Label of the challenge joining two halves into one claim.
 const LINE: &str = "line";
 
-/// Label of the two operand evaluations one leaf sumcheck ends on.
-const VALUES: &str = "values";
+/// Label of the base lift and right bits the selector sumcheck ends on.
+const SELECTED: &str = "selected";
+
+/// Label of the point folding the right bits into one claim.
+const RIGHT_POINT: &str = "right_point";
 
 /// Type-level identity of one layer sumcheck.
 struct Layer;
 
-/// Type-level identity of one leaf sumcheck.
-struct Leaf;
+/// Type-level identity of the selector sumcheck.
+struct Selector;
+
+/// Label of the selector sumcheck.
+const SELECTOR: &str = "selector";
 
 /// Sponge alphabet of a challenger native to the challenge field.
 type Alphabet<F> = FieldUnit<F>;
@@ -78,7 +86,7 @@ impl TranscriptShape {
             challenge(ROW_POINT, Length::Fixed(self.row_variables)),
             message(ROOT, Length::Scalar),
         ];
-        for tree in [Tree::Factor, Tree::Result] {
+        let layers = |steps: &mut Vec<Interaction>, tree: Tree| {
             for _ in 0..tree.depth(self.bit_variables) {
                 steps.push(Interaction::marker::<Layer>(
                     Hierarchy::Begin,
@@ -93,18 +101,33 @@ impl TranscriptShape {
                 steps.push(message(HALVES, Length::Fixed(2)));
                 steps.push(challenge(LINE, Length::Scalar));
             }
-            steps.push(Interaction::marker::<Leaf>(
-                Hierarchy::Begin,
-                Kind::Protocol,
-                tree.leaf_label(),
+            steps.push(message(
+                tree.leaves_label(),
+                Length::Fixed(tree.leaves(self.bit_variables)),
             ));
-            steps.push(Interaction::marker::<Leaf>(
-                Hierarchy::End,
-                Kind::Protocol,
-                tree.leaf_label(),
+            steps.push(challenge(
+                tree.point_label(),
+                Length::Fixed(self.bit_variables),
             ));
-            steps.push(message(VALUES, Length::Fixed(2)));
-        }
+        };
+        layers(&mut steps, Tree::Power);
+        steps.push(Interaction::marker::<Selector>(
+            Hierarchy::Begin,
+            Kind::Protocol,
+            SELECTOR,
+        ));
+        steps.push(Interaction::marker::<Selector>(
+            Hierarchy::End,
+            Kind::Protocol,
+            SELECTOR,
+        ));
+        steps.push(message(
+            SELECTED,
+            Length::Fixed((1 << self.bit_variables) + 1),
+        ));
+        steps.push(challenge(RIGHT_POINT, Length::Fixed(self.bit_variables)));
+        layers(&mut steps, Tree::Base);
+        layers(&mut steps, Tree::Result);
         InteractionPattern::new(steps)
             .expect("balanced brackets around atomic steps are well formed")
     }
@@ -181,18 +204,35 @@ where
         (result, halves, line)
     }
 
-    /// Lends the challenger to one leaf sumcheck, then binds its operand values.
-    pub(super) fn leaf<R>(
-        &mut self,
-        tree: Tree,
-        run: impl FnOnce(&mut &'a mut C) -> (R, [EF; 2]),
-    ) -> (R, [EF; 2]) {
-        self.state.begin_protocol::<Leaf>(tree.leaf_label());
-        let (result, values) = run(self.state.challenger_mut());
-        self.state.end_protocol::<Leaf>(tree.leaf_label());
+    /// Binds one tree's leaf evaluations, then draws the point folding them.
+    pub(super) fn leaves(&mut self, tree: Tree, values: &[EF], count: usize) -> Vec<EF> {
         self.state
-            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(VALUES, &values);
-        (result, values)
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(tree.leaves_label(), values);
+        self.points(tree.point_label(), count)
+    }
+
+    /// Lends the challenger to the selector sumcheck, then binds its values and draws a point.
+    pub(super) fn selector<R>(
+        &mut self,
+        count: usize,
+        run: impl FnOnce(&mut &'a mut C) -> (R, Vec<EF>),
+    ) -> (R, Vec<EF>, Vec<EF>) {
+        self.state.begin_protocol::<Selector>(SELECTOR);
+        let (result, values) = run(self.state.challenger_mut());
+        self.state.end_protocol::<Selector>(SELECTOR);
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(SELECTED, &values);
+        let point = self.points(RIGHT_POINT, count);
+        (result, values, point)
+    }
+
+    /// Draws `count` challenges under one label.
+    fn points(&mut self, label: &'static str, count: usize) -> Vec<EF> {
+        self.state
+            .challenge_extensions::<F, EF, FieldToFieldCodec<F>>(label, count)
+            .into_iter()
+            .map(|value| value.into_inner())
+            .collect()
     }
 
     /// Closes the reduction transcript.
@@ -257,20 +297,41 @@ where
         (result, line)
     }
 
-    /// Lends the challenger to one leaf replay, then binds its operand values.
-    pub(super) fn leaf<R>(
-        &mut self,
-        tree: Tree,
-        values: &[EF; 2],
-        run: impl FnOnce(&mut &'a mut C) -> R,
-    ) -> R {
-        self.state.begin_protocol::<Leaf>(tree.leaf_label());
-        let result = run(self.state.challenger_mut());
-        self.state.end_protocol::<Leaf>(tree.leaf_label());
+    /// Binds one tree's leaf evaluations, then draws the point folding them.
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` when the record carries a different number of leaves than the step.
+    pub(super) fn leaves(&mut self, tree: Tree, values: &[EF], count: usize) -> Option<Vec<EF>> {
         self.state
-            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(VALUES, values)
-            .expect("a fixed-width array matches its fixed-width step");
-        result
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(tree.leaves_label(), values)
+            .ok()?;
+        Some(self.points(tree.point_label(), count))
+    }
+
+    /// Lends the challenger to the selector replay, then binds its values and draws a point.
+    pub(super) fn selector<R>(
+        &mut self,
+        values: &[EF],
+        count: usize,
+        run: impl FnOnce(&mut &'a mut C) -> R,
+    ) -> Option<(R, Vec<EF>)> {
+        self.state.begin_protocol::<Selector>(SELECTOR);
+        let result = run(self.state.challenger_mut());
+        self.state.end_protocol::<Selector>(SELECTOR);
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(SELECTED, values)
+            .ok()?;
+        Some((result, self.points(RIGHT_POINT, count)))
+    }
+
+    /// Draws `count` challenges under one label.
+    fn points(&mut self, label: &'static str, count: usize) -> Vec<EF> {
+        self.state
+            .challenge_extensions::<F, EF, FieldToFieldCodec<F>>(label, count)
+            .into_iter()
+            .map(|value| value.into_inner())
+            .collect()
     }
 
     /// Closes the reduction transcript.

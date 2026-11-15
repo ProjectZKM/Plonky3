@@ -10,6 +10,7 @@ use p3_commit::{Mmcs, MultilinearPcs};
 use p3_field::{ExtensionField, Field};
 use p3_matrix::dense::DenseMatrix;
 use p3_multilinear_util::point::Point;
+use p3_sumcheck::commit::CodewordCommitter;
 use p3_sumcheck::layout::{Layout, Table, Verifier, Witness, observe_commitment};
 use p3_sumcheck::{OpeningEvals, OpeningProtocol, PrescribedPointPcs};
 
@@ -61,6 +62,48 @@ where
     /// Returns source table `id` retained by the committed layout.
     pub fn table(&self, id: usize) -> &Table<F> {
         self.layout.table(id)
+    }
+}
+
+impl<EF, F, Dft, MT, Challenger, L> WhirProver<EF, F, Dft, MT, Challenger, L>
+where
+    F: Field + TranscriptField + Ord,
+    EF: ExtensionField<F>,
+    Dft: WhirDomain<F, EF>,
+    MT: Mmcs<F>,
+    Challenger: FieldChallenger<F>
+        + GrindingChallenger<Witness = F>
+        + CanSampleUniformBits<F>
+        + CanObserve<MT::Commitment>,
+    L: Layout<F, EF>,
+{
+    /// [`MultilinearPcs::commit`] through `committer`, which encodes and commits the
+    /// message wherever it keeps the codeword.
+    ///
+    /// # Errors
+    /// As [`MultilinearPcs::commit`].
+    pub fn commit_with<K: CodewordCommitter<F, MT>>(
+        &self,
+        committer: &K,
+        witness: Witness<F>,
+        challenger: &mut Challenger,
+    ) -> Result<(MT::Commitment, WhirProverData<F, EF, MT, L>), WhirConfigError> {
+        assert_eq!(witness.num_variables(), self.config.num_variables);
+        let (layout, commitment, merkle_data) = L::commit_with::<MT, K>(
+            committer,
+            witness,
+            self.config.round_folding_factor(0),
+            self.config.starting_log_inv_rate,
+        );
+        observe_commitment::<F, _, _>(challenger, commitment.clone());
+        Ok((
+            commitment,
+            WhirProverData {
+                layout,
+                merkle_data: Arc::new(merkle_data),
+                _marker: PhantomData,
+            },
+        ))
     }
 }
 

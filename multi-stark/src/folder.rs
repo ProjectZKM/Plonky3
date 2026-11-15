@@ -13,7 +13,8 @@ use p3_bus::{
 };
 use p3_field::{Algebra, ExtensionField, Field, PrimeCharacteristicRing, dot_product};
 use p3_lookup::{
-    Count, IndexedLookupBuilder, InteractionBuilder, InteractionSymbolicBuilder, TraceWindow,
+    Count, IndexedLookupBuilder, IndexedPosition, InteractionBuilder, InteractionSymbolicBuilder,
+    TraceWindow,
 };
 
 use crate::lookup::AirLinkInstance;
@@ -506,10 +507,10 @@ where
     Var: Algebra<F> + Copy + Send + Sync,
     Acc: Algebra<Var> + Copy,
 {
-    fn push_indexed_read(
+    fn push_indexed_read_at(
         &mut self,
         _table: &str,
-        _position: usize,
+        _position: IndexedPosition,
         payload: impl IntoIterator<Item = usize>,
     ) {
         // This folder evaluates constraints at one point and carries no reduction.
@@ -848,10 +849,10 @@ where
     Var: Algebra<F> + Copy + Send + Sync,
     Acc: Algebra<Var> + Copy,
 {
-    fn push_indexed_read(
+    fn push_indexed_read_at(
         &mut self,
         _table: &str,
-        _position: usize,
+        _position: IndexedPosition,
         payload: impl IntoIterator<Item = usize>,
     ) {
         // This folder evaluates constraints at one point and carries no reduction.

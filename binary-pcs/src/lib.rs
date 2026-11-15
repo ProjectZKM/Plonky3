@@ -30,10 +30,11 @@ pub mod zk;
 
 pub use boolean::{
     BitOpening, BitReadings, BooleanBackend, BooleanMultilinearPcs, BooleanPcs, BooleanPcsError,
-    BooleanProof,
+    BooleanProof, NoOpeningDevice, PairReadings, ReadingsCheck,
 };
 pub use boolean_trace::{
-    BooleanTraceCommitment, BooleanTraceCommitmentData, BooleanTraceCommitmentError,
+    BooleanTraceCommitment, BooleanTraceCommitmentData, BooleanTraceCommitmentError, GatherSlot,
+    HELD_LOW_VARIABLES, HeldColumns, row_weight_factors,
     BooleanTraceCommitmentProof, BooleanTraceData, BooleanTraceError, BooleanTracePcs,
     BooleanTraceProof,
 };

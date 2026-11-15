@@ -15,9 +15,8 @@ use p3_bus::BusSymbolicBuilder;
 use p3_commit::MultilinearPcs;
 use p3_field::{ExtensionField, Field};
 use p3_lookup::InteractionSymbolicBuilder;
-use p3_matrix::Matrix;
 use p3_sumcheck::layout::Table;
-use p3_util::log2_strict_usize;
+use tracing::info_span;
 
 use crate::ProvingError;
 use crate::config::{Commitment, MultiStarkConfig, PcsProverError, ProverData};
@@ -135,6 +134,58 @@ pub struct VerifyingKey<C: MultiStarkConfig> {
     pub(crate) air_profiles: Vec<AirProfile>,
 }
 
+impl<C: MultiStarkConfig> VerifyingKey<C> {
+    /// The key of an ordered AIR batch from its parts: the preprocessed
+    /// commitment setup made and the row variables of each committed
+    /// preprocessed table.  The zerocheck metadata is read off the AIRs, as
+    /// setup reads it, so a verifier holding the commitment needs no trace.
+    pub fn from_commitment<A>(
+        airs: &[&A],
+        preprocessed: Option<Commitment<C>>,
+        preprocessed_log_heights: Vec<usize>,
+    ) -> Self
+    where
+        A: BaseAir<C::Val> + Air<InteractionSymbolicBuilder<C::Val, C::Challenge>>,
+    {
+        Self {
+            preprocessed,
+            preprocessed_log_heights,
+            air_profiles: airs
+                .iter()
+                .map(|&air| get_air_profile::<C::Val, C::Challenge, A>(air))
+                .collect(),
+        }
+    }
+
+    /// The batched preprocessed commitment, if any AIR declares one.
+    pub const fn preprocessed_commitment(&self) -> Option<&Commitment<C>> {
+        self.preprocessed.as_ref()
+    }
+
+    /// The row variables of each committed preprocessed table, in batch order.
+    pub fn preprocessed_log_heights(&self) -> &[usize] {
+        &self.preprocessed_log_heights
+    }
+
+    /// The same key under another configuration over the same AIRs.
+    ///
+    /// The heights and zerocheck metadata carry over unchanged.
+    /// The preprocessed commitment, if any, is carried by `lift`.
+    ///
+    /// A verifier that runs the same protocol over another value type, such as one that records
+    /// the verification as a circuit, reads the key this way rather than redoing setup.
+    pub fn lift<D: MultiStarkConfig>(
+        &self,
+        lift: impl FnOnce(&Commitment<C>) -> Commitment<D>,
+    ) -> VerifyingKey<D> {
+        VerifyingKey {
+            preprocessed: self.preprocessed.as_ref().map(lift),
+            preprocessed_log_heights: self.preprocessed_log_heights.clone(),
+            air_profiles: self.air_profiles.clone(),
+        }
+    }
+}
+
 /// Commit all AIR preprocessed traces once, returning matched prover and verifier keys.
 ///
 /// When the AIR declares no preprocessed trace, both keys carry no preprocessed data.
@@ -172,26 +223,62 @@ where
         + Air<BusSymbolicBuilder<C::Val, C::Challenge>>,
     Commitment<C>: Clone,
 {
-    let air_profiles = airs
+    let tables = airs
         .iter()
-        .map(|&air| get_air_profile::<C::Val, C::Challenge, A>(air))
-        .collect::<Vec<_>>();
-    let declares_bus = declares_bus::<C::Val, C::Challenge, A>(airs);
+        .filter(|air| air.preprocessed_width() != 0)
+        .map(|air| {
+            let trace = info_span!("preprocessed trace").in_scope(|| {
+                air.preprocessed_trace()
+                    .expect("AIR with preprocessed columns must return a preprocessed trace")
+            });
+            config.preprocessed_table(trace)
+        })
+        .collect();
+    setup_with_tables(config, airs, tables, challenger)
+}
+
+/// [`setup`] over preprocessed tables the caller made.
+///
+/// `tables` holds one table per AIR that declares preprocessed columns, in proof order, each the
+/// one [`MultiStarkConfig::preprocessed_table`] makes from that AIR's preprocessed trace. A caller
+/// that holds its preprocessed columns in a cheaper form builds the tables from it directly.
+///
+/// # Panics
+///
+/// Panics if `tables` does not hold one table per AIR with preprocessed columns.
+#[allow(clippy::type_complexity)]
+pub fn setup_with_tables<C, A>(
+    config: &C,
+    airs: &[&A],
+    tables: Vec<Table<C::Val>>,
+    challenger: &mut C::Challenger,
+) -> Result<(ProvingKey<C>, VerifyingKey<C>), ProvingError<PcsProverError<C>>>
+where
+    C: MultiStarkConfig,
+    A: BaseAir<C::Val>
+        + Air<InteractionSymbolicBuilder<C::Val, C::Challenge>>
+        + Air<BusSymbolicBuilder<C::Val, C::Challenge>>,
+    Commitment<C>: Clone,
+{
+    assert_eq!(
+        tables.len(),
+        airs.iter()
+            .filter(|air| air.preprocessed_width() != 0)
+            .count(),
+        "one preprocessed table per AIR with preprocessed columns"
+    );
+    let air_profiles = info_span!("air profiles").in_scope(|| {
+        airs.iter()
+            .map(|&air| get_air_profile::<C::Val, C::Challenge, A>(air))
+            .collect::<Vec<_>>()
+    });
+    let declares_bus =
+        info_span!("declares bus").in_scope(|| declares_bus::<C::Val, C::Challenge, A>(airs));
     let air_shapes = airs
         .iter()
         .map(|&air| AirShape::of::<C::Val, A>(air))
         .collect::<Vec<_>>();
-    let mut tables = Vec::new();
-    let mut preprocessed_log_heights = Vec::new();
-
-    for air in airs.iter().filter(|air| air.preprocessed_width() != 0) {
-        let trace = air
-            .preprocessed_trace()
-            .expect("AIR with preprocessed columns must return a preprocessed trace");
-
-        preprocessed_log_heights.push(log2_strict_usize(trace.height()));
-        tables.push(Table::new(trace.transpose_packable()));
-    }
+    let preprocessed_log_heights: Vec<usize> = tables.iter().map(Table::num_variables).collect();
 
     if tables.is_empty() {
         return Ok((
@@ -210,7 +297,7 @@ where
     }
 
     // Turn traces into one multilinear per column, then commit the stacked tables once.
-    let witness = config.build_witness(tables);
+    let witness = info_span!("build witness").in_scope(|| config.build_witness(tables));
     let (commitment, prover_data) = config
         .preprocessed_pcs()
         .commit(witness, challenger)

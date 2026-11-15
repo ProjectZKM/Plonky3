@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::index::{Segment, ValueIndex};
@@ -23,7 +24,8 @@ pub struct EvaluationError {
 /// Terms retain their supplied order and multiplicity.
 /// Repeated terms therefore cancel in pairs.
 /// An empty operand evaluates to zero.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct Operand<W: Word> {
     /// The shifted words combined by bitwise XOR.
     terms: Vec<ShiftedValue<W>>,
@@ -97,7 +99,8 @@ impl<W: Word> Operand<W> {
 }
 
 /// A relation requiring an XOR operand to equal zero.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct ZeroConstraint<W: Word> {
     /// The XOR expression required to vanish.
     value: Operand<W>,
@@ -123,7 +126,8 @@ impl<W: Word> ZeroConstraint<W> {
 }
 
 /// A relation requiring the bitwise AND of two operands to equal a third.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct AndConstraint<W: Word> {
     /// The left bitwise factor.
     left: Operand<W>,
@@ -178,7 +182,8 @@ impl<W: Word> AndConstraint<W> {
 }
 
 /// A relation requiring a full-width unsigned integer product.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct IntegerMulConstraint<W: Word> {
     /// The left unsigned factor.
     left: Operand<W>,

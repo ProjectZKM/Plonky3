@@ -17,7 +17,7 @@ use crate::builder::{
     SymbolicExclusiveInteraction, SymbolicInteraction, SymbolicLocalInteraction,
 };
 use crate::count::Count;
-use crate::indexed::{IndexedRead, IndexedTable, TraceWindow};
+use crate::indexed::{IndexedPosition, IndexedRead, IndexedTable, TraceWindow};
 
 /// Symbolic builder that captures constraints, bus interactions and indexed declarations.
 #[derive(Debug)]
@@ -331,10 +331,10 @@ impl<F: Field, EF: ExtensionField<F>> InteractionBuilder for InteractionSymbolic
 }
 
 impl<F: Field, EF: ExtensionField<F>> IndexedLookupBuilder for InteractionSymbolicBuilder<F, EF> {
-    fn push_indexed_read(
+    fn push_indexed_read_at(
         &mut self,
         table: &str,
-        position: usize,
+        position: IndexedPosition,
         payload: impl IntoIterator<Item = usize>,
     ) {
         // Push order is preserved, since it fixes the reader order both sides walk.

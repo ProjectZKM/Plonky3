@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use p3_air::symbolic::{AirLayout, BaseEntry, BaseLeaf, SymbolicExpr};
 use p3_air::{Air, BaseAir};
+use p3_bus::AffineForm;
 use p3_bus::{
     BusActivation, BusAffineExpression, BusBlock, BusBlockOwner, BusBoundary, BusDirection,
     BusEvaluation, BusFactorPlan, BusPlan, BusPlanInput, BusSymbolicBuilder,
@@ -127,6 +128,19 @@ impl<'a, F: Field, EF: ExtensionField<F>> AffineRow<'a, F, EF> {
 }
 
 /// Verifier-derived bus declarations and their checked physical layout.
+/// One block of bus leaves as a backend materializes it.
+#[derive(Clone, Debug)]
+pub struct BusLeafBlock<EF> {
+    /// The instance whose table the block reads.
+    pub air: usize,
+    /// The block holds `1 << log_height` leaves, one per row of the table.
+    pub log_height: usize,
+    /// The factor and the selector as affine forms over the row's cells, when the
+    /// interaction is affine; a leaf is `1 + (factor - 1) * selector`, or the factor
+    /// without a selector.
+    pub forms: Option<(AffineForm<EF>, Option<AffineForm<EF>>)>,
+}
+
 pub(crate) struct BusContext<F: Field, EF: ExtensionField<F>> {
     /// One symbolic declaration profile per AIR instance.
     profiles: Vec<BusSymbolicBuilder<F, EF>>,
@@ -459,6 +473,39 @@ where
     /// Materialize both direction-specific product prefixes from committed tables.
     ///
     /// `periodic` holds the tables [`Self::periodic_tables`] returns.
+    /// Each leaf block of each direction as a backend materializes it: the table it reads,
+    /// its height, and its factor and selector as affine forms over the table's cells when
+    /// the interaction is affine.
+    pub(crate) fn leaf_blocks(
+        &self,
+        public_values: &[&[F]],
+        challenges: &p3_bus::BusChallenges<EF>,
+    ) -> [Vec<BusLeafBlock<EF>>; 2] {
+        let weights = challenges.fingerprint_weights();
+        BusDirection::ALL.map(|direction| {
+            self.plan
+                .blocks(direction)
+                .iter()
+                .map(|block| {
+                    let air = block.owner.air;
+                    let interaction = &self.profiles[air].interactions()[block.owner.declaration];
+                    let factor = self
+                        .plan
+                        .compile_factor(block.bus, interaction, &weights, challenges.offset)
+                        .expect("a checked bus plan compiles against its own declarations");
+                    BusLeafBlock {
+                        air,
+                        log_height: block.log_height,
+                        forms: factor
+                            .affine(public_values[air])
+                            .expect("a checked bus plan reads only its public values")
+                            .map(|factor| AffineForm::of_factor(&factor)),
+                    }
+                })
+                .collect()
+        })
+    }
+
     pub(crate) fn materialize(
         &self,
         tables: &[&Table<F>],
@@ -550,6 +597,32 @@ where
                         })
                 })
                 .collect(),
+        )
+    }
+
+    /// The leaves of block `index` of direction `direction`, in the order of
+    /// [`BusDirection::ALL`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn materialize_one(
+        &self,
+        direction: usize,
+        index: usize,
+        tables: &[&Table<F>],
+        preprocessed: &[Option<&Table<F>>],
+        periodic: &[Option<Vec<Vec<F>>>],
+        public_values: &[&[F]],
+        challenges: &p3_bus::BusChallenges<EF>,
+    ) -> Vec<EF> {
+        let weights = challenges.fingerprint_weights();
+        let block = &self.plan.blocks(BusDirection::ALL[direction])[index];
+        self.materialize_block(
+            block,
+            tables,
+            preprocessed,
+            periodic,
+            public_values,
+            &weights,
+            challenges.offset,
         )
     }
 

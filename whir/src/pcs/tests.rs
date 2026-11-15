@@ -985,6 +985,11 @@ mod error_variant_tests {
                 opening.rows.pop();
                 original
             }
+            QueryOpenings::Batched(batch) => {
+                let original = batch[0].rows.len();
+                batch[0].rows.pop();
+                original
+            }
         }
     }
 
@@ -1376,6 +1381,7 @@ mod error_variant_tests {
                 QueryOpenings::Extension(opening) => {
                     opening.rows[0].pop();
                 }
+                QueryOpenings::Batched(_) => unreachable!("a single commitment opens unbatched"),
             }
             let expected_reason = if final_round {
                 "Extension field Merkle multiproof verification failed"
@@ -1413,6 +1419,7 @@ mod error_variant_tests {
                     rows: vec![],
                     proof: opening.proof.clone(),
                 }),
+                QueryOpenings::Batched(_) => unreachable!("a single commitment opens unbatched"),
             };
             match verify(&pcs, &commitment, &malformed, protocol.clone()).unwrap_err() {
                 VerifierError::MerkleProofInvalid { position, reason } => {

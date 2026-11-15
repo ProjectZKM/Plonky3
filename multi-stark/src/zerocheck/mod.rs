@@ -39,7 +39,7 @@ use p3_sumcheck::layout::Table;
 use thiserror::Error;
 
 use crate::backend::{GenericBackend, ZerocheckBackend};
-use crate::bus::composition::BusCompositionProver;
+use crate::bus::composition::{BusCompositionProver, BusFamilyDevice};
 use crate::bus::{BusBindingError, BusContext};
 use crate::config::DEFAULT_SLICED_ROUNDS;
 use crate::folder::{
@@ -574,6 +574,7 @@ impl<'a, A> AirZerocheck<'a, A> {
             public_values,
             LookupRuntime::Inactive,
             DEFAULT_SLICED_ROUNDS,
+            &GenericBackend,
             challenger,
         )
     }
@@ -599,6 +600,7 @@ impl<'a, A> AirZerocheck<'a, A> {
         public_values: &[&[F]],
         lookup: LookupRuntime<EF>,
         sliced_rounds: usize,
+        backend: &B,
         challenger: &mut Challenger,
     ) -> (ZerocheckProof<F, EF>, Point<EF>)
     where
@@ -614,7 +616,9 @@ impl<'a, A> AirZerocheck<'a, A> {
             public_values,
             lookup,
             None,
+            None,
             sliced_rounds,
+            backend,
             challenger,
         )
     }
@@ -643,7 +647,9 @@ impl<'a, A> AirZerocheck<'a, A> {
         public_values: &[&[F]],
         lookup: LookupRuntime<EF>,
         bus: Option<BusFamily<'_, F, EF>>,
+        bus_device: Option<&dyn BusFamilyDevice<F, EF>>,
         sliced_rounds: usize,
+        backend: &B,
         challenger: &mut Challenger,
     ) -> (ZerocheckProof<F, EF>, Point<EF>)
     where
@@ -827,6 +833,7 @@ impl<'a, A> AirZerocheck<'a, A> {
                 .map(|table| table.num_variables())
                 .collect::<Vec<_>>();
             let periodic = family.context.period_vectors(self.airs, &num_variables);
+            let _span = tracing::info_span!("bus composition setup").entered();
             let prover = BusCompositionProver::new(
                 family.context,
                 family.output,
@@ -838,6 +845,7 @@ impl<'a, A> AirZerocheck<'a, A> {
                 log_height,
                 B::to_repr,
                 B::from_repr,
+                bus_device,
             );
             (prover, claim)
         });
@@ -907,7 +915,12 @@ impl<'a, A> AirZerocheck<'a, A> {
                 };
                 pending_claim -= activating_claim;
                 if activates_stage && eq_suffix.is_none() {
-                    eq_suffix = Some(Poly::new_from_point(&tau.as_slice()[round + 1..], EF::ONE));
+                    // A device keeps the equality suffix with each of its stages.
+                    eq_suffix = Some(if backend.host_equality() {
+                        Poly::new_from_point(&tau.as_slice()[round + 1..], EF::ONE)
+                    } else {
+                        Poly::new(vec![EF::ONE])
+                    });
                 }
 
                 // Not-yet-active lookup stages remain represented by one dormant constant.
@@ -916,13 +929,12 @@ impl<'a, A> AirZerocheck<'a, A> {
 
                 // Existing stages already live over the extension field.
                 // Extend each stage's internal round polynomial to the global degree and accumulate it.
-                for (state, &claim) in states.iter_mut().zip(claims.iter()) {
-                    let round_poly = B::round(
-                        state,
-                        eq_suffix
-                            .as_ref()
-                            .expect("active AIR has an equality suffix"),
-                    );
+                for (stage, (state, &claim)) in states.iter_mut().zip(claims.iter()).enumerate() {
+                    let eq_suffix = eq_suffix
+                        .as_ref()
+                        .expect("active AIR has an equality suffix");
+                    let round_poly = tracing::info_span!("stage round", round, stage)
+                        .in_scope(|| backend.round(state, eq_suffix));
                     let q1 = (claim - (EF::ONE - tau_round) * round_poly[0]) * tau_round_inv;
                     let unweighted_claim = round_poly[0] + q1;
                     let round_poly = interpolators[round_poly.len()].extend_evals(
@@ -945,14 +957,14 @@ impl<'a, A> AirZerocheck<'a, A> {
                         .iter()
                         .map(|&air_index| beta_powers[air_index])
                         .collect::<Vec<_>>();
-                    let mut state =
-                        RoundStateBase::new(stage, alpha, eta, betas, tau, sliced_rounds);
-                    let round_poly = B::round0(
-                        &mut state,
-                        eq_suffix
-                            .as_ref()
-                            .expect("activating AIR has an equality suffix"),
-                    );
+                    let mut state = tracing::info_span!("stage activate", round).in_scope(|| {
+                        RoundStateBase::new(stage, alpha, eta, betas, tau, sliced_rounds)
+                    });
+                    let eq_suffix = eq_suffix
+                        .as_ref()
+                        .expect("activating AIR has an equality suffix");
+                    let round_poly = tracing::info_span!("stage round0", round)
+                        .in_scope(|| backend.round0(&mut state, eq_suffix));
                     let q1 =
                         (activating_claim - (EF::ONE - tau_round) * round_poly[0]) * tau_round_inv;
                     let unweighted_claim = round_poly[0] + q1;
@@ -992,7 +1004,8 @@ impl<'a, A> AirZerocheck<'a, A> {
                 }
                 let bus_evals = bus_family.as_ref().zip(bus_interpolator.as_ref()).map(
                     |((prover, claim), interpolator)| {
-                        let evals = prover.round_poly();
+                        let evals =
+                            tracing::info_span!("bus round", round).in_scope(|| prover.round_poly());
                         let raised = interpolator.extend_evals(&evals, *claim, transmitted_degree);
                         for (combined, bus) in standard_evals.iter_mut().zip(raised) {
                             *combined += lambda * bus;
@@ -1002,14 +1015,15 @@ impl<'a, A> AirZerocheck<'a, A> {
                 );
 
                 // Bind the polynomial, grind, and draw this round's challenge.
-                let (r, witness) = sumcheck.round(&standard_evals);
+                let (r, witness) =
+                    tracing::info_span!("transcript round", round).in_scope(|| sumcheck.round(&standard_evals));
 
                 // The bus family folds through the same challenge as every AIR table.
                 if let (Some((prover, claim)), Some(interpolator), Some(evals)) =
                     (bus_family.as_mut(), bus_interpolator.as_ref(), bus_evals)
                 {
                     *claim = interpolator.eval(&evals, *claim, r);
-                    prover.fold(r);
+                    tracing::info_span!("bus fold", round).in_scope(|| prover.fold(r));
                 }
 
                 // Store what the round produced alongside what it bound.
@@ -1027,7 +1041,7 @@ impl<'a, A> AirZerocheck<'a, A> {
                     let q1 = (*claim - (EF::ONE - tau_round) * round_poly[0]) * tau_round_inv;
                     let unweighted_claim = round_poly[0] + q1;
                     *claim = interpolator.eval(round_poly, unweighted_claim, r);
-                    B::fold(state, r);
+                    tracing::info_span!("stage fold", round).in_scope(|| backend.fold(state, r));
                 }
 
                 // The newly activated stage joins the active list only after this round.
@@ -1038,13 +1052,16 @@ impl<'a, A> AirZerocheck<'a, A> {
                         (activating_claim - (EF::ONE - tau_round) * round_poly[0]) * tau_round_inv;
                     let unweighted_claim = round_poly[0] + q1;
                     claims.push(interpolator.eval(&round_poly, unweighted_claim, r));
-                    states.push(B::fold0(state, r));
+                    states.push(
+                        tracing::info_span!("stage fold0", round).in_scope(|| backend.fold0(state, r)),
+                    );
                 }
 
                 // Advance the shared equality factors to the next round.
                 // The prefix absorbs r; the suffix drops the variable just bound.
                 eq_prefix *= Point::eval_eq(&[tau_round], &[r]);
                 if round + 1 < log_height
+                    && backend.host_equality()
                     && let Some(eq_suffix) = &mut eq_suffix
                 {
                     eq_suffix.sum_prefix_var_mut();
@@ -1075,8 +1092,9 @@ impl<'a, A> AirZerocheck<'a, A> {
         let mut openings = iter::repeat_with(|| None)
             .take(self.airs.len())
             .collect::<Vec<Option<AirOpenings<EF>>>>();
+        let _openings_span = tracing::info_span!("stage openings").entered();
         for state in states {
-            for (air_index, opening) in B::openings(state) {
+            for (air_index, opening) in backend.openings(state) {
                 openings[air_index] = Some(opening);
             }
         }

@@ -31,7 +31,7 @@ pub use debug::{
 };
 pub use direction::BusDirection;
 pub use evaluation::{
-    BusAffineExpression, BusAffineFactor, BusEvaluation, BusEvaluationError, BusFactorPlan,
+    AffineCell, AffineForm, BusAffineExpression, BusAffineFactor, BusEvaluation, BusEvaluationError, BusFactorPlan,
 };
 pub use memory::{
     MemoryFinalCounts, MemoryReadAddresses, MemoryReadCounts, MemoryReadValues, MemoryTableValues,
@@ -40,8 +40,8 @@ pub use memory::{
 };
 pub use name::{BusName, BusNameError};
 pub use p3_gkr::{
-    ProductGkrError, ProductGkrLayerProof, ProductGkrOutput, ProductGkrProof, ProductGkrRootShape,
-    ProductGkrShape, ProductGkrShapeError,
+    DeviceProductTrees, ProductGkrError, ProductGkrLayerProof, ProductGkrOutput, ProductGkrProof,
+    ProductGkrRootShape, ProductGkrShape, ProductGkrShapeError, ProductTrees,
 };
 pub use plan::{
     BusBlock, BusBlockOwner, BusDomain, BusExpressionLocation, BusPlan, BusPlanError, BusPlanInput,

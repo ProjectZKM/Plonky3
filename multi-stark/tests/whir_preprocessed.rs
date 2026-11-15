@@ -66,6 +66,8 @@ struct WhirConfigForTest {
     pcs: TestPcs,
     /// Scheme sized for the preprocessed stacked trace.
     preprocessed_pcs: TestPcs,
+    /// Whether both traces are opened as one pair.
+    pair: bool,
 }
 
 impl MultiStarkConfig for WhirConfigForTest {
@@ -84,6 +86,10 @@ impl MultiStarkConfig for WhirConfigForTest {
 
     fn preprocessed_pcs(&self) -> &TestPcs {
         &self.preprocessed_pcs
+    }
+
+    fn pair_openings(&self) -> bool {
+        self.pair
     }
 
     fn min_num_variables(&self) -> usize {
@@ -152,6 +158,7 @@ fn config_for(log_height: usize) -> WhirConfigForTest {
     WhirConfigForTest {
         pcs: pcs_for(log_height, MAIN_WIDTH),
         preprocessed_pcs: pcs_for(log_height, PREPROCESSED_WIDTH),
+        pair: false,
     }
 }
 
@@ -163,6 +170,7 @@ fn batch_config_for(log_height: usize, num_tables: usize) -> WhirConfigForTest {
     WhirConfigForTest {
         pcs: pcs_for_stacked(main_stacked_num_variables),
         preprocessed_pcs: pcs_for_stacked(preprocessed_stacked_num_variables),
+        pair: false,
     }
 }
 
@@ -518,6 +526,7 @@ fn prove_verify_mixed_height_preprocessed_roundtrips() {
     let config = WhirConfigForTest {
         pcs: pcs_for_stacked(log2_ceil_usize(main_cells)),
         preprocessed_pcs: pcs_for_stacked(log2_ceil_usize(preprocessed_cells)),
+        pair: false,
     };
     let airs = [&air_a, &air_b];
 
@@ -570,6 +579,7 @@ fn verify_rejects_preprocessed_tables_at_heights_the_key_was_not_set_up_for() {
     let config = WhirConfigForTest {
         pcs: pcs_for_stacked(log2_ceil_usize(main_cells)),
         preprocessed_pcs: pcs_for_stacked(log2_ceil_usize(preprocessed_cells)),
+        pair: false,
     };
 
     let air_a = PreprocessedAir {
@@ -969,4 +979,46 @@ fn a_rejected_main_opening_leaves_the_preprocessed_opening_unrun() {
 
     // The rejecting path never asked for the preprocessed scheme, so it opened nothing twice.
     assert_eq!(config.take_preprocessed_lookups(), 0);
+}
+
+#[test]
+fn a_paired_run_proves_and_verifies_and_is_its_own_statement() {
+    // A scheme with no shared opening pairs by opening each side in turn.
+    //
+    // The run is still its own statement: one bracket in place of two moves the transcript,
+    // so a proof made one way never verifies the other way.
+    let n = 256;
+    let fixed = fixed_column(n);
+    let air = PreprocessedAir {
+        height: n,
+        cells: &FIRST_MAIN_CELL,
+    };
+    let log_height = log2_strict_usize(n);
+    let public = [fixed[0]];
+    let paired = WhirConfigForTest {
+        pair: true,
+        ..config_for(log_height)
+    };
+    let apart = config_for(log_height);
+
+    let (pk, vk) = setup(&paired, &[&air], &mut challenger()).unwrap();
+    let proof = prove(
+        &paired,
+        ProverInstances::new(vec![ProverInstance::new(
+            &air,
+            Table::new(main_trace(&fixed).transpose()),
+            &pk,
+            &public,
+        )]),
+        0,
+        &mut challenger(),
+    )
+    .unwrap();
+    assert!(proof.preprocessed_opening.is_some());
+
+    let instances =
+        || VerifierInstances::new(vec![VerifierInstance::new(&air, &vk, log_height, &public)]);
+    verify(&paired, instances(), &proof, 0, &mut challenger())
+        .expect("an honest paired proof verifies");
+    assert!(verify(&apart, instances(), &proof, 0, &mut challenger()).is_err());
 }

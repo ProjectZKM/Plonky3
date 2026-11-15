@@ -52,7 +52,7 @@ pub use data::{SumcheckData, verify_final_sumcheck_rounds};
 pub use error::SumcheckError;
 pub(crate) use lagrange::extrapolate_01inf;
 use p3_field::Field;
-pub use prescribed_pcs::{PrescribedOpeningSecurity, PrescribedPointPcs};
+pub use prescribed_pcs::{PairCheck, PairOpening, PrescribedOpeningSecurity, PrescribedPointPcs};
 pub use table::{
     OpeningBatch, OpeningEvals, OpeningPointMismatch, OpeningProtocol, OpeningRequest,
     PointSchedule, TableShape, TableSpec,
@@ -80,3 +80,5 @@ impl<F: Field, P, Data> Claim<F, P, Data> {
         &self.point
     }
 }
+
+pub use commit::{CodewordCommitter, HostCommitter, commit_base_with};

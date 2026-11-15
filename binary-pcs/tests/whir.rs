@@ -196,6 +196,7 @@ fn assert_shape_bounds_payload(
                 positions += opening.rows.len();
                 digests += opening.proof.sibling_hashes.len();
             }
+            p3_whir::QueryOpenings::Batched(_) => unreachable!("a single commitment opens unbatched"),
         }
     }
     assert!(base <= bound.sent_base_elements);

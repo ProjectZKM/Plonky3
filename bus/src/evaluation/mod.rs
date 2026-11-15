@@ -10,7 +10,7 @@ use p3_multilinear_util::point::Point;
 mod affine;
 mod error;
 
-pub use affine::{BusAffineExpression, BusAffineFactor};
+pub use affine::{AffineCell, AffineForm, BusAffineExpression, BusAffineFactor};
 pub use error::BusEvaluationError;
 
 use crate::{

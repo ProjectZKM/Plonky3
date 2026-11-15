@@ -22,13 +22,17 @@
 //! isomorphic to the challenge field. Challenges cross into `R` once and round polynomials
 //! cross back once, so the composition is the one computed in the challenge field.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use hashbrown::HashMap;
 use hashbrown::hash_map::Entry;
-use p3_bus::{BusActivation, BusAffineExpression, BusDirection, BusEvaluation, BusReductionOutput};
+use p3_bus::{
+    AffineForm, BusActivation, BusAffineExpression, BusDirection, BusEvaluation,
+    BusReductionOutput,
+};
 use p3_field::{Algebra, ExtensionField, Field};
 use p3_maybe_rayon::prelude::*;
 use p3_multilinear_util::point::Point;
@@ -38,6 +42,47 @@ use p3_sumcheck::layout::{ColumnView, Table};
 
 use crate::bus::BusContext;
 use crate::selectors::BoundaryEvals;
+
+/// One AIR's affine bus terms held by a device: the factor and selector of every term at
+/// every row of the AIR's table, the equality weights of the product point's row variables,
+/// and each term's coefficient.
+pub trait DeviceBusTerms<EF>: Send + Sync {
+    /// Each term's claim: the sum over the rows of the equality weight times the factor
+    /// less one times the selector, without the term's coefficient.
+    fn row_claims(&self) -> Vec<EF>;
+
+    /// The AIR's body at each interpolation node of the current round: the sum over the row
+    /// pairs of the interpolated equality weight times the sum over the terms of the
+    /// coefficient times the interpolated factor less one times the interpolated selector.
+    fn round(&self, nodes: &[EF]) -> Vec<EF>;
+
+    /// Bind the current row variable to `challenge`.
+    fn fold(&mut self, challenge: EF);
+}
+
+/// A device that holds the committed tables and takes every AIR's bus terms.
+///
+/// With a device the whole bus family runs on it: every declaration must be affine in its
+/// AIR's cells, and nothing is evaluated on the host.
+pub trait BusFamilyDevice<F, EF>: Send + Sync {
+    /// The terms on the device.
+    fn terms(&self, spec: BusTermsSpec<F, EF>) -> Box<dyn DeviceBusTerms<EF>>;
+}
+
+/// One AIR's affine bus terms as a device evaluates them.
+#[derive(Clone, Debug)]
+pub struct BusTermsSpec<F, EF> {
+    /// The instance whose committed table the terms read.
+    pub instance: usize,
+    /// The table has `1 << log_height` rows.
+    pub log_height: usize,
+    /// The product point's row variables, whose equality weights the claims carry.
+    pub point: Vec<EF>,
+    /// Each term's factor form, selector form and coefficient.
+    pub terms: Vec<(AffineForm<EF>, Option<AffineForm<EF>>, EF)>,
+    /// The AIR's public values, which the forms are already resolved against.
+    pub public_values: Vec<F>,
+}
 
 /// Prover state for the mixed-height bus composition polynomial.
 pub(crate) struct BusCompositionProver<'a, F: Field, EF: ExtensionField<F>, R> {
@@ -51,6 +96,8 @@ pub(crate) struct BusCompositionProver<'a, F: Field, EF: ExtensionField<F>, R> {
     equality_point: Vec<R>,
     /// Source columns and selectors grouped once per AIR.
     airs: Vec<AirState<'a, F, R>>,
+    /// Each AIR's terms on the device, aligned with `airs`; all of them when a device is given.
+    device_terms: Vec<Option<Box<dyn DeviceBusTerms<EF>>>>,
     /// Maximum round degree, derived once from the public plan.
     degree: usize,
     /// Number of global variables already bound.
@@ -358,6 +405,67 @@ where
     F: Field,
     R: Field + Algebra<F>,
 {
+    /// Hand every term of this AIR to `device`, which reads the committed table it holds.
+    ///
+    /// # Panics
+    /// Panics if a declaration is not affine in the AIR's cells: with a device the bus family
+    /// never falls back to the host.
+    #[allow(clippy::too_many_arguments)]
+    fn device_terms<EF: ExtensionField<F>>(
+        &mut self,
+        device: &dyn BusFamilyDevice<F, EF>,
+        context: &BusContext<F, EF>,
+        output: &BusReductionOutput<EF>,
+        instance: usize,
+        log_height: usize,
+        point: &[EF],
+        to_repr: fn(EF) -> R,
+        from_repr: fn(R) -> EF,
+    ) -> Box<dyn DeviceBusTerms<EF>> {
+        let weights = output.challenges.fingerprint_weights();
+        let offset = output.challenges.offset;
+        let terms = self
+            .terms
+            .iter()
+            .map(|term| {
+                let factor = context
+                    .plan()
+                    .compile_factor(
+                        term.bus,
+                        context.interaction(term.owner),
+                        &weights,
+                        offset,
+                    )
+                    .expect("a checked bus plan compiles against its own declarations")
+                    .affine(&self.public_values)
+                    .expect("a planned expression resolves its public inputs")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "bus declaration {:?} of AIR {instance} is not affine in its cells; \
+                             the device bus family has no host path",
+                            term.owner
+                        )
+                    });
+                let (factor, selector) = AffineForm::of_factor(&factor);
+                (factor, selector, from_repr(term.coefficient))
+            })
+            .collect::<Vec<_>>();
+        let device_terms = device.terms(BusTermsSpec {
+            instance,
+            log_height,
+            point: point.to_vec(),
+            terms,
+            public_values: self.public_values.clone(),
+        });
+        for (term, claim) in self.terms.iter_mut().zip(device_terms.row_claims()) {
+            term.row_claim = to_repr(claim);
+        }
+        self.main = Vec::new();
+        self.preprocessed = Vec::new();
+        self.periodic = Vec::new();
+        device_terms
+    }
+
     /// Project only when every declaration is affine and the retained tables are no larger
     /// than the generic path's first fold. Count actual source columns, not declared widths.
     fn initialize_projection<EF: ExtensionField<F>>(
@@ -685,6 +793,7 @@ where
         num_variables: usize,
         to_repr: fn(EF) -> R,
         from_repr: fn(R) -> EF,
+        device: Option<&dyn BusFamilyDevice<F, EF>>,
     ) -> Self {
         debug_assert!(num_variables >= context.max_num_variables());
         // Sources, public values and plan constants enter `R` through its own embedding of `F`.
@@ -701,6 +810,7 @@ where
             .collect();
         let offset = to_repr(output.challenges.offset);
         let mut airs = (0..tables.len()).map(|_| None).collect::<Vec<_>>();
+        let mut row_points = (0..tables.len()).map(|_| Vec::new()).collect::<Vec<Vec<EF>>>();
 
         for direction in BusDirection::ALL {
             let direction_weight = match direction {
@@ -710,6 +820,7 @@ where
             for share in context.plan().terminal_shares(direction) {
                 let air = share.owner.air;
                 let row_point = &output.product.point[share.prefix_variables..];
+                row_points[air] = row_point.to_vec();
                 let block_weight = share
                     .prefix_weight(&output.product.point)
                     .expect("a planned share addresses its own product-tree point");
@@ -717,12 +828,17 @@ where
                 let state = airs[air].get_or_insert_with(|| {
                     // Column views read a packed Boolean table without expanding it first.
                     // Only the columns a declaration reads are kept, and they are read in place.
+                    // A device reads the columns where it holds them, so the host keeps none.
                     let main_columns = context.main_columns(air);
                     let table = tables[air];
-                    let main = main_columns
-                        .iter()
-                        .map(|&column| Source::Committed(table.column(column)))
-                        .collect::<Vec<_>>();
+                    let main = if device.is_some() {
+                        Vec::new()
+                    } else {
+                        main_columns
+                            .iter()
+                            .map(|&column| Source::Committed(table.column(column)))
+                            .collect::<Vec<_>>()
+                    };
                     let fixed_columns = context.preprocessed_columns(air);
                     let fixed_width = preprocessed[air].map_or(0, Table::num_polys);
                     let preprocessed = preprocessed[air]
@@ -757,10 +873,17 @@ where
                         periodic_layout: (periodic_columns.to_vec(), periodic_width),
                         // No row variable is bound yet, so both prefix products are empty.
                         boundary: BoundaryEvals::at(&[]),
-                        equality: Poly::new(
-                            Point::new(row_point.iter().copied().map(to_repr).collect::<Vec<_>>())
+                        // A device holds its own equality weights; the host builds none.
+                        equality: if device.is_some() {
+                            Poly::new(vec![R::ONE])
+                        } else {
+                            Poly::new(
+                                Point::new(
+                                    row_point.iter().copied().map(to_repr).collect::<Vec<_>>(),
+                                )
                                 .equality_weights_msb(),
-                        ),
+                            )
+                        },
                         terms: Vec::new(),
                         projected: None,
                         unused_prefix: num_variables - share.row_variables,
@@ -783,7 +906,25 @@ where
             }
         }
 
-        for air in airs.iter_mut().flatten() {
+        let mut device_terms = Vec::new();
+        for (index, air) in airs.iter_mut().enumerate() {
+            let Some(air) = air else {
+                continue;
+            };
+            if let Some(device) = device {
+                device_terms.push(Some(air.device_terms(
+                    device,
+                    context,
+                    output,
+                    index,
+                    tables[index].num_variables(),
+                    &row_points[index],
+                    to_repr,
+                    from_repr,
+                )));
+                continue;
+            }
+            device_terms.push(None);
             // A dormant wide table benefits before its first active round: its initial
             // row claim reads the compact projection instead of revisiting every source.
             air.initialize_projection(context, &weights, offset);
@@ -803,6 +944,7 @@ where
                 Vec::new()
             },
             airs: airs.into_iter().flatten().collect(),
+            device_terms,
             degree: context.composition_degree(),
             round: 0,
             to_repr,
@@ -894,12 +1036,14 @@ where
     fn fold(&mut self, challenge: EF) {
         let challenge = (self.to_repr)(challenge);
         // Dormant blocks evaluate one more coordinate of χ_k at the all-one vertex.
-        for air in &mut self.airs {
+        for (air, device) in self.airs.iter_mut().zip(&mut self.device_terms) {
             if self.round < air.unused_prefix {
                 air.prefix_evaluation *= challenge;
                 continue;
             }
-            if let Some(projected) = &mut air.projected {
+            if let Some(device) = device {
+                device.fold((self.from_repr)(challenge));
+            } else if let Some(projected) = &mut air.projected {
                 for projection in &mut projected.groups {
                     projection.fold(challenge);
                 }
@@ -941,15 +1085,32 @@ where
             })
             .collect::<Vec<_>>();
         // Generic-degree encoding omits node one, which the verifier derives from the claim.
-        (0..self.degree)
+        let nodes = (0..self.degree)
             .map(RoundPolyInterpolator::<EF>::transmitted_node)
-            .map(|node| {
+            .collect::<Vec<_>>();
+        // A device evaluates every node of the round in one pass.
+        let device_bodies = self
+            .airs
+            .iter()
+            .zip(&self.device_terms)
+            .map(|(air, device)| {
+                device
+                    .as_ref()
+                    .filter(|_| self.round >= air.unused_prefix)
+                    .map(|device| device.round(&nodes))
+            })
+            .collect::<Vec<_>>();
+        nodes
+            .iter()
+            .enumerate()
+            .map(|(at, &node)| {
                 let node = (self.to_repr)(node);
                 let sum = self
                     .airs
                     .iter()
                     .zip(&projected)
-                    .map(|(air, coefficients)| {
+                    .zip(&device_bodies)
+                    .map(|((air, coefficients), device_body)| {
                         let body = if self.round < air.unused_prefix {
                             // χ_k contributes the current node; its remaining cube sum is one.
                             node * air.projected.as_ref().map_or_else(
@@ -961,6 +1122,8 @@ where
                                 },
                                 |projected| projected.row_claim,
                             )
+                        } else if let Some(bodies) = device_body {
+                            (self.to_repr)(bodies[at])
                         } else if let Some([constant, linear, quadratic]) = *coefficients {
                             let projection = air.projected.as_ref().unwrap();
                             let anchor = self.equality_point

@@ -31,6 +31,7 @@ use p3_field::{ExtensionField, Field};
 use p3_matrix::dense::{DenseMatrix, RowMajorMatrix};
 use p3_multilinear_util::point::Point;
 use p3_sumcheck::SumcheckData;
+use p3_sumcheck::commit::CodewordCommitter;
 use p3_sumcheck::layout::{Layout, SuffixResidualProver, Table, Witness};
 
 use crate::PcsLayout;
@@ -97,6 +98,34 @@ pub(crate) struct RoundCommitment<EF: Field, MX: Mmcs<EF>> {
 ///
 /// `witness` must have the configured number of variables, at zero preprocessing depth.
 #[tracing::instrument(name = "binary pcs commit", skip_all)]
+/// [`commit`] through `committer`.
+pub(crate) fn commit_with<F, EF, MT, K>(
+    config: &BinaryPcsConfig,
+    committer: &K,
+    witness: Witness<F>,
+) -> (MT::Commitment, BinaryPcsProverData<F, EF, MT>)
+where
+    F: TranscriptField,
+    EF: ExtensionField<F>,
+    MT: Mmcs<F>,
+    K: CodewordCommitter<F, MT>,
+{
+    assert_eq!(
+        witness.num_variables(),
+        config.num_variables(),
+        "witness arity must match the config it is committed against"
+    );
+    let (layout, commitment, merkle_data) =
+        PcsLayout::<F, EF>::commit_with(committer, witness, FOLDING, config.log_inv_rate());
+    (
+        commitment,
+        BinaryPcsProverData {
+            layout,
+            merkle_data,
+        },
+    )
+}
+
 pub(crate) fn commit<F, EF, E, MT>(
     config: &BinaryPcsConfig,
     encoder: &E,

@@ -155,16 +155,54 @@ pub(super) struct SlicedTrace<'data> {
     width: usize,
     /// `cells[w * width + c]`: the planes of column `c` over rows `64 w .. 64 w + 63`.
     cells: Planes<'data>,
-    /// The successor planes, laid out like `cells`.
+    /// The successor planes of the successor columns alone, `successor_width` per word.
     ///
     /// Row `s` holds the cell at row `min(s + 1, height - 1)`, the repeat-last successor.
-    /// Zero for every column no AIR reads on the next row. A stage with no declared successor
-    /// reads omits this buffer entirely.
+    /// A column no AIR reads on the next row has none, rather than a plane of zeros.
     successors: Planes<'data>,
+    /// Successor columns per word of `successors`.
+    successor_width: usize,
+    /// Each successor column's place among them, in column order; unused for the others.
+    successor_slots: Vec<usize>,
     /// The first-row, last-row, and transition selectors of each word, one bit per row.
     boundary: Vec<[u64; 3]>,
     /// Number of rounds evaluated on the planes.
     rounds: usize,
+}
+
+/// Where a column's word sits in one set of planes.
+#[derive(Clone, Copy)]
+struct PlaneLayout<'s> {
+    /// Columns per word.
+    width: usize,
+    /// Each column's place, when the planes hold only some columns.
+    slots: Option<&'s [usize]>,
+}
+
+impl PlaneLayout<'_> {
+    /// The place of `column` within one word.
+    #[inline]
+    fn slot(&self, column: usize) -> usize {
+        self.slots.map_or(column, |slots| slots[column])
+    }
+}
+
+impl SlicedTrace<'_> {
+    /// The layout of the cells: every column, in order.
+    const fn cell_layout(&self) -> PlaneLayout<'_> {
+        PlaneLayout {
+            width: self.width,
+            slots: None,
+        }
+    }
+
+    /// The layout of the successor planes: the successor columns alone.
+    fn successor_layout(&self) -> PlaneLayout<'_> {
+        PlaneLayout {
+            width: self.successor_width,
+            slots: Some(&self.successor_slots),
+        }
+    }
 }
 
 /// Bit planes laid out word by word, one entry per word of one column.
@@ -288,25 +326,27 @@ fn successor_word(planes: [u64; 2], carry: (bool, bool)) -> [u64; 2] {
     ]
 }
 
-/// The successor planes of the low plane `cells`, `width` columns per word, laid out alike.
-///
-/// Zero for every column that is not a successor column.
-fn low_successors(cells: &[u64], is_successor: &[bool], width: usize) -> Vec<u64> {
+/// The successor planes of the low plane `cells`, `width` columns per word, for the
+/// `successor_columns` alone, in that order.
+fn low_successors(cells: &[u64], successor_columns: &[usize], width: usize) -> Vec<u64> {
     let top = SLICED_LANES - 1;
-    let mut successors = vec![0; cells.len()];
+    let words = cells.len() / width;
+    let mut successors = vec![0; words * successor_columns.len()];
+    if successor_columns.is_empty() {
+        return successors;
+    }
     successors
-        .par_chunks_mut(width)
+        .par_chunks_mut(successor_columns.len())
         .enumerate()
         .for_each(|(word, output)| {
             let current = &cells[word * width..(word + 1) * width];
             // Each word's top lane reads the lowest lane of the next word, and the last word's
             // top lane repeats itself.
             let next = cells.get((word + 1) * width..(word + 2) * width);
-            for (column, (successor, &low)) in output.iter_mut().zip(current).enumerate() {
-                if is_successor[column] {
-                    let carry = next.map_or(low >> top, |next| next[column] & 1) == 1;
-                    *successor = successor_word([low, 0], (carry, false))[0];
-                }
+            for (successor, &column) in output.iter_mut().zip(successor_columns) {
+                let low = current[column];
+                let carry = next.map_or(low >> top, |next| next[column] & 1) == 1;
+                *successor = successor_word([low, 0], (carry, false))[0];
             }
         });
     successors
@@ -466,9 +506,11 @@ where
     ///
     /// Each column's value at `t = 0` lands in `values`, and its step to `t = 1` in `steps`.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn fold_columns<const CORNERS: usize>(
         &self,
         planes: &Planes<'_>,
+        layout: PlaneLayout<'_>,
         columns: Range<usize>,
         word: usize,
         prefix: &PrefixFold,
@@ -476,30 +518,35 @@ where
         steps: &mut [SlicedGf4<F, S>],
     ) {
         match planes {
-            Planes::Low(words) => self
-                .fold_plane_columns::<_, CORNERS>(&**words, columns, word, prefix, values, steps),
-            Planes::Pairs(pairs) => self
-                .fold_plane_columns::<_, CORNERS>(&**pairs, columns, word, prefix, values, steps),
+            Planes::Low(words) => self.fold_plane_columns::<_, CORNERS>(
+                &**words, layout, columns, word, prefix, values, steps,
+            ),
+            Planes::Pairs(pairs) => self.fold_plane_columns::<_, CORNERS>(
+                &**pairs, layout, columns, word, prefix, values, steps,
+            ),
         }
     }
 
     /// [`Self::fold_columns`] over planes of one layout.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn fold_plane_columns<P: PlaneWords + ?Sized, const CORNERS: usize>(
         &self,
         planes: &P,
+        layout: PlaneLayout<'_>,
         columns: Range<usize>,
         word: usize,
         prefix: &PrefixFold,
         values: &mut [SlicedGf4<F, S>],
         steps: &mut [SlicedGf4<F, S>],
     ) {
-        let width = self.trace.width;
+        let width = layout.width;
         let starts: [usize; CORNERS] =
             core::array::from_fn(|corner| (prefix.corners[corner] * self.words + word) * width);
         for column in columns {
+            let slot = layout.slot(column);
             let corners = starts.map(|start| {
-                let [low, high] = planes.planes(start + column);
+                let [low, high] = planes.planes(start + slot);
                 SlicedGf4::from_planes(low, high)
             });
             let (lo, hi) = fold_corners(corners, &prefix.nodes);
@@ -551,6 +598,7 @@ where
 
         self.fold_columns::<CORNERS>(
             &trace.cells,
+            trace.cell_layout(),
             0..trace.width,
             word,
             prefix,
@@ -560,6 +608,7 @@ where
         for run in &self.next_columns {
             self.fold_columns::<CORNERS>(
                 &trace.successors,
+                trace.successor_layout(),
                 run.clone(),
                 word,
                 prefix,
@@ -1141,8 +1190,14 @@ where
         let width = columns.len();
         let next_columns = next_row_runs(&self.slots);
         let mut is_successor = vec![false; width];
-        for column in next_columns.iter().flat_map(|run| run.clone()) {
+        let mut successor_slots = vec![usize::MAX; width];
+        let successor_columns = next_columns
+            .iter()
+            .flat_map(|run| run.clone())
+            .collect::<Vec<_>>();
+        for (slot, &column) in successor_columns.iter().enumerate() {
             is_successor[column] = true;
+            successor_slots[column] = slot;
         }
 
         // Each table's packed matrix is already word-major: the low plane of its columns. A stage
@@ -1166,12 +1221,8 @@ where
         };
         let low = borrowed.or_else(|| direct_packed_cells(&tables, words).map(Cow::Owned));
         let (cells, successors) = if let Some(low) = low {
-            let successors = if next_columns.is_empty() {
-                Cow::Borrowed(&[][..])
-            } else {
-                Cow::Owned(low_successors(&low, &is_successor, width))
-            };
-            (Planes::Low(low), Planes::Low(successors))
+            let successors = low_successors(&low, &successor_columns, width);
+            (Planes::Low(low), Planes::Low(Cow::Owned(successors)))
         } else {
             let (cells, successors) =
                 pack_sliced_columns::<F, S>(&columns, &is_successor, words, width)?;
@@ -1192,6 +1243,8 @@ where
             width,
             cells,
             successors,
+            successor_width: successor_columns.len(),
+            successor_slots,
             boundary,
             rounds,
         })
@@ -1288,6 +1341,8 @@ where
             cells: Planes::Low(cells),
             // Eligibility excludes successor reads, including during the boundary fold.
             successors: Planes::Low(Cow::Borrowed(&[])),
+            successor_width: 0,
+            successor_slots: Vec::new(),
             boundary,
             rounds: 3,
         };
@@ -1516,6 +1571,7 @@ where
                 theta_beta_powers: lift(&self.coupling.theta_beta_powers),
             },
             lookup_scale: self.eta,
+            device: None,
             boundary: BoundaryEvals::new(R::from(EF::ONE - r), R::from(r), R::from(EF::ONE - r)),
         }
     }
@@ -1574,36 +1630,32 @@ where
         })
         .collect::<Option<Vec<_>>>()?;
 
-    // Lay the words out word by word, every column of a word side by side.
+    // Lay the words out word by word, every column of a word side by side, and every successor
+    // column's successor planes beside each other in column order.
+    let successor_width = is_successor.iter().filter(|&&successor| successor).count();
     let mut cells = vec![[0; 2]; words * width];
-    if !is_successor.iter().any(|&next| next) {
-        cells
-            .par_chunks_mut(width)
-            .enumerate()
-            .for_each(|(word, word_cells)| {
-                for (cell, (column_planes, _)) in word_cells.iter_mut().zip(&packed) {
-                    *cell = column_planes[word];
-                }
-            });
-        return Some((cells, Vec::new()));
-    }
-    let mut successors = vec![[0; 2]; words * width];
     cells
         .par_chunks_mut(width)
-        .zip(successors.par_chunks_mut(width))
         .enumerate()
-        .for_each(|(word, (word_cells, word_successors))| {
-            for ((cell, successor), (column_planes, successor_planes)) in word_cells
-                .iter_mut()
-                .zip(word_successors.iter_mut())
-                .zip(&packed)
-            {
+        .for_each(|(word, word_cells)| {
+            for (cell, (column_planes, _)) in word_cells.iter_mut().zip(&packed) {
                 *cell = column_planes[word];
-                if let Some(&planes) = successor_planes.get(word) {
-                    *successor = planes;
-                }
             }
         });
+    let mut successors = vec![[0; 2]; words * successor_width];
+    if successor_width > 0 {
+        successors
+            .par_chunks_mut(successor_width)
+            .enumerate()
+            .for_each(|(word, word_successors)| {
+                let planes = packed
+                    .iter()
+                    .filter(|(_, successor_planes)| !successor_planes.is_empty());
+                for (successor, (_, successor_planes)) in word_successors.iter_mut().zip(planes) {
+                    *successor = successor_planes[word];
+                }
+            });
+    }
     Some((cells, successors))
 }
 
@@ -2159,12 +2211,13 @@ impl<'a, R: Field, const CORNERS: usize> PlaneFold<'a, R, CORNERS> {
     fn corner_words(
         &self,
         planes: &Planes<'_>,
+        layout: PlaneLayout<'_>,
         column: usize,
         word: usize,
     ) -> ([u64; CORNERS], [u64; CORNERS]) {
         match planes {
-            Planes::Low(words) => self.corner_plane_words(&**words, column, word),
-            Planes::Pairs(pairs) => self.corner_plane_words(&**pairs, column, word),
+            Planes::Low(words) => self.corner_plane_words(&**words, layout, column, word),
+            Planes::Pairs(pairs) => self.corner_plane_words(&**pairs, layout, column, word),
         }
     }
 
@@ -2173,13 +2226,14 @@ impl<'a, R: Field, const CORNERS: usize> PlaneFold<'a, R, CORNERS> {
     fn corner_plane_words<P: PlaneWords + ?Sized>(
         &self,
         planes: &P,
+        layout: PlaneLayout<'_>,
         column: usize,
         word: usize,
     ) -> ([u64; CORNERS], [u64; CORNERS]) {
         let mut low = [0; CORNERS];
         let mut high = [0; CORNERS];
-        let base = word * self.trace.width + column;
-        let stride = self.words * self.trace.width;
+        let base = word * layout.width + layout.slot(column);
+        let stride = self.words * layout.width;
         for (corner, (low, high)) in low[..self.corners]
             .iter_mut()
             .zip(&mut high[..self.corners])
@@ -2238,8 +2292,15 @@ impl<'a, R: Field, const CORNERS: usize> PlaneFold<'a, R, CORNERS> {
     }
 
     /// The value at every residual row of one word.
-    fn fold_word(&self, planes: &Planes<'_>, column: usize, word: usize, out: &mut [R]) {
-        let (low, high) = self.corner_words(planes, column, word);
+    fn fold_word(
+        &self,
+        planes: &Planes<'_>,
+        layout: PlaneLayout<'_>,
+        column: usize,
+        word: usize,
+        out: &mut [R],
+    ) {
+        let (low, high) = self.corner_words(planes, layout, column, word);
         for (out, value) in out.iter_mut().zip(self.corner_values(&low, &high)) {
             *out = value;
         }
@@ -2473,6 +2534,7 @@ impl<'a, R: Field, const CORNERS: usize> PlaneFold<'a, R, CORNERS> {
     fn write_top_lane_cells(
         &self,
         planes: &Planes<'_>,
+        layout: PlaneLayout<'_>,
         column: usize,
         words: [usize; ROW_HALVES],
         low_cell: &mut [u8],
@@ -2480,7 +2542,7 @@ impl<'a, R: Field, const CORNERS: usize> PlaneFold<'a, R, CORNERS> {
     ) -> bool {
         let mut has_high = false;
         for (half, word) in words.into_iter().enumerate() {
-            let (low, high) = self.corner_words(planes, column, word);
+            let (low, high) = self.corner_words(planes, layout, column, word);
             for group in 0..self.groups {
                 let (low, high) = self.group_words(&low, &high, group);
                 low_cell[half * self.groups + group] = top_lane_mask(low);
@@ -2644,6 +2706,7 @@ impl RowTile {
                 let at = extra + column * column_bytes;
                 high |= fold.write_top_lane_cells(
                     &fold.trace.successors,
+                    fold.trace.successor_layout(),
                     column,
                     words,
                     &mut self.low_cells[at..at + self.cell],
@@ -2991,7 +3054,13 @@ where
         let mut last = [R::ZERO; SLICED_LANES];
         for run in next_row_runs(&self.slots) {
             for column in run {
-                fold.fold_word(&fold.trace.successors, column, fold.words - 1, &mut last);
+                fold.fold_word(
+                    &fold.trace.successors,
+                    fold.trace.successor_layout(),
+                    column,
+                    fold.words - 1,
+                    &mut last,
+                );
                 self.next_tail[column] = last[SLICED_LANES - 1];
             }
         }

@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 
 use p3_binary_field::{PackedGf2, Underlier};
+use p3_maybe_rayon::prelude::*;
 use p3_word::{Segment, ShapeError, ValueIndex, Word, Word32, Word64};
 
 use crate::statement::StatementShape;
@@ -61,8 +62,13 @@ impl PackedWord for Word64 {
 pub struct PackedWitness<W: PackedWord> {
     /// The verifier-known words in least-significant-bit-first packing.
     public: Vec<Packed<W>>,
-    /// The committed words in least-significant-bit-first packing.
+    /// The committed words in least-significant-bit-first packing, none when a device holds
+    /// them.
     witness: Vec<Packed<W>>,
+    /// How many committed words there are.
+    witness_len: usize,
+    /// Whether a device holds the committed words, the host their count alone.
+    held: bool,
 }
 
 /// A witness that does not match its checked statement shape.
@@ -80,7 +86,25 @@ impl<W: PackedWord> PackedWitness<W> {
 
         Ok(Self {
             public: public.iter().copied().map(W::pack).collect(),
-            witness: witness.iter().copied().map(W::pack).collect(),
+            witness: witness.par_iter().copied().map(W::pack).collect(),
+            witness_len: witness.len(),
+            held: false,
+        })
+    }
+
+    /// The public words beside `witness_len` committed words a device holds, which the host
+    /// never reads: a prover on that device reads them where they lie.
+    pub fn held(
+        shape: &impl StatementShape<W>,
+        public: &[W],
+        witness_len: usize,
+    ) -> Result<Self, WitnessError> {
+        shape.check_shape(public.len(), witness_len)?;
+        Ok(Self {
+            public: public.iter().copied().map(W::pack).collect(),
+            witness: Vec::new(),
+            witness_len,
+            held: true,
         })
     }
 
@@ -92,12 +116,18 @@ impl<W: PackedWord> PackedWitness<W> {
     ) -> Result<Self, WitnessError> {
         // Prepacked buffers obey the same checked statement shape.
         shape.check_shape(public.len(), witness.len())?;
-        Ok(Self { public, witness })
+        let witness_len = witness.len();
+        Ok(Self {
+            public,
+            witness,
+            witness_len,
+            held: false,
+        })
     }
 
     pub(crate) fn check_shape(&self, shape: &impl StatementShape<W>) -> Result<(), WitnessError> {
         // Revalidation protects backend entry points that receive stored witnesses.
-        shape.check_shape(self.public.len(), self.witness.len())
+        shape.check_shape(self.public.len(), self.witness_len)
     }
 
     /// Returns the packed public words.
@@ -107,9 +137,26 @@ impl<W: PackedWord> PackedWitness<W> {
     }
 
     /// Returns the packed committed words.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a device holds them.
     #[inline]
     pub fn witness(&self) -> &[Packed<W>] {
+        assert!(!self.held, "a device holds the committed words");
         &self.witness
+    }
+
+    /// How many committed words there are, wherever they are held.
+    #[inline]
+    pub const fn witness_len(&self) -> usize {
+        self.witness_len
+    }
+
+    /// Whether a device holds the committed words, the host their count alone.
+    #[inline]
+    pub const fn is_held(&self) -> bool {
+        self.held
     }
 
     /// Reads a word through its checked segment index.
@@ -117,7 +164,7 @@ impl<W: PackedWord> PackedWitness<W> {
     pub fn get(&self, index: ValueIndex) -> Option<W> {
         let segment = match index.segment() {
             Segment::Public => &self.public,
-            Segment::Witness => &self.witness,
+            Segment::Witness => self.witness(),
         };
         segment
             .get(index.position() as usize)

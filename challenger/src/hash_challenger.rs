@@ -56,6 +56,12 @@ where
         }
     }
 
+    /// The inputs absorbed since the last digest, which the next digest
+    /// hashes before anything observed after them.
+    pub fn pending_input(&self) -> &[T] {
+        &self.input_buffer
+    }
+
     fn flush(&mut self) {
         let output = self.hasher.hash_slice(&self.input_buffer);
 

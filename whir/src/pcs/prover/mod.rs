@@ -16,7 +16,9 @@ use p3_multilinear_util::poly::Poly;
 use p3_sumcheck::TableShape;
 use p3_sumcheck::constraints::statement::{EqStatement, SelectStatement};
 use p3_sumcheck::constraints::{Constraint, Statements};
-use p3_sumcheck::layout::{InitialWeight, Layout, SuffixProver, Verifier as LayoutVerifier};
+use p3_sumcheck::layout::{
+    InitialWeight, Layout, SuffixProver, Verifier as LayoutVerifier, fold_rounds, residual_prover,
+};
 use p3_sumcheck::strategy::{SumcheckProver, VariableOrder};
 use tracing::instrument;
 
@@ -25,12 +27,20 @@ use crate::domain::{WhirDomain, WhirQueryPoint};
 use crate::parameters::WhirConfig;
 use crate::pcs::WhirProverData;
 use crate::pcs::committer::writer::commit_extension;
+use crate::pcs::device::Device;
 use crate::pcs::proof::{
-    QueryOpenings, SharedProofOpening, SumcheckData, WhirProof, WhirRoundProof,
+    QueryOpenings, SharedProofOpening, SumcheckData, WhirProof, WhirRoundProof, combined_row,
 };
 use crate::pcs::verifier::errors::VerifierError;
 use crate::pcs::verifier::{InitialWeightCheck, WhirVerifier};
 use crate::transcript::{WhirProverTranscript, WhirShape};
+
+/// The Merkle prover data of the polynomial the next queries open.
+type WhirRoundData<EF, F, MT> = RoundData<
+    F,
+    Arc<<MT as Mmcs<F>>::ProverData<DenseMatrix<F>>>,
+    <MT as Mmcs<F>>::ProverData<FlatMatrixView<F, EF, DenseMatrix<EF>>>,
+>;
 
 /// Per-round prover state with the Merkle authentication shapes
 /// baked in for the WHIR commitment scheme.
@@ -49,11 +59,60 @@ type WhirRoundState<EF, F, MT> = RoundState<
 
 /// Active Merkle prover data for the polynomial currently being queried.
 #[derive(Debug)]
-enum RoundData<BaseData, ExtData> {
+enum RoundData<F, BaseData, ExtData> {
     /// Base-field commitment produced by the initial round.
     Base(BaseData),
+    /// Several base-field commitments whose polynomials the run batches,
+    /// with the coefficient each enters the batch with.
+    Batched(Vec<BaseData>, Vec<F>),
     /// Extension-field commitment produced by every subsequent folded round.
     Ext(ExtData),
+    /// A folded round's commitment kept on the device under this handle.
+    Resident(usize),
+    /// A pair's two base-field commitments batched as `first + gamma * second`, the first
+    /// kept on the device.
+    Pair(BaseData, F),
+    /// A lone base-field commitment kept on the device.
+    First,
+}
+
+/// The polynomial and weights the rounds fold: in host memory, or on the device.
+#[derive(Debug)]
+enum Residual<F: Field, EF: ExtensionField<F>> {
+    /// The host's sumcheck prover.
+    Host(SumcheckProver<F, EF>),
+    /// The pair on the device, `sum_x f(x) w(x) = sum` over `num_variables` variables.
+    Device { sum: EF, num_variables: usize },
+}
+
+impl<F: Field, EF: ExtensionField<F>> Residual<F, EF> {
+    fn num_variables(&self) -> usize {
+        match self {
+            Self::Host(prover) => prover.num_variables(),
+            Self::Device { num_variables, .. } => *num_variables,
+        }
+    }
+
+    /// The host prover.
+    ///
+    /// # Panics
+    ///
+    /// When the residual is on the device.
+    fn host(&mut self) -> &mut SumcheckProver<F, EF> {
+        match self {
+            Self::Host(prover) => prover,
+            Self::Device { .. } => unreachable!("the residual is on the device"),
+        }
+    }
+}
+
+/// The device of a run whose residual is on it.
+fn held<'s, 'd, F: Field, EF: ExtensionField<F>, MT: Mmcs<F>>(
+    device: &'s mut Option<&mut Device<'d, F, EF, MT>>,
+) -> &'s mut Device<'d, F, EF, MT> {
+    device
+        .as_deref_mut()
+        .expect("a residual on the device comes with its device")
 }
 
 /// Per-round state during WHIR proof generation.
@@ -66,12 +125,12 @@ where
     F: Field,
     EF: ExtensionField<F>,
 {
-    /// Sumcheck prover managing constraint batching and polynomial folding.
-    sumcheck_prover: SumcheckProver<F, EF>,
+    /// Sumcheck state managing constraint batching and polynomial folding.
+    sumcheck_prover: Residual<F, EF>,
     /// Folding challenges (alpha_1, ..., alpha_k) for the current round.
     folding_randomness: Point<EF>,
     /// Active Merkle prover data for the polynomial currently being queried.
-    round_data: RoundData<BaseData, ExtData>,
+    round_data: RoundData<F, BaseData, ExtData>,
 }
 
 /// WHIR prover bundling the protocol config with its FFT and commitment backends.
@@ -91,18 +150,6 @@ where
     pub(crate) extension_mmcs: ExtensionMmcs<F, EF, MT>,
     /// Marker tying the prover to a specific stacked-layout binding mode.
     _marker: PhantomData<Layout>,
-}
-
-impl<EF, F, Dft, MT, Challenger, L> WhirProver<EF, F, Dft, MT, Challenger, L>
-where
-    F: Field,
-    EF: ExtensionField<F>,
-{
-    /// Commitment backend used by the initial and folded codewords.
-    #[must_use]
-    pub const fn mmcs(&self) -> &MT {
-        &self.mmcs
-    }
 }
 
 impl<EF, F, Dft, MT, Challenger, Layout> Deref for WhirProver<EF, F, Dft, MT, Challenger, Layout>
@@ -164,6 +211,11 @@ where
         }
     }
 
+    /// The Merkle commitment scheme of the base codeword.
+    pub const fn mmcs(&self) -> &MT {
+        &self.mmcs
+    }
+
     /// Execute the full WHIR proving protocol.
     ///
     /// Performs multi-round sumcheck-based polynomial folding,
@@ -219,11 +271,145 @@ where
             initial_ood_answers,
             challenger,
             num_claims,
-            prover_data,
+            RoundData::Base(prover_data),
             num_opening_claims,
-            |initial_sumcheck, challenger| {
-                layout.into_sumcheck(initial_sumcheck, starting_folding_pow_bits, challenger)
+            |initial_sumcheck, challenger, _| {
+                let (prover, point) =
+                    layout.into_sumcheck(initial_sumcheck, starting_folding_pow_bits, challenger);
+                (Residual::Host(prover), point)
             },
+            None,
+        )
+    }
+
+    /// Execute the WHIR protocol on a batch of committed polynomials.
+    ///
+    /// The layout holds the batched polynomial `sum_i c_i f_i` and its claims.
+    /// The first round's queries open every commitment at the same positions,
+    /// and the verifier combines the rows by the same coefficients, so the
+    /// batch costs one path per commitment in that round and nothing after.
+    ///
+    /// # Arguments
+    ///
+    /// - `initial_ood_answers`: answers at the commitment phase's out-of-domain points.
+    /// - `challenger`: the sponge the whole proof shares, borrowed for this run.
+    /// - `layout`: the batched polynomial's layout, holding the claims to batch.
+    /// - `prover_data`: Merkle prover data behind each initial commitment.
+    /// - `coefficients`: the coefficient each commitment's polynomial enters with.
+    /// - `num_opening_claims`: opening claims the caller bound before this run.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless there is one coefficient per commitment.
+    #[instrument(skip_all)]
+    pub fn prove_batched(
+        &self,
+        initial_ood_answers: Vec<EF>,
+        challenger: &mut Challenger,
+        layout: L,
+        prover_data: Vec<Arc<MT::ProverData<DenseMatrix<F>>>>,
+        coefficients: Vec<F>,
+        num_opening_claims: usize,
+    ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        assert_eq!(
+            prover_data.len(),
+            coefficients.len(),
+            "one coefficient per commitment"
+        );
+        assert_eq!(self.round_folding_factor(0), layout.folding());
+        let num_claims = layout.num_claims();
+        let starting_folding_pow_bits = self.starting_folding_pow_bits;
+        self.prove_from(
+            initial_ood_answers,
+            challenger,
+            num_claims,
+            RoundData::Batched(prover_data, coefficients),
+            num_opening_claims,
+            |initial_sumcheck, challenger, _| {
+                let (prover, point) =
+                    layout.into_sumcheck(initial_sumcheck, starting_folding_pow_bits, challenger);
+                (Residual::Host(prover), point)
+            },
+            None,
+        )
+    }
+
+    /// [`Self::prove_batched`] over a pair `device` holds, `first + gamma * second`, the first
+    /// commitment kept on the device and `second` in host memory, with the claims already
+    /// recorded elsewhere: `initial` plays the initial fold over the `num_claims` concrete
+    /// claims on `device`, as [`Layout::into_sumcheck`] plays it, and returns the residual's
+    /// claimed sum and the challenges it drew.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prove_pair_on<'d>(
+        &self,
+        initial_ood_answers: Vec<EF>,
+        challenger: &mut Challenger,
+        num_claims: usize,
+        initial: impl FnOnce(
+            &mut SumcheckData<F, EF>,
+            &mut Challenger,
+            &mut Device<'d, F, EF, MT>,
+        ) -> (EF, Point<EF>),
+        device: &mut Device<'d, F, EF, MT>,
+        second: Arc<MT::ProverData<DenseMatrix<F>>>,
+        gamma: F,
+        num_opening_claims: usize,
+    ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        let num_variables = self.num_variables - self.round_folding_factor(0);
+        self.prove_from(
+            initial_ood_answers,
+            challenger,
+            num_claims,
+            RoundData::Pair(second, gamma),
+            num_opening_claims,
+            |sumcheck, challenger, device| {
+                let (sum, point) = initial(sumcheck, challenger, held(device));
+                (Residual::Device { sum, num_variables }, point)
+            },
+            Some(device),
+        )
+    }
+
+    /// The WHIR run over a lone commitment's polynomial held on `device`: `initial` plays the
+    /// claims' batching and preprocessing rounds there, and every round after stays there; the
+    /// first round's queries open `first`, the commitment's own prover data, or the codeword
+    /// the device kept when there is none.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prove_single_on<'d>(
+        &self,
+        initial_ood_answers: Vec<EF>,
+        challenger: &mut Challenger,
+        num_claims: usize,
+        initial: impl FnOnce(
+            &mut SumcheckData<F, EF>,
+            &mut Challenger,
+            &mut Device<'d, F, EF, MT>,
+        ) -> (EF, Point<EF>),
+        device: &mut Device<'d, F, EF, MT>,
+        first: Option<Arc<MT::ProverData<DenseMatrix<F>>>>,
+        num_opening_claims: usize,
+    ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        let num_variables = self.num_variables - self.round_folding_factor(0);
+        self.prove_from(
+            initial_ood_answers,
+            challenger,
+            num_claims,
+            first.map_or(RoundData::First, RoundData::Base),
+            num_opening_claims,
+            |sumcheck, challenger, device| {
+                let (sum, point) = initial(sumcheck, challenger, held(device));
+                (Residual::Device { sum, num_variables }, point)
+            },
+            Some(device),
         )
     }
 
@@ -234,20 +420,26 @@ where
     /// - `initial_ood_answers`: answers at the commitment phase's out-of-domain points.
     /// - `challenger`: the sponge the whole proof shares, borrowed for this run.
     /// - `num_claims`: claims the initial fold batches, out-of-domain ones excluded.
-    /// - `prover_data`: Merkle prover data behind the initial commitment.
+    /// - `round_data`: Merkle prover data behind the initial commitment or commitments.
     /// - `num_opening_claims`: opening claims the caller bound before this run.
-    /// - `initial_fold`: plays the initial fold inside its delegation bracket.
-    fn prove_from(
+    /// - `initial_fold`: plays the initial fold inside its delegation bracket, returning the
+    ///   residual and the challenges it drew.
+    /// - `device`: the device a residual on it stays on, every round committing, evaluating
+    ///   and folding it there.
+    #[allow(clippy::too_many_arguments)]
+    fn prove_from<'d>(
         &self,
         initial_ood_answers: Vec<EF>,
         challenger: &mut Challenger,
         num_claims: usize,
-        prover_data: Arc<MT::ProverData<DenseMatrix<F>>>,
+        round_data: WhirRoundData<EF, F, MT>,
         num_opening_claims: usize,
         initial_fold: impl FnOnce(
             &mut SumcheckData<F, EF>,
             &mut Challenger,
-        ) -> (SumcheckProver<F, EF>, Point<EF>),
+            &mut Option<&mut Device<'d, F, EF, MT>>,
+        ) -> (Residual<F, EF>, Point<EF>),
+        mut device: Option<&mut Device<'d, F, EF, MT>>,
     ) -> Result<WhirProof<F, EF, MT>, WhirConfigError>
     where
         Challenger: CanObserve<MT::Commitment>,
@@ -265,13 +457,15 @@ where
 
         // The delegate draws the claim-batching challenge, then plays its own rounds.
         let mut initial_sumcheck = SumcheckData::default();
-        let (sumcheck_prover, folding_randomness) = transcript
-            .delegate_initial_fold(|challenger| initial_fold(&mut initial_sumcheck, challenger));
+        let (sumcheck_prover, folding_randomness) =
+            transcript.delegate_initial_fold(|challenger| {
+                initial_fold(&mut initial_sumcheck, challenger, &mut device)
+            });
 
         let mut round_state = RoundState {
             sumcheck_prover,
             folding_randomness,
-            round_data: RoundData::Base(prover_data),
+            round_data,
         };
 
         // Build one round proof per intermediate folding round.
@@ -282,12 +476,17 @@ where
                 &mut transcript,
                 &mut round_state,
                 variable_order,
+                &mut device,
             ));
         }
 
         // Final round: send the polynomial in the clear, open the last queries.
-        let (final_poly, final_pow_witness, final_openings, final_sumcheck) =
-            self.final_round(self.n_rounds(), &mut transcript, &mut round_state);
+        let (final_poly, final_pow_witness, final_openings, final_sumcheck) = self.final_round(
+            self.n_rounds(),
+            &mut transcript,
+            &mut round_state,
+            &mut device,
+        );
 
         // Require that every described step was played.
         transcript.finish();
@@ -305,12 +504,13 @@ where
 
     #[instrument(skip_all, level = "debug", fields(round_number = round_index, log_size = self.num_variables - self.total_folded_through(round_index)))]
     #[allow(clippy::too_many_lines)]
-    fn round(
+    fn round<'d>(
         &self,
         round_index: usize,
         transcript: &mut WhirProverTranscript<'_, Challenger, F, EF>,
         round_state: &mut WhirRoundState<EF, F, MT>,
         variable_order: VariableOrder,
+        device: &mut Option<&mut Device<'d, F, EF, MT>>,
     ) -> WhirRoundProof<F, EF, MT>
     where
         Challenger: CanObserve<MT::Commitment>,
@@ -323,14 +523,25 @@ where
         let log_inv_rate = round_params.log_inv_rate;
 
         // Commit straight from the live sumcheck buffer; no scalar copy is materialized.
-        let (root, prover_data) = commit_extension(
-            variable_order,
-            &self.dft,
-            &self.extension_mmcs,
-            round_state.sumcheck_prover.evals_view(),
-            folding_factor_next,
-            log_inv_rate,
-        );
+        // A residual on the device is committed there, its codeword and tree kept for the
+        // next round's queries.
+        let (root, prover_data) = match &mut round_state.sumcheck_prover {
+            Residual::Host(prover) => {
+                let (root, data) = commit_extension(
+                    variable_order,
+                    &self.dft,
+                    &self.extension_mmcs,
+                    prover.evals_view(),
+                    folding_factor_next,
+                    log_inv_rate,
+                );
+                (root, RoundData::Ext(data))
+            }
+            Residual::Device { .. } => {
+                let (root, handle) = held(device).commit(folding_factor_next, log_inv_rate);
+                (root, RoundData::Resident(handle))
+            }
+        };
 
         // Observe the round commitment.
         transcript.commitment(root.clone());
@@ -339,14 +550,19 @@ where
         // OOD sampling.
         let mut ood_statement = EqStatement::initialize(num_variables);
         let mut ood_answers = Vec::with_capacity(round_params.ood_samples);
-        (0..round_params.ood_samples).for_each(|_| {
+        let mut ood_points = Vec::with_capacity(round_params.ood_samples);
+        for _ in 0..round_params.ood_samples {
             let point = Point::expand_from_univariate(transcript.ood_point(), num_variables);
-            let eval = round_state.sumcheck_prover.eval(&point);
+            let eval = match &mut round_state.sumcheck_prover {
+                Residual::Host(prover) => prover.eval(&point),
+                Residual::Device { .. } => held(device).stacked().eval(&point),
+            };
             transcript.ood_answer(eval);
 
             ood_answers.push(eval);
+            ood_points.push(point.clone());
             ood_statement.add_evaluated_constraint(point, eval);
-        });
+        }
 
         // PoW grinding: prevents query manipulation by forcing work after committing.
         let pow_witness = transcript.query_pow(round_index);
@@ -355,6 +571,7 @@ where
         let stir_challenges_indexes = transcript.query_indices(round_index);
 
         let mut stir_statement = SelectStatement::initialize(num_variables);
+        let mut stir_points = Vec::with_capacity(stir_challenges_indexes.len());
         let query_randomness = match variable_order {
             VariableOrder::Prefix => round_state.folding_randomness.clone(),
             VariableOrder::Suffix => round_state.folding_randomness.reversed(),
@@ -362,7 +579,32 @@ where
 
         // Open all queried positions in one multiproof.
         // Each row folds in place; the same allocation then travels into the proof.
-        let openings = match &round_state.round_data {
+        // A resident commitment hands over the rows and digests the queries read.
+        let fetch_span = tracing::info_span!("query fetch").entered();
+        let fetched;
+        let round_data = match &round_state.round_data {
+            RoundData::Resident(handle) => {
+                fetched = RoundData::Ext(held(device).tree(*handle, &stir_challenges_indexes));
+                &fetched
+            }
+            RoundData::Pair(second, gamma) => {
+                let first = held(device).first_tree(&stir_challenges_indexes);
+                fetched = RoundData::Batched(
+                    vec![Arc::new(first), Arc::clone(second)],
+                    vec![F::ONE, *gamma],
+                );
+                &fetched
+            }
+            RoundData::First => {
+                fetched =
+                    RoundData::Base(Arc::new(held(device).first_tree(&stir_challenges_indexes)));
+                &fetched
+            }
+            data => data,
+        };
+        drop(fetch_span);
+        let open_span = tracing::info_span!("query openings").entered();
+        let openings = match round_data {
             RoundData::Base(data) => {
                 let mut opening =
                     SharedProofOpening::open(&self.mmcs, &stir_challenges_indexes, data);
@@ -375,15 +617,44 @@ where
                         challenge,
                     ) {
                         WhirQueryPoint::Univariate(var) => {
+                            stir_points.push(Point::expand_from_univariate(var, num_variables));
                             stir_statement.add_constraint(var, eval);
                         }
                         WhirQueryPoint::Multilinear(point) => {
+                            stir_points.push(point.clone());
                             stir_statement.add_point_constraint(point, eval);
                         }
                     }
                     *row = poly.into_evals();
                 }
                 QueryOpenings::Base(opening)
+            }
+            RoundData::Batched(datas, coefficients) => {
+                let openings: Vec<_> = datas
+                    .iter()
+                    .map(|data| {
+                        SharedProofOpening::open(&self.mmcs, &stir_challenges_indexes, data)
+                    })
+                    .collect();
+                for (query, &challenge) in stir_challenges_indexes.iter().enumerate() {
+                    let row = combined_row(&openings, coefficients, query);
+                    let eval = Poly::new(row).eval_base(&query_randomness);
+                    match self.dft.query_point(
+                        round_params.log_folded_domain_size,
+                        round_params.num_variables,
+                        challenge,
+                    ) {
+                        WhirQueryPoint::Univariate(var) => {
+                            stir_points.push(Point::expand_from_univariate(var, num_variables));
+                            stir_statement.add_constraint(var, eval);
+                        }
+                        WhirQueryPoint::Multilinear(point) => {
+                            stir_points.push(point.clone());
+                            stir_statement.add_point_constraint(point, eval);
+                        }
+                    }
+                }
+                QueryOpenings::Batched(openings)
             }
             RoundData::Ext(data) => {
                 let mut opening =
@@ -397,9 +668,11 @@ where
                         challenge,
                     ) {
                         WhirQueryPoint::Univariate(var) => {
+                            stir_points.push(Point::expand_from_univariate(var, num_variables));
                             stir_statement.add_constraint(var, eval);
                         }
                         WhirQueryPoint::Multilinear(point) => {
+                            stir_points.push(point.clone());
                             stir_statement.add_point_constraint(point, eval);
                         }
                     }
@@ -407,7 +680,11 @@ where
                 }
                 QueryOpenings::Extension(opening)
             }
+            RoundData::Resident(_) | RoundData::Pair(..) | RoundData::First => {
+                unreachable!("a resident commitment is fetched above")
+            }
         };
+        drop(open_span);
 
         // Batch the two statement groups into one constraint over the same cube.
         // The out-of-domain claims form the equality group.
@@ -426,19 +703,41 @@ where
 
         // Run sumcheck and fold the polynomial, under this round's delegation bracket.
         let mut sumcheck_data: SumcheckData<F, EF> = SumcheckData::default();
-        let folding_randomness = transcript.delegate_round_fold(|challenger| {
-            round_state.sumcheck_prover.compute_sumcheck_polynomials(
-                &mut sumcheck_data,
-                challenger,
-                folding_factor_next,
-                round_params.folding_pow_bits,
-                Some(constraint),
-            )
-        });
+        let folding_randomness = match &mut round_state.sumcheck_prover {
+            Residual::Host(prover) => transcript.delegate_round_fold(|challenger| {
+                prover.compute_sumcheck_polynomials(
+                    &mut sumcheck_data,
+                    challenger,
+                    folding_factor_next,
+                    round_params.folding_pow_bits,
+                    Some(constraint),
+                )
+            }),
+            Residual::Device { sum, num_variables } => {
+                // The device adds the batched weights; the claim gains their values.
+                constraint.combine_evals(sum);
+                let mut powers = constraint.challenge_powers(0);
+                let eq: Vec<_> = ood_points.into_iter().zip(&mut powers).collect();
+                let select: Vec<_> = stir_points.into_iter().zip(&mut powers).collect();
+                let device = held(device);
+                device.constrain(&eq, &select);
+                *num_variables -= folding_factor_next;
+                transcript.delegate_round_fold(|challenger| {
+                    fold_rounds(
+                        device.stacked(),
+                        sum,
+                        &mut sumcheck_data,
+                        challenger,
+                        folding_factor_next,
+                        round_params.folding_pow_bits,
+                    )
+                })
+            }
+        };
 
         // Update round state for next iteration.
         round_state.folding_randomness = folding_randomness;
-        round_state.round_data = RoundData::Ext(prover_data);
+        round_state.round_data = prover_data;
 
         WhirRoundProof {
             commitment,
@@ -451,11 +750,12 @@ where
 
     #[instrument(skip_all)]
     #[allow(clippy::type_complexity)]
-    fn final_round(
+    fn final_round<'d>(
         &self,
         round_index: usize,
         transcript: &mut WhirProverTranscript<'_, Challenger, F, EF>,
         round_state: &mut WhirRoundState<EF, F, MT>,
+        device: &mut Option<&mut Device<'d, F, EF, MT>>,
     ) -> (
         Option<Poly<EF>>,
         F,
@@ -463,14 +763,18 @@ where
         Option<SumcheckData<F, EF>>,
     ) {
         let num_variables = self.num_variables - self.total_folded_through(round_index);
-        assert_eq!(
-            num_variables,
-            round_state.sumcheck_prover.evals().num_variables()
-        );
+        assert_eq!(num_variables, round_state.sumcheck_prover.num_variables());
+
+        // The final polynomial and its rounds are small: a residual on the device comes home.
+        if let Residual::Device { sum, .. } = round_state.sumcheck_prover {
+            round_state.sumcheck_prover =
+                Residual::Host(residual_prover(held(device).stacked(), sum));
+        }
+        let prover = round_state.sumcheck_prover.host();
 
         // Send final polynomial coefficients in the clear.
         // Unpack once; the transcript and the returned proof share the same copy.
-        let final_poly = round_state.sumcheck_prover.evals();
+        let final_poly = prover.evals();
         transcript.final_poly(final_poly.as_slice());
         let final_poly = Some(final_poly);
 
@@ -481,18 +785,54 @@ where
         let final_challenge_indexes = transcript.query_indices(round_index);
 
         // Open all queried positions in one multiproof.
-        let final_openings = match &round_state.round_data {
+        let fetch_span = tracing::info_span!("query fetch").entered();
+        let fetched;
+        let round_data = match &round_state.round_data {
+            RoundData::Resident(handle) => {
+                fetched = RoundData::Ext(held(device).tree(*handle, &final_challenge_indexes));
+                &fetched
+            }
+            RoundData::Pair(second, gamma) => {
+                let first = held(device).first_tree(&final_challenge_indexes);
+                fetched = RoundData::Batched(
+                    vec![Arc::new(first), Arc::clone(second)],
+                    vec![F::ONE, *gamma],
+                );
+                &fetched
+            }
+            RoundData::First => {
+                fetched =
+                    RoundData::Base(Arc::new(held(device).first_tree(&final_challenge_indexes)));
+                &fetched
+            }
+            data => data,
+        };
+        drop(fetch_span);
+        let open_span = tracing::info_span!("query openings").entered();
+        let final_openings = match round_data {
             RoundData::Base(data) => QueryOpenings::Base(SharedProofOpening::open(
                 &self.mmcs,
                 &final_challenge_indexes,
                 data,
             )),
+            RoundData::Batched(datas, _) => QueryOpenings::Batched(
+                datas
+                    .iter()
+                    .map(|data| {
+                        SharedProofOpening::open(&self.mmcs, &final_challenge_indexes, data)
+                    })
+                    .collect(),
+            ),
             RoundData::Ext(data) => QueryOpenings::Extension(SharedProofOpening::open(
                 &self.extension_mmcs,
                 &final_challenge_indexes,
                 data,
             )),
+            RoundData::Resident(_) | RoundData::Pair(..) | RoundData::First => {
+                unreachable!("a resident commitment is fetched above")
+            }
         };
+        drop(open_span);
 
         // Optional final sumcheck, under its own delegation bracket.
         //
@@ -500,7 +840,7 @@ where
         let final_sumcheck = transcript.delegate_final_fold(|challenger| {
             let mut sumcheck_data: SumcheckData<F, EF> = SumcheckData::default();
             // The prover holds the folded state, so the returned point is redundant here.
-            let _ = round_state.sumcheck_prover.compute_sumcheck_polynomials(
+            let _ = prover.compute_sumcheck_polynomials(
                 &mut sumcheck_data,
                 challenger,
                 self.final_sumcheck_rounds,
@@ -559,11 +899,18 @@ where
             initial_ood_answers,
             challenger,
             num_claims,
-            prover_data.merkle_data,
+            RoundData::Base(prover_data.merkle_data),
             0,
-            |initial_sumcheck, challenger| {
-                layout.into_sumcheck_with_weight(weight, initial_sumcheck, pow_bits, challenger)
+            |initial_sumcheck, challenger, _| {
+                let (prover, point) = layout.into_sumcheck_with_weight(
+                    weight,
+                    initial_sumcheck,
+                    pow_bits,
+                    challenger,
+                );
+                (Residual::Host(prover), point)
             },
+            None,
         )
     }
 

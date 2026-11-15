@@ -13,6 +13,7 @@
 //! That is why both forms reach the same transcript and the same proof.
 
 use p3_word::{Composition, ConstraintSystem, Segment, ShapeError, Word};
+use serde::{Deserialize, Serialize};
 
 use crate::{CompiledKeyLayout, KeyCompileError};
 
@@ -93,7 +94,8 @@ impl<W: Word> StatementShape<W> for Statement<W> {
 }
 
 /// The relations a key proves, in either of the two equivalent forms.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub enum Statement<W: Word> {
     /// Every relation written out once.
     Flat(ConstraintSystem<W>),

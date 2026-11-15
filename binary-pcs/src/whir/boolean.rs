@@ -40,22 +40,32 @@ use p3_matrix::dense::RowMajorMatrix;
 use p3_multilinear_util::point::Point;
 use p3_multilinear_util::poly::Poly;
 use p3_security::multilinear::{bit_ring_switch_claim_batching_term, bit_ring_switch_tensors_term};
+use p3_security::{ErrorBits, SecurityTerm};
+use p3_sumcheck::commit::{CodewordCommitter, DynCommitter};
 use p3_sumcheck::layout::{Layout, SuffixProver, Table};
 use p3_sumcheck::ring_switch::bits::{
-    BitPacking, BitPackingView, BitRingSwitch, BitRingSwitchClaims, SuffixTensors,
+    BitPacking, BitPackingView, BitRingSwitch, BitRingSwitchClaims, BitRingSwitchClaimsProof,
+    PackingRoundsDevice, SuffixTensors, TraceReduction,
 };
 use p3_sumcheck::{
     OpeningBatch, OpeningProtocol, PrescribedOpeningSecurity, PrescribedPointPcs, TableShape,
     TableSpec,
 };
-use p3_whir::{InitialWeightCheck, WhirDomain, WhirProver, WhirProverData};
+use p3_whir::{
+    InitialWeightCheck, PairDevices, PcsProof, SingleDevices, WhirDomain, WhirProver,
+    WhirProverData, pair_batching_error,
+};
 
-use crate::boolean::{BitOpening, BitReadings, BooleanBackend, BooleanMultilinearPcs};
+use crate::boolean::{
+    BitOpening, BitReadings, BooleanBackend, BooleanMultilinearPcs, PairReadings, ReadingsCheck,
+};
 use crate::boolean_trace::BooleanTraceCommitment;
 use crate::fold::BitChallengeField;
 use crate::packing::{Coordinates, PackedStack, PackedWords, hypercube_variables};
 use crate::whir::error::BooleanWhirError;
-use crate::whir::proof::{BooleanWhirDeferredProof, BooleanWhirProof};
+use crate::whir::proof::{
+    BooleanWhirDeferredProof, BooleanWhirOpening, BooleanWhirProof, BooleanWhirTraceProof,
+};
 use crate::whir::shape::{ProofShape, ProofShapeError};
 
 /// One claim weighing the absorbed bit patterns itself: `sum_v low_weights[v] * t(high, v)`.
@@ -100,6 +110,9 @@ impl<EF: Field> WeightedOpening<EF> {
 /// The value of every weighted opening, in order, and the one proof that opens them all.
 type WeightedOpened<F, EF, MT> = (Vec<EF>, BooleanWhirProof<F, EF, MT>);
 
+/// The current reading of every opening, in order, and the one trace proof that opens them all.
+type TraceOpened<F, EF, MT> = (Vec<BitReadings<EF>>, BooleanWhirTraceProof<F, EF, MT>);
+
 /// A weighted opening and the value the verifier holds for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WeightedClaim<EF> {
@@ -108,6 +121,9 @@ pub struct WeightedClaim<EF> {
     /// The claimed value.
     pub value: EF,
 }
+
+/// Label of the error a pair opening's batching draw charges.
+pub const PAIR_BATCHING_LABEL: &str = "pair-batching";
 
 /// The binding mode the committed layout uses.
 ///
@@ -151,6 +167,96 @@ where
     Dft: WhirDomain<F, EF>,
     MT: Mmcs<F>,
 {
+    /// The proximity argument underneath.
+    pub const fn inner(&self) -> &BooleanWhirProver<F, EF, Dft, MT, Challenger> {
+        &self.inner
+    }
+
+    /// [`BooleanBackend::commit_packed`] through `committer`, which encodes and commits the
+    /// packed bits wherever it keeps the codeword.
+    ///
+    /// # Errors
+    /// As [`BooleanBackend::commit_packed`].
+    pub fn commit_packed_with<K>(
+        &self,
+        committer: &K,
+        packed: PackedWords<F>,
+        challenger: &mut Challenger,
+    ) -> Result<(MT::Commitment, BooleanWhirData<F, EF, MT>), BooleanWhirError>
+    where
+        K: CodewordCommitter<F, MT>,
+        Challenger: FieldChallenger<F>
+            + GrindingChallenger<Witness = F>
+            + CanSampleUniformBits<F>
+            + CanObserve<MT::Commitment>,
+    {
+        self.commit_elements_with(committer, packed.into_elements(), challenger)
+    }
+
+    /// The commitment [`Self::commit_packed_with`] makes to the `words` 64-bit words
+    /// `committer` holds, every word past them zero, none of them on the host.
+    ///
+    /// # Errors
+    ///
+    /// When the words outrun the witness.
+    pub fn commit_held_with<K>(
+        &self,
+        committer: &K,
+        words: usize,
+        challenger: &mut Challenger,
+    ) -> Result<(MT::Commitment, BooleanWhirData<F, EF, MT>), BooleanWhirError>
+    where
+        K: CodewordCommitter<F, MT>,
+        Challenger: FieldChallenger<F>
+            + GrindingChallenger<Witness = F>
+            + CanSampleUniformBits<F>
+            + CanObserve<MT::Commitment>,
+    {
+        let num_variables = self.inner.num_variables();
+        let elements = (words * size_of::<u64>()).div_ceil(size_of::<F>());
+        if elements > 1 << num_variables {
+            return Err(BooleanWhirError::WitnessArity {
+                expected: num_variables,
+                actual: elements.next_power_of_two().trailing_zeros() as usize,
+            });
+        }
+        let folding = self.inner.round_folding_factor(0);
+        let witness = Binding::<F, EF>::new_witness(vec![Table::held(num_variables)], folding);
+        self.inner
+            .commit_with(committer, witness, challenger)
+            .map_err(BooleanWhirError::Commit)
+    }
+
+    /// [`Self::commit_packed_with`] over the elements the packing holds.
+    fn commit_elements_with<K>(
+        &self,
+        committer: &K,
+        elements: Vec<F>,
+        challenger: &mut Challenger,
+    ) -> Result<(MT::Commitment, BooleanWhirData<F, EF, MT>), BooleanWhirError>
+    where
+        K: CodewordCommitter<F, MT>,
+        Challenger: FieldChallenger<F>
+            + GrindingChallenger<Witness = F>
+            + CanSampleUniformBits<F>
+            + CanObserve<MT::Commitment>,
+    {
+        let actual = hypercube_variables(elements.len()).map_err(BooleanWhirError::Packing)?;
+        if actual != self.inner.num_variables() {
+            return Err(BooleanWhirError::WitnessArity {
+                expected: self.inner.num_variables(),
+                actual,
+            });
+        }
+        let len = elements.len();
+        let table = Table::new(RowMajorMatrix::new(elements, len));
+        let folding = self.inner.round_folding_factor(0);
+        let witness = Binding::<F, EF>::new_witness(vec![table], folding);
+        self.inner
+            .commit_with(committer, witness, challenger)
+            .map_err(BooleanWhirError::Commit)
+    }
+
     /// Wrap a proximity argument as a commitment to a bit witness of this many variables.
     ///
     /// # Errors
@@ -333,23 +439,14 @@ where
         // Every claim of a batch survives as one claim, at one point.
         let protocol = self.protocol(num_claims.min(1));
         let mut security = self.inner.prescribed_security(&protocol)?;
-        // The tensor alone, or the tensor with carry and last.
-        let num_tensors = if successor_tensors { 3 } else { 1 };
         // The batch runs before one candidate is named, so it pays for all of them.
         //
         // The charge leaves the count alone, so the caller above still sees the same list.
         //
         // It then charges its own draws over that list.
-        security.charge_reduction(bit_ring_switch_tensors_term(
-            num_claims.min(1),
-            num_tensors,
-            BitRingSwitch::<F, EF>::BATCHED,
-            self.inner.num_variables(),
-            EF::bits(),
-        ));
-        // A single claim draws no lambda, so its report carries no batching term.
-        if num_claims > 1 {
-            security.charge_reduction(bit_ring_switch_claim_batching_term(num_claims, EF::bits()));
+        for term in Self::reduction_terms(self.inner.num_variables(), num_claims, successor_tensors)
+        {
+            security.charge_reduction(term);
         }
         Some(security)
     }
@@ -398,31 +495,31 @@ where
             .map_err(BooleanWhirError::Commit)
     }
 
-    /// Open the bit witness with the readings every opening asks for, in one proof.
-    ///
-    /// No point needs prior transcript binding: each reduction binds its own.
+    /// Run one batched ring switch over every opening, leaving one claim about the packing.
     ///
     /// # Returns
     ///
-    /// One set of readings per opening, in the order the openings were supplied.
-    ///
-    /// # Errors
-    ///
-    /// Before the transcript moves, an opening that names the wrong variables.
-    ///
-    /// An opening asking for no reading, or stepping within more rows than the witness has.
+    /// The readings, the reduction's proof, and the surviving point.
     #[allow(clippy::type_complexity)]
-    pub fn open_readings(
+    fn switch(
         &self,
-        prover_data: BooleanWhirData<F, EF, MT>,
+        prover_data: &BooleanWhirData<F, EF, MT>,
         openings: &[BitOpening<EF>],
+        device: Option<&dyn PackingRoundsDevice>,
         challenger: &mut Challenger,
-    ) -> Result<(Vec<BitReadings<EF>>, BooleanWhirProof<F, EF, MT>), BooleanWhirError> {
+    ) -> Result<
+        (
+            Vec<BitReadings<EF>>,
+            BitRingSwitchClaimsProof<F, EF>,
+            Point<EF>,
+        ),
+        BooleanWhirError,
+    > {
         self.check_openings(openings)?;
         // Every reduction is set up before any runs, so a refused one leaves the transcript alone.
         let claims = Self::claims(openings)?;
-        let proof = self.open_claims(prover_data, &claims, challenger)?;
-        let reduction = &proof.reduction;
+        let (reduction, surviving_point) =
+            Self::switch_claims(prover_data, &claims, device, challenger);
 
         // The elements each claim sends already hold its readings.
         let readings = openings
@@ -441,7 +538,30 @@ where
                 Ok(BitReadings { current, next })
             })
             .collect::<Result<Vec<_>, BooleanWhirError>>()?;
-        Ok((readings, proof))
+        Ok((readings, reduction, surviving_point))
+    }
+
+    /// One batched ring switch over a batch of claims, leaving one claim about the packing.
+    fn switch_claims(
+        prover_data: &BooleanWhirData<F, EF, MT>,
+        claims: &BitRingSwitchClaims<F, EF>,
+        device: Option<&dyn PackingRoundsDevice>,
+        challenger: &mut Challenger,
+    ) -> (BitRingSwitchClaimsProof<F, EF>, Point<EF>) {
+        if prover_data.table(0).is_held() {
+            let device = device.expect("a held message opens on the device that holds it");
+            let (reduction, surviving_point, _) = tracing::info_span!("bit ring switch")
+                .in_scope(|| claims.prove_held(device, challenger));
+            return (reduction, surviving_point);
+        }
+        let packing = Self::packing(prover_data);
+        let (reduction, surviving_point, _) =
+            tracing::info_span!("bit ring switch").in_scope(|| {
+                claims.prove_on::<<EF as BitChallengeField<F>>::SumcheckRepr, _, _>(
+                    &packing, device, challenger,
+                )
+            });
+        (reduction, surviving_point)
     }
 
     /// Reduce a batch of claims to one about the packing, then open WHIR at its point.
@@ -451,14 +571,9 @@ where
         claims: &BitRingSwitchClaims<F, EF>,
         challenger: &mut Challenger,
     ) -> Result<BooleanWhirProof<F, EF, MT>, BooleanWhirError> {
-        let packing = Self::packing(&prover_data);
-
         // One batch for every opening, leaving one claim about the packing.
-        let (reduction, surviving_point, _) =
-            tracing::info_span!("bit ring switch").in_scope(|| {
-                claims
-                    .prove::<<EF as BitChallengeField<F>>::SumcheckRepr, _, _>(&packing, challenger)
-            });
+        let (reduction, surviving_point) =
+            Self::switch_claims(&prover_data, claims, None, challenger);
 
         // The surviving value crosses the wire twice, and the closing check is that the two agree.
         // The surviving point came out of the batch's rounds, so it is bound already.
@@ -471,7 +586,10 @@ where
                 challenger,
             )
             .map_err(BooleanWhirError::Commit)?;
-        Ok(BooleanWhirProof { reduction, opening })
+        Ok(BooleanWhirProof {
+            reduction,
+            opening: BooleanWhirOpening::Own(opening),
+        })
     }
 
     /// Open the bit witness at weighted claims, in one proof.
@@ -589,6 +707,121 @@ where
             .map_err(BooleanWhirError::Opening)
     }
 
+    /// Open the bit witness at every opening through the trace reduction, in one proof.
+    ///
+    /// The openings reduce to one weighted relation over the packing without a sumcheck, and
+    /// WHIR's first fold proves that relation beside its own claims.  Successor readings are
+    /// not answered this way yet.
+    ///
+    /// # Returns
+    ///
+    /// One current reading per opening, in the order supplied.
+    ///
+    /// # Errors
+    ///
+    /// Before the transcript moves, no opening, an opening of the wrong width, or one asking for
+    /// a successor reading.  After it, a refused proximity opening.
+    pub fn open_readings_trace(
+        &self,
+        prover_data: BooleanWhirData<F, EF, MT>,
+        openings: &[BitOpening<EF>],
+        challenger: &mut Challenger,
+    ) -> Result<TraceOpened<F, EF, MT>, BooleanWhirError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        let claims = self.trace_claims(openings)?;
+        let (readings, reduction, weight) = {
+            let packing = Self::packing(&prover_data);
+            let tensors =
+                tracing::info_span!("trace tensors").in_scope(|| claims.tensors(&packing));
+            let values = claims.values(&tensors);
+            let (reduction, weights) = tracing::info_span!("trace reduction")
+                .in_scope(|| claims.prove(&tensors, &values, challenger))
+                .map_err(BooleanWhirError::Trace)?;
+            let readings = values
+                .iter()
+                .map(|&value| BitReadings {
+                    current: Some(value),
+                    next: None,
+                })
+                .collect();
+            (readings, reduction, weights.initial_weight(&packing))
+        };
+        let opening = self
+            .inner
+            .open_with_initial_weight(prover_data, weight, challenger)
+            .map_err(BooleanWhirError::Commit)?;
+        Ok((readings, BooleanWhirTraceProof { reduction, opening }))
+    }
+
+    /// Check a trace proof against the current reading it claims at every opening.
+    ///
+    /// # Errors
+    ///
+    /// Before the transcript moves, a refused opening or a reading count that disagrees.
+    ///
+    /// After it, a false reading, a trace message of trace one, the commitment, or a first
+    /// fold that does not close.
+    pub fn verify_readings_trace(
+        &self,
+        commitment: &MT::Commitment,
+        openings: &[BitOpening<EF>],
+        readings: &[BitReadings<EF>],
+        proof: &BooleanWhirTraceProof<F, EF, MT>,
+        challenger: &mut Challenger,
+    ) -> Result<(), BooleanWhirError>
+    where
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        let claims = self.trace_claims(openings)?;
+        if readings.len() != openings.len() {
+            return Err(BooleanWhirError::ClaimCount {
+                expected: openings.len(),
+                values: readings.len(),
+                reductions: openings.len(),
+            });
+        }
+        let values = readings
+            .iter()
+            .enumerate()
+            .map(|(index, reading)| match (reading.current, reading.next) {
+                (Some(value), None) => Ok(value),
+                _ => Err(BooleanWhirError::ReadingShape { index }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let weights = claims
+            .verify(&values, &proof.reduction, challenger)
+            .map_err(BooleanWhirError::Trace)?;
+        let shapes = [TableShape::new(self.inner.num_variables(), 1)];
+        let weight_at = |point: &Point<EF>| weights.weight_at(point);
+        self.inner
+            .verify_with_initial_weight(
+                commitment,
+                &proof.opening,
+                &shapes,
+                InitialWeightCheck {
+                    sum: weights.sum(),
+                    eval: &weight_at,
+                },
+                challenger,
+            )
+            .map_err(BooleanWhirError::Opening)
+    }
+
+    /// Every opening's claim, gathered into one trace reduction.
+    fn trace_claims(
+        &self,
+        openings: &[BitOpening<EF>],
+    ) -> Result<TraceReduction<F, EF>, BooleanWhirError> {
+        self.check_openings(openings)?;
+        let reductions = openings
+            .iter()
+            .map(Self::reduction)
+            .collect::<Result<Vec<_>, _>>()?;
+        TraceReduction::new(reductions).map_err(BooleanWhirError::Trace)
+    }
+
     /// Check one proof against every weighted claim.
     ///
     /// # Errors
@@ -646,23 +879,18 @@ where
         BitRingSwitchClaims::new(reductions).map_err(BooleanWhirError::Reduction)
     }
 
-    /// Check one proof against the readings it claims at every opening.
+    /// Replay one batched ring switch against the readings a proof claims.
     ///
-    /// The commitment's binding is the caller's, replayed before this is reached.
+    /// # Returns
     ///
-    /// # Errors
-    ///
-    /// Before the transcript moves, a refused opening or a reading count that disagrees.
-    ///
-    /// After it, a false reading, a failed reduction, the commitment, or an unclosed claim.
-    pub fn verify_readings(
+    /// The surviving point, and the value the packing must hold there.
+    fn check_switch(
         &self,
-        commitment: &MT::Commitment,
         openings: &[BitOpening<EF>],
         readings: &[BitReadings<EF>],
         proof: &BooleanWhirProof<F, EF, MT>,
         challenger: &mut Challenger,
-    ) -> Result<(), BooleanWhirError> {
+    ) -> Result<(Point<EF>, EF), BooleanWhirError> {
         self.check_openings(openings)?;
         if readings.len() != openings.len() || proof.reduction.claims.len() != openings.len() {
             return Err(BooleanWhirError::ClaimCount {
@@ -687,7 +915,9 @@ where
             .iter()
             .map(|reading| (reading.current, reading.next))
             .collect::<Vec<_>>();
-        self.verify_claims(commitment, &claims, &readings, proof, challenger)
+        claims
+            .verify_readings(&proof.reduction, &readings, challenger)
+            .map_err(BooleanWhirError::ReductionProof)
     }
 
     /// Replay a batch of claims, then the WHIR opening at the point it leaves.
@@ -699,17 +929,146 @@ where
         proof: &BooleanWhirProof<F, EF, MT>,
         challenger: &mut Challenger,
     ) -> Result<(), BooleanWhirError> {
+        let BooleanWhirOpening::Own(opening) = &proof.opening else {
+            return Err(BooleanWhirError::OpeningKind);
+        };
         // The batch turns every reading about the bits into one claim about the packing.
         let (surviving_point, surviving_value) = claims
             .verify_readings(&proof.reduction, readings, challenger)
             .map_err(BooleanWhirError::ReductionProof)?;
+        self.close_own(
+            commitment,
+            opening,
+            surviving_point,
+            surviving_value,
+            challenger,
+        )
+    }
 
+    /// Open the bit witness with the readings every opening asks for, in one proof.
+    ///
+    /// No point needs prior transcript binding: each reduction binds its own.
+    ///
+    /// # Returns
+    ///
+    /// One set of readings per opening, in the order the openings were supplied.
+    ///
+    /// # Errors
+    ///
+    /// Before the transcript moves, an opening that names the wrong variables.
+    ///
+    /// An opening asking for no reading, or stepping within more rows than the witness has.
+    #[allow(clippy::type_complexity)]
+    pub fn open_readings(
+        &self,
+        prover_data: BooleanWhirData<F, EF, MT>,
+        openings: &[BitOpening<EF>],
+        challenger: &mut Challenger,
+    ) -> Result<(Vec<BitReadings<EF>>, BooleanWhirProof<F, EF, MT>), BooleanWhirError> {
+        self.open_readings_by(prover_data, openings, None, challenger)
+    }
+
+    /// [`Self::open_readings`] with the proximity opening on `device`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_readings`].
+    #[allow(clippy::type_complexity)]
+    pub fn open_readings_on(
+        &self,
+        prover_data: BooleanWhirData<F, EF, MT>,
+        openings: &[BitOpening<EF>],
+        device: &dyn SingleDevices<F, EF, MT>,
+        challenger: &mut Challenger,
+    ) -> Result<(Vec<BitReadings<EF>>, BooleanWhirProof<F, EF, MT>), BooleanWhirError> {
+        self.open_readings_by(prover_data, openings, Some(device), challenger)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn open_readings_by(
+        &self,
+        prover_data: BooleanWhirData<F, EF, MT>,
+        openings: &[BitOpening<EF>],
+        device: Option<&dyn SingleDevices<F, EF, MT>>,
+        challenger: &mut Challenger,
+    ) -> Result<(Vec<BitReadings<EF>>, BooleanWhirProof<F, EF, MT>), BooleanWhirError> {
+        let (readings, reduction, surviving_point) = self.switch(
+            &prover_data,
+            openings,
+            device.map(|d| d.packing_rounds()),
+            challenger,
+        )?;
+
+        // The surviving value crosses the wire twice, and the closing check is that the two agree.
+        // The surviving point came out of the batch's rounds, so it is bound already.
+        let protocol = self.protocol(1);
+        let points = [surviving_point];
+        let opening = match device {
+            Some(device) => {
+                self.inner
+                    .open_at_on(prover_data, &protocol, &points, device, challenger)
+            }
+            None => self
+                .inner
+                .open_at(prover_data, &protocol, &points, challenger),
+        }
+        .map_err(BooleanWhirError::Commit)?;
+
+        Ok((
+            readings,
+            BooleanWhirProof {
+                reduction,
+                opening: BooleanWhirOpening::Own(opening),
+            },
+        ))
+    }
+
+    /// Check one proof against the readings it claims at every opening.
+    ///
+    /// The commitment's binding is the caller's, replayed before this is reached.
+    ///
+    /// # Errors
+    ///
+    /// Before the transcript moves, a refused opening or a reading count that disagrees.
+    ///
+    /// After it, a false reading, a failed reduction, the commitment, or an unclosed claim.
+    pub fn verify_readings(
+        &self,
+        commitment: &MT::Commitment,
+        openings: &[BitOpening<EF>],
+        readings: &[BitReadings<EF>],
+        proof: &BooleanWhirProof<F, EF, MT>,
+        challenger: &mut Challenger,
+    ) -> Result<(), BooleanWhirError> {
+        let BooleanWhirOpening::Own(opening) = &proof.opening else {
+            return Err(BooleanWhirError::OpeningKind);
+        };
+        let (surviving_point, surviving_value) =
+            self.check_switch(openings, readings, proof, challenger)?;
+        self.close_own(
+            commitment,
+            opening,
+            surviving_point,
+            surviving_value,
+            challenger,
+        )
+    }
+
+    /// Close one surviving claim with this side's own proximity opening.
+    fn close_own(
+        &self,
+        commitment: &MT::Commitment,
+        opening: &PcsProof<F, EF, MT>,
+        surviving_point: Point<EF>,
+        surviving_value: EF,
+        challenger: &mut Challenger,
+    ) -> Result<(), BooleanWhirError> {
         // One proximity opening pins the one surviving point to the committed polynomial.
         let evals = self
             .inner
             .verify_at(
                 commitment,
-                &proof.opening,
+                opening,
                 &self.protocol(1),
                 &[surviving_point],
                 challenger,
@@ -721,6 +1080,235 @@ where
             [batch] if batch.current().first() == Some(&surviving_value) => Ok(()),
             _ => Err(BooleanWhirError::SurvivingClaim),
         }
+    }
+
+    /// Refuse a pair whose two commitments are not words of one code.
+    ///
+    /// The pair opening reads both trees under this commitment's schedule, so the second
+    /// must have been encoded exactly as this one encodes.
+    fn check_partner(&self, second: &Self) -> Result<(), BooleanWhirError> {
+        let (a, b) = (&self.inner, &second.inner);
+        if self.num_variables != second.num_variables
+            || a.num_variables() != b.num_variables()
+            || a.params().starting_log_inv_rate != b.params().starting_log_inv_rate
+            || a.round_folding_factor(0) != b.round_folding_factor(0)
+        {
+            return Err(BooleanWhirError::PairShape {
+                first: self.num_variables,
+                second: second.num_variables,
+            });
+        }
+        Ok(())
+    }
+
+    /// Open this witness and `second`'s, each with its own readings, under one proximity opening.
+    ///
+    /// ```text
+    ///     switch      first's openings  ->  one claim about f at z_f
+    ///     switch      second's openings ->  one claim about g at z_g
+    ///     pair        f + gamma g at z_f and z_g, one WHIR run, both trees opened once
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_readings`] for either side, and a partner of another code.
+    #[allow(clippy::type_complexity)]
+    pub fn open_readings_pair(
+        &self,
+        second: &Self,
+        first_side: (BooleanWhirData<F, EF, MT>, &[BitOpening<EF>]),
+        second_side: (&BooleanWhirData<F, EF, MT>, &[BitOpening<EF>]),
+        challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, BooleanWhirProof<F, EF, MT>>, BooleanWhirError> {
+        self.open_readings_pair_on(second, first_side, second_side, None, challenger)
+    }
+
+    /// [`Self::open_readings_pair`] with the pair's proximity opening on `device`, when given,
+    /// which holds the first side's packed message.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_readings_pair`].
+    #[allow(clippy::type_complexity)]
+    pub fn open_readings_pair_on(
+        &self,
+        second: &Self,
+        first_side: (BooleanWhirData<F, EF, MT>, &[BitOpening<EF>]),
+        second_side: (&BooleanWhirData<F, EF, MT>, &[BitOpening<EF>]),
+        device: Option<&dyn PairDevices<F, EF, MT>>,
+        challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, BooleanWhirProof<F, EF, MT>>, BooleanWhirError> {
+        self.check_partner(second)?;
+        second.check_openings(second_side.1)?;
+        let (first_readings, first_reduction, first_point) = self.switch(
+            &first_side.0,
+            first_side.1,
+            device.map(|d| d.packing_rounds()),
+            challenger,
+        )?;
+        let (second_readings, second_reduction, second_point) = second.switch(
+            second_side.0,
+            second_side.1,
+            device.map(|d| d.packing_rounds()),
+            challenger,
+        )?;
+
+        let pair = tracing::info_span!("pair opening")
+            .in_scope(|| {
+                let points = [first_point, second_point];
+                let protocol = self.protocol(1);
+                match device {
+                    Some(device) => self.inner.open_pair_at_on(
+                        first_side.0,
+                        second_side.0,
+                        &protocol,
+                        &points,
+                        device,
+                        challenger,
+                    ),
+                    None => self.inner.open_pair_at(
+                        first_side.0,
+                        second_side.0,
+                        &protocol,
+                        &points,
+                        challenger,
+                    ),
+                }
+            })
+            .map_err(BooleanWhirError::Commit)?;
+
+        Ok((
+            (
+                first_readings,
+                BooleanWhirProof {
+                    reduction: first_reduction,
+                    opening: BooleanWhirOpening::Paired,
+                },
+            ),
+            (
+                second_readings,
+                BooleanWhirProof {
+                    reduction: second_reduction,
+                    opening: BooleanWhirOpening::Pair(pair),
+                },
+            ),
+        ))
+    }
+
+    /// Check what [`Self::open_readings_pair`] produced.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_readings`] for either side, a partner of another code, or a pair whose
+    /// opening sits on the wrong side.
+    pub fn verify_readings_pair(
+        &self,
+        second: &Self,
+        first_side: &ReadingsCheck<'_, EF, MT::Commitment, BooleanWhirProof<F, EF, MT>>,
+        second_side: &ReadingsCheck<'_, EF, MT::Commitment, BooleanWhirProof<F, EF, MT>>,
+        challenger: &mut Challenger,
+    ) -> Result<(), BooleanWhirError> {
+        self.check_partner(second)?;
+        let (BooleanWhirOpening::Paired, BooleanWhirOpening::Pair(pair)) =
+            (&first_side.proof.opening, &second_side.proof.opening)
+        else {
+            return Err(BooleanWhirError::OpeningKind);
+        };
+        second.check_openings(second_side.openings)?;
+        let (first_point, first_value) = self.check_switch(
+            first_side.openings,
+            first_side.readings,
+            first_side.proof,
+            challenger,
+        )?;
+        let (second_point, second_value) = second.check_switch(
+            second_side.openings,
+            second_side.readings,
+            second_side.proof,
+            challenger,
+        )?;
+
+        let evals = self
+            .inner
+            .verify_pair_at(
+                [first_side.commitment, second_side.commitment],
+                pair,
+                &self.protocol(1),
+                &[first_point, second_point],
+                challenger,
+            )
+            .map_err(BooleanWhirError::Opening)?;
+
+        // Each side's batch closes against the value the pair bound at its surviving point.
+        match evals.as_slice() {
+            [first, second]
+                if first.current().first() == Some(&first_value)
+                    && second.current().first() == Some(&second_value) =>
+            {
+                Ok(())
+            }
+            _ => Err(BooleanWhirError::SurvivingClaim),
+        }
+    }
+
+    /// Every labelled algebraic error one pair opening charges, one report per side.
+    ///
+    /// ```text
+    ///     first side     the proximity argument at two surviving points, the pair's batching
+    ///                    draw, and the first side's reductions
+    ///     second side    the second side's reductions
+    /// ```
+    ///
+    /// Both reports leave the same candidate count, the shared argument's.
+    #[must_use]
+    pub fn readings_pair_security(
+        &self,
+        second: &Self,
+        first_side: (usize, bool),
+        second_side: (usize, bool),
+    ) -> Option<(PrescribedOpeningSecurity, PrescribedOpeningSecurity)> {
+        self.check_partner(second).ok()?;
+        let mut first = self.inner.prescribed_security(&self.protocol(2))?;
+        first.terms.push(SecurityTerm::new(
+            PAIR_BATCHING_LABEL,
+            ErrorBits::from_log2(pair_batching_error(&self.inner)),
+        ));
+        let mut second_report = PrescribedOpeningSecurity {
+            terms: Vec::new(),
+            log2_max_candidates: first.log2_max_candidates,
+        };
+        for ((num_claims, successor_tensors), report) in
+            [(first_side, &mut first), (second_side, &mut second_report)]
+        {
+            for term in
+                Self::reduction_terms(self.inner.num_variables(), num_claims, successor_tensors)
+            {
+                report.charge_reduction(term);
+            }
+        }
+        Some((first, second_report))
+    }
+
+    /// The reductions one batched ring switch of this many claims draws.
+    fn reduction_terms(
+        packed_variables: usize,
+        num_claims: usize,
+        successor_tensors: bool,
+    ) -> Vec<SecurityTerm> {
+        // The tensor alone, or the tensor with carry and last.
+        let num_tensors = if successor_tensors { 3 } else { 1 };
+        let mut terms = vec![bit_ring_switch_tensors_term(
+            num_claims.min(1),
+            num_tensors,
+            BitRingSwitch::<F, EF>::BATCHED,
+            packed_variables,
+            EF::bits(),
+        )];
+        // A single claim draws no lambda, so its report carries no batching term.
+        if num_claims > 1 {
+            terms.push(bit_ring_switch_claim_batching_term(num_claims, EF::bits()));
+        }
+        terms
     }
 }
 
@@ -736,6 +1324,8 @@ where
         + CanSampleUniformBits<F>
         + CanObserve<MT::Commitment>,
 {
+    type OpeningDevice = dyn SingleDevices<F, EF, MT>;
+
     fn observe_commitment(&self, commitment: &Self::Commitment, challenger: &mut Challenger) {
         p3_commit::MultilinearPcs::<EF, Challenger>::observe_commitment(
             &self.inner,
@@ -753,6 +1343,35 @@ where
         let stack = PackedStack::<PackedGf2<U>, F>::from_columns(&[bits])
             .map_err(BooleanWhirError::Packing)?;
         self.commit_column(stack.into_poly().into_evals(), challenger)
+    }
+
+    fn commit_bits_on<U: Underlier>(
+        &self,
+        bits: &[PackedGf2<U>],
+        device: &dyn SingleDevices<F, EF, MT>,
+        challenger: &mut Challenger,
+    ) -> Result<(Self::Commitment, Self::ProverData), Self::Error> {
+        let stack = PackedStack::<PackedGf2<U>, F>::from_columns(&[bits])
+            .map_err(BooleanWhirError::Packing)?;
+        let elements = stack.into_poly().into_evals();
+        match device.committer() {
+            Some(committer) => {
+                self.commit_elements_with(&DynCommitter(committer), elements, challenger)
+            }
+            None => self.commit_column(elements, challenger),
+        }
+    }
+
+    fn commit_held_on(
+        &self,
+        words: usize,
+        device: &dyn SingleDevices<F, EF, MT>,
+        challenger: &mut Challenger,
+    ) -> Result<(Self::Commitment, Self::ProverData), Self::Error> {
+        let committer = device
+            .committer()
+            .ok_or(BooleanWhirError::NoDeviceCommitter)?;
+        self.commit_held_with(&DynCommitter(committer), words, challenger)
     }
 
     fn commit_packed(
@@ -795,6 +1414,56 @@ where
         Self::readings_security(self, num_claims, successor_tensors)
     }
 
+    fn open_readings_pair(
+        &self,
+        second: &Self,
+        first_side: (Self::ProverData, &[BitOpening<EF>]),
+        second_side: (&Self::ProverData, &[BitOpening<EF>]),
+        challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, Self::Proof>, Self::Error> {
+        Self::open_readings_pair(self, second, first_side, second_side, challenger)
+    }
+
+    fn open_readings_pair_on(
+        &self,
+        second: &Self,
+        first_side: (Self::ProverData, &[BitOpening<EF>]),
+        second_side: (&Self::ProverData, &[BitOpening<EF>]),
+        device: &dyn SingleDevices<F, EF, MT>,
+        challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, Self::Proof>, Self::Error> {
+        let pair = device
+            .pair_devices()
+            .ok_or(BooleanWhirError::NoPairDevice)?;
+        Self::open_readings_pair_on(
+            self,
+            second,
+            first_side,
+            second_side,
+            Some(pair),
+            challenger,
+        )
+    }
+
+    fn verify_readings_pair(
+        &self,
+        second: &Self,
+        first_side: ReadingsCheck<'_, EF, Self::Commitment, Self::Proof>,
+        second_side: ReadingsCheck<'_, EF, Self::Commitment, Self::Proof>,
+        challenger: &mut Challenger,
+    ) -> Result<(), Self::Error> {
+        Self::verify_readings_pair(self, second, &first_side, &second_side, challenger)
+    }
+
+    fn readings_pair_security(
+        &self,
+        second: &Self,
+        first_side: (usize, bool),
+        second_side: (usize, bool),
+    ) -> Option<(PrescribedOpeningSecurity, PrescribedOpeningSecurity)> {
+        Self::readings_pair_security(self, second, first_side, second_side)
+    }
+
     fn open_at_points(
         &self,
         prover_data: Self::ProverData,
@@ -803,6 +1472,30 @@ where
     ) -> Result<(Vec<EF>, Self::Proof), Self::Error> {
         let (readings, proof) =
             self.open_readings(prover_data, &Self::current_openings(points), challenger)?;
+        let values = readings
+            .into_iter()
+            .map(|reading| {
+                reading
+                    .current
+                    .expect("an opening asking for the current reading carries it")
+            })
+            .collect();
+        Ok((values, proof))
+    }
+
+    fn open_at_points_on(
+        &self,
+        prover_data: Self::ProverData,
+        points: &[Point<EF>],
+        device: &dyn SingleDevices<F, EF, MT>,
+        challenger: &mut Challenger,
+    ) -> Result<(Vec<EF>, Self::Proof), Self::Error> {
+        let (readings, proof) = self.open_readings_on(
+            prover_data,
+            &Self::current_openings(points),
+            device,
+            challenger,
+        )?;
         let values = readings
             .into_iter()
             .map(|reading| {

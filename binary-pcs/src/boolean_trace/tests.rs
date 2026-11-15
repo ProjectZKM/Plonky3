@@ -182,6 +182,8 @@ impl BooleanBackend<EF> for BitsOnly {
 }
 
 impl BooleanMultilinearPcs<EF, MyChallenger> for BitsOnly {
+    type OpeningDevice = crate::NoOpeningDevice;
+
     fn observe_commitment(&self, commitment: &Self::Commitment, challenger: &mut MyChallenger) {
         BooleanMultilinearPcs::observe_commitment(&self.0, commitment, challenger);
     }
@@ -215,6 +217,34 @@ impl BooleanMultilinearPcs<EF, MyChallenger> for BitsOnly {
             .verify_readings(commitment, openings, readings, proof, challenger)
     }
 
+    fn open_readings_pair(
+        &self,
+        second: &Self,
+        first_side: (Self::ProverData, &[BitOpening<EF>]),
+        second_side: (&Self::ProverData, &[BitOpening<EF>]),
+        challenger: &mut MyChallenger,
+    ) -> Result<crate::boolean::PairReadings<EF, Self::Proof>, Self::Error> {
+        BooleanMultilinearPcs::open_readings_pair(
+            &self.0,
+            &second.0,
+            first_side,
+            second_side,
+            challenger,
+        )
+    }
+
+    fn open_readings_pair_on(
+        &self,
+        _second: &Self,
+        _first_side: (Self::ProverData, &[BitOpening<EF>]),
+        _second_side: (&Self::ProverData, &[BitOpening<EF>]),
+        device: &crate::NoOpeningDevice,
+        _challenger: &mut MyChallenger,
+    ) -> Result<crate::boolean::PairReadings<EF, Self::Proof>, Self::Error> {
+        let _ = device;
+        unreachable!("no opening device exists")
+    }
+
     fn readings_security(
         &self,
         num_claims: usize,
@@ -230,6 +260,17 @@ impl BooleanMultilinearPcs<EF, MyChallenger> for BitsOnly {
         challenger: &mut MyChallenger,
     ) -> Result<(Vec<EF>, Self::Proof), Self::Error> {
         BooleanMultilinearPcs::open_at_points(&self.0, prover_data, points, challenger)
+    }
+
+    fn open_at_points_on(
+        &self,
+        _prover_data: Self::ProverData,
+        _points: &[Point<EF>],
+        device: &crate::NoOpeningDevice,
+        _challenger: &mut MyChallenger,
+    ) -> Result<(Vec<EF>, Self::Proof), Self::Error> {
+        let _ = device;
+        unreachable!("no opening device exists")
     }
 
     fn verify_at_points(
@@ -971,13 +1012,14 @@ fn optimized_security_charges_batches_and_column_coordinates() {
 }
 
 #[test]
-fn optimized_security_rejects_a_protocol_with_the_wrong_stacked_arity() {
+fn optimized_security_rejects_a_protocol_stacking_past_the_commitment() {
+    // Committed: 8 rows by 3 columns stacks to 10 variables; the protocol's 5 columns to 11.
     let committed_shape = TableShape::new(8, 3);
     let scheme = pcs(&[committed_shape]);
-    let protocol_shape = TableShape::new(8, 2);
+    let protocol_shape = TableShape::new(8, 5);
     let protocol = OpeningProtocol::new(vec![TableSpec::new(
         protocol_shape,
-        vec![OpeningBatch::new(vec![0, 1], Vec::new())],
+        vec![OpeningBatch::new(vec![0, 1, 2, 3, 4], Vec::new())],
     )]);
 
     let security = <BooleanTracePcs<EF, MyMmcs, MyMmcs> as PrescribedPointPcs<
@@ -2828,6 +2870,53 @@ fn requested_packed_views_preserve_dense_subset_and_reordered_column_order() {
                 actual.1,
                 columns.iter().map(|&c| successor[c]).collect::<Vec<_>>()
             );
+        }
+    }
+}
+
+/// A host model of a device holding packed tables, weighting rows as the trait states.
+struct HostHeld(Vec<Table<EF>>);
+
+impl HeldColumns<EF> for HostHeld {
+    fn held_column_values(
+        &self,
+        table: usize,
+        high: &[EF],
+        low: &[EF],
+        current: &[usize],
+        next: &[usize],
+    ) -> (Vec<EF>, Vec<EF>) {
+        let table = &self.0[table];
+        let rows = 1usize << table.num_variables();
+        let weight = |r: usize| high[r >> HELD_LOW_VARIABLES] * low[r % 64];
+        let sum = |column: usize, shift: usize| {
+            let view = table.column(column);
+            (0..rows)
+                .filter(|&r| view.boolean_bit((r + shift).min(rows - 1)) == Some(true))
+                .map(weight)
+                .sum::<EF>()
+        };
+        (
+            current.iter().map(|&c| sum(c, 0)).collect(),
+            next.iter().map(|&c| sum(c, 1)).collect(),
+        )
+    }
+}
+
+#[test]
+fn held_column_values_match_the_host_weights() {
+    for (rows, width) in [(6, 64), (9, 64), (11, 128)] {
+        let packed = packed_table(&table_with_width(0x4e1d, rows, width));
+        let point = Point::<EF>::rand(&mut SmallRng::seed_from_u64(0x4e1e), rows);
+        let held = HostHeld(vec![packed.clone()]);
+        for columns in [vec![3, 1], (0..width).collect::<Vec<_>>(), vec![width - 1]] {
+            let expected = BooleanTracePcs::<EF, MyMmcs, MyMmcs>::evaluate_requested(
+                &packed, &point, &columns, &columns,
+            );
+            let actual = BooleanTracePcs::<EF, MyMmcs, MyMmcs>::evaluate_held(
+                &held, 0, &point, &columns, &columns,
+            );
+            assert_eq!(actual, expected);
         }
     }
 }

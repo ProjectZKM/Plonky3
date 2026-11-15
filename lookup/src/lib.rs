@@ -24,7 +24,9 @@ pub use builder::{
 pub use bus::{LookupBus, PermutationCheckBus};
 pub use challenges::Challenges;
 pub use count::Count;
-pub use indexed::{IndexedLookupError, IndexedLookups, IndexedRead, IndexedTable, TraceWindow};
+pub use indexed::{
+    IndexedLookupError, IndexedLookups, IndexedPosition, IndexedRead, IndexedTable, TraceWindow,
+};
 pub use logup::LogUpGadget;
 pub use protocol::LookupProtocol;
 pub use symbolic::InteractionSymbolicBuilder;

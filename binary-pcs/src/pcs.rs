@@ -36,6 +36,7 @@ use p3_commit::{Encoder, Mmcs, MultilinearPcs};
 use p3_field::ExtensionField;
 use p3_multilinear_util::point::Point;
 use p3_multilinear_util::poly::Poly;
+use p3_sumcheck::commit::CodewordCommitter;
 use p3_sumcheck::layout::{Layout, Verifier, Witness, observe_commitment};
 use p3_sumcheck::strategy::Basis;
 use p3_sumcheck::{
@@ -49,7 +50,7 @@ use crate::error::BinaryPcsError;
 use crate::fold::{ChallengeField, FoldAlphabet};
 use crate::params::{BinaryPcsConfig, BinaryPcsConfigError};
 use crate::proof::BinaryPcsProof;
-use crate::prover::{BinaryPcsProverData, commit, fold_rounds_with, open_queries};
+use crate::prover::{BinaryPcsProverData, commit, commit_with, fold_rounds_with, open_queries};
 use crate::transcript::{BinaryPcsProverTranscript, BinaryPcsShape, BinaryPcsVerifierTranscript};
 use crate::verifier::{
     check_canonical_pow_witness, check_round_and_final_lengths, verify_query_paths,
@@ -673,6 +674,36 @@ where
         }
 
         Ok(&proof.evals)
+    }
+}
+
+impl<F, EF, MT, MX, E> BinaryPcs<F, EF, MT, MX, E>
+where
+    F: EncodableLevel + TranscriptField + FoldAlphabet<EF>,
+    EF: ChallengeField<F> + ExtensionField<F> + TowerLevel + FoldAlphabet<EF>,
+    MT: Mmcs<F>,
+    MX: Mmcs<EF, Error = MT::Error>,
+    E: Encoder<F> + Sync,
+{
+    /// [`MultilinearPcs::commit`] through `committer`, which encodes and commits the
+    /// message wherever it keeps the codeword.
+    ///
+    /// # Errors
+    /// As [`MultilinearPcs::commit`].
+    pub fn commit_with<Challenger, K>(
+        &self,
+        committer: &K,
+        witness: Witness<F>,
+        challenger: &mut Challenger,
+    ) -> Result<(MT::Commitment, BinaryPcsProverData<F, EF, MT>), BinaryPcsError<F, MT::Error>>
+    where
+        K: CodewordCommitter<F, MT>,
+        Challenger: FieldChallenger<F> + CanObserve<MT::Commitment>,
+    {
+        let (commitment, prover_data) =
+            commit_with::<F, EF, MT, K>(&self.config, committer, witness);
+        observe_commitment::<F, _, _>(challenger, commitment.clone());
+        Ok((commitment, prover_data))
     }
 }
 

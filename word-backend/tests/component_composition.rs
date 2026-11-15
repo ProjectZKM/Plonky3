@@ -13,9 +13,11 @@
 //! - a proof that repeats one instance where two were declared.
 
 use p3_binary_field::{BinaryChallenger, BinaryField128};
-use p3_binary_pcs::{BinaryPcsConfig, BinaryPcsParams, BooleanPcs, BooleanPcsError, BooleanProof};
+use p3_binary_pcs::BooleanBackend;
+use p3_binary_pcs::whir::{
+    BinaryWhirProfile, BooleanWhirDomain, BooleanWhirPcs, BooleanWhirProver, recommended_cap_height,
+};
 use p3_challenger::HashChallenger;
-use p3_commit::Mmcs;
 use p3_keccak::Keccak256Hash;
 use p3_merkle_tree::MerkleTreeMmcs;
 use p3_sumcheck::generic_degree::GenericDegreeError;
@@ -25,17 +27,20 @@ use p3_word::{
     IntegerMulConstraint, Operand, Segment, Shift, ShiftKind, ShiftedValue, ValueIndex,
     VerificationError, Word64, ZeroConstraint,
 };
-use p3_word_backend::{PackedWitness, Statement, WordProof, WordProofError, WordProofKey};
+use p3_word_backend::{
+    PackedWitness, PortError, PortRef, PortRouting, Statement, WordProof, WordProofError,
+    WordProofKey,
+};
 
 type EF = BinaryField128;
 type MyHash = SerializingHasher<Keccak256Hash>;
 type MyCompress = CompressionFunctionFromHasher<Keccak256Hash, 2, 32>;
 type MyMmcs = MerkleTreeMmcs<EF, u8, MyHash, MyCompress, 2, 32>;
-type Scheme = BooleanPcs<EF, MyMmcs, MyMmcs>;
 type Challenger = BinaryChallenger<EF, HashChallenger<u8, Keccak256Hash, 32>>;
-type SchemeProof = BooleanProof<EF, MyMmcs, MyMmcs>;
-type SchemeError = BooleanPcsError<EF, <MyMmcs as Mmcs<EF>>::Error>;
-type Commitment = <MyMmcs as Mmcs<EF>>::Commitment;
+type Scheme = BooleanWhirPcs<EF, EF, BooleanWhirDomain, MyMmcs, Challenger>;
+type SchemeProof = <Scheme as BooleanBackend<EF>>::Proof;
+type SchemeError = <Scheme as BooleanBackend<EF>>::Error;
+type Commitment = <Scheme as BooleanBackend<EF>>::Commitment;
 type Record = WordProof<EF, EF, SchemeProof>;
 
 /// Base-two logarithm of the bits one committed element holds.
@@ -163,20 +168,18 @@ const fn challenger() -> Challenger {
 }
 
 fn commitment_scheme(trace_variables: usize) -> Scheme {
+    let domain = BooleanWhirDomain::default();
+    let variables = trace_variables - ABSORBED;
+    let config = BinaryWhirProfile::proven_list_decoding(40, 2, variables.clamp(1, 3))
+        .config::<EF, EF, Challenger, _>(variables, &domain)
+        .expect("the fixture arity has a WHIR schedule");
     let mmcs = MyMmcs::new(
         MyHash::new(Keccak256Hash),
         MyCompress::new(Keccak256Hash),
-        0,
+        recommended_cap_height(&config),
     );
-    let params = BinaryPcsParams {
-        log_inv_rate: 2,
-        pow_bits: 0,
-        security_level: 40,
-    };
-    let config =
-        BinaryPcsConfig::try_new_with_folding::<EF, EF>(trace_variables - ABSORBED, params, 1)
-            .expect("the fixture arity supports one folding round");
-    Scheme::new(config, mmcs.clone(), mmcs, trace_variables).expect("the fixture arity is valid")
+    BooleanWhirPcs::new(BooleanWhirProver::new(config, domain, mmcs), trace_variables)
+        .expect("the fixture arity is valid")
 }
 
 fn prove(
@@ -1121,5 +1124,279 @@ fn an_instance_count_past_the_index_space_is_refused_by_the_layout() {
     assert_eq!(
         Composition::new(vec![ComponentCall::new(empty, instances)]),
         Err(p3_word::CompositionError::TooManyInstances { call: 0, instances })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Interleaved placement
+// ---------------------------------------------------------------------------
+
+/// Fills every instance of every call of an interleaved composition, slot by slot.
+fn interleaved_values(composition: &Composition<Word64>) -> (Vec<Word64>, Vec<Word64>) {
+    let mut public = vec![Word64::new(0); composition.public_len()];
+    let mut witness = vec![Word64::new(0); composition.witness_len()];
+    let mut seed = 0;
+    for (call, entry) in composition.calls().iter().enumerate() {
+        for instance in 0..entry.instances() {
+            let (in0, in1) = instance_inputs(seed);
+            seed += 1;
+            let (out, locals) = run_gadget(in0, in1);
+            let mut put = |index: ValueIndex, value: u64| {
+                let at = composition
+                    .resolve(call, instance, index)
+                    .expect("the instance and slot exist");
+                let segment = match at.segment() {
+                    Segment::Public => &mut public,
+                    Segment::Witness => &mut witness,
+                };
+                segment[at.position() as usize] = Word64::new(value);
+            };
+            put(ValueIndex::public(0).expect("slot fits"), in0);
+            put(ValueIndex::public(1).expect("slot fits"), in1);
+            put(ValueIndex::public(2).expect("slot fits"), out);
+            put(ValueIndex::witness(0).expect("slot fits"), locals[0]);
+            put(ValueIndex::witness(1).expect("slot fits"), locals[1]);
+        }
+    }
+    (public, witness)
+}
+
+#[test]
+fn the_interleaved_layout_is_the_lowered_layout() {
+    for counts in [[1_usize, 1], [4, 2], [5, 3], [7, 0], [0, 6]] {
+        let composition = Composition::interleaved(vec![
+            ComponentCall::new(gadget(), counts[0]),
+            ComponentCall::new(gadget(), counts[1]),
+        ])
+        .expect("the fixture fits the compact address space");
+        assert_layout_matches(composition, "interleaved");
+    }
+}
+
+#[test]
+fn an_interleaved_key_and_its_lowered_key_produce_the_same_proof() {
+    // Fixture state: two calls, cut into blocks of 8, 4, 2 and 1 instances.
+    let composition = Composition::interleaved(vec![
+        ComponentCall::new(gadget(), 11),
+        ComponentCall::new(gadget(), 6),
+    ])
+    .expect("the fixture fits the compact address space");
+    let flat = composition
+        .lower()
+        .expect("the lowered system is well formed");
+    let (public, witness) = interleaved_values(&composition);
+
+    let composed_key = WordProofKey::new(composition).expect("the composed key compiles");
+    let flat_key = WordProofKey::new(flat).expect("the flat key compiles");
+    assert_eq!(composed_key.trace_variables(), flat_key.trace_variables());
+    let scheme = commitment_scheme(composed_key.trace_variables());
+
+    let (composed_commitment, composed_proof) =
+        prove(&composed_key, &scheme, &public, &witness).expect("the composed statement holds");
+    let (flat_commitment, flat_proof) =
+        prove(&flat_key, &scheme, &public, &witness).expect("the flat statement holds");
+    assert_eq!(composed_commitment, flat_commitment);
+    assert_eq!(bytes(&composed_proof), bytes(&flat_proof));
+
+    // The composed key evaluates the wiring per block, the flat key per word.
+    assert!(verify(&composed_key, &scheme, &flat_commitment, &public, &flat_proof).is_ok());
+    assert!(verify(&flat_key, &scheme, &composed_commitment, &public, &composed_proof).is_ok());
+}
+
+#[test]
+fn an_interleaved_instance_has_no_contiguous_slice() {
+    let composition = Composition::interleaved(vec![ComponentCall::new(gadget(), 4)])
+        .expect("the fixture fits the compact address space");
+    let (_, witness) = interleaved_values(&composition);
+    assert!(composition.locals(&witness, 0, 1).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Committed ports
+// ---------------------------------------------------------------------------
+
+/// Rotation inside the link gadget.
+const LINK_ROTATION: usize = 7;
+
+/// A gadget with no interface: it reads its committed input port and writes its committed
+/// output port, `out = in ^ rotr(in, 7)`.
+fn link_gadget() -> Component<Word64> {
+    let input = ValueIndex::witness(0).expect("slot fits");
+    let output = ValueIndex::witness(1).expect("slot fits");
+    let body = ConstraintSystem::new(
+        0,
+        2,
+        vec![ZeroConstraint::new(Operand::new(vec![
+            ShiftedValue::plain(output),
+            ShiftedValue::plain(input),
+            ShiftedValue::single(
+                input,
+                Shift::new(ShiftKind::RotateRight, LINK_ROTATION).expect("rotation is in range"),
+            ),
+        ]))],
+        vec![],
+        vec![],
+    )
+    .expect("the gadget addresses only its declared slots");
+    Component::new(body, 0, 0).expect("a gadget may expose no interface")
+}
+
+/// Ports of the link gadget: its input, then its output.
+const IN: usize = 0;
+const OUT: usize = 1;
+
+/// Call 0 is a chain of `chain` instances, each reading the previous one's output; call 1 has
+/// `side` instances, the `j`-th reading the output of chain instance `j`.
+fn link_composition(chain: usize, side: usize) -> (Composition<Word64>, Vec<(PortRef, PortRef)>) {
+    let composition = Composition::interleaved(vec![
+        ComponentCall::new(link_gadget(), chain),
+        ComponentCall::new(link_gadget(), side),
+    ])
+    .expect("the fixture fits the compact address space");
+    let port = |call, instance, port| PortRef {
+        call,
+        instance,
+        port,
+    };
+    let mut links = (1..chain)
+        .map(|i| (port(0, i, IN), port(0, i - 1, OUT)))
+        .collect::<Vec<_>>();
+    links.extend((0..side).map(|j| (port(1, j, IN), port(0, j, OUT))));
+    (composition, links)
+}
+
+/// Fills the link composition honestly from one seed word.
+fn link_values(composition: &Composition<Word64>, chain: usize, side: usize) -> Vec<Word64> {
+    let mut witness = vec![Word64::new(0); composition.witness_len()];
+    let mut put = |call, instance, slot, value: u64| {
+        let at = composition
+            .resolve(call, instance, ValueIndex::witness(slot).expect("slot fits"))
+            .expect("the instance and slot exist");
+        witness[at.position() as usize] = Word64::new(value);
+    };
+    let step = |x: u64| x ^ x.rotate_right(LINK_ROTATION as u32);
+    let mut outputs = Vec::with_capacity(chain);
+    let mut x = 0xf0f0_ffff_0f0f_ffff_u64;
+    for i in 0..chain {
+        let y = step(x);
+        put(0, i, 0, x);
+        put(0, i, 1, y);
+        outputs.push(y);
+        x = y;
+    }
+    for (j, &output) in outputs.iter().enumerate().take(side) {
+        put(1, j, 0, output);
+        put(1, j, 1, step(output));
+    }
+    witness
+}
+
+/// Verifies a routed proof against the routing commitment of `routing_key`.
+fn verify_routed(
+    key: &WordProofKey<Word64>,
+    routing_key: &WordProofKey<Word64>,
+    scheme: &Scheme,
+    commitment: &Commitment,
+    proof: &Record,
+) -> Result<(), WordProofError<SchemeError>> {
+    let routing = routing_key
+        .port_commitment::<EF, _, _>(scheme, &mut challenger())
+        .expect("the routing words commit")
+        .expect("the key routes ports");
+    key.verify_routed::<EF, EF, _, _>(scheme, commitment, &routing, &[], proof, &mut challenger())
+}
+
+fn link_key(chain: usize, side: usize, links: &[(PortRef, PortRef)]) -> WordProofKey<Word64> {
+    let composition = link_composition(chain, side).0;
+    let routing = PortRouting::new(&composition, &[vec![0, 1], vec![0, 1]], links)
+        .expect("the links name existing ports");
+    WordProofKey::with_ports(composition, routing).expect("the key compiles")
+}
+
+#[test]
+fn routed_ports_prove_and_verify() {
+    for (chain, side) in [(5_usize, 3_usize), (8, 8), (1, 1), (11, 6)] {
+        let (composition, links) = link_composition(chain, side);
+        let witness = link_values(&composition, chain, side);
+        let key = link_key(chain, side, &links);
+        let scheme = commitment_scheme(key.trace_variables());
+        let (commitment, proof) =
+            prove(&key, &scheme, &[], &witness).expect("the routed statement holds");
+        assert!(
+            verify_routed(&key, &key, &scheme, &commitment, &proof).is_ok(),
+            "chain {chain} side {side}"
+        );
+        assert!(matches!(
+            verify(&key, &scheme, &commitment, &[], &proof),
+            Err(WordProofError::PortCommitment)
+        ));
+    }
+}
+
+#[test]
+fn a_broken_link_is_refused_by_the_prover() {
+    let (chain, side) = (5, 3);
+    let (composition, mut links) = link_composition(chain, side);
+    let witness = link_values(&composition, chain, side);
+    links.push((
+        PortRef {
+            call: 1,
+            instance: 2,
+            port: IN,
+        },
+        PortRef {
+            call: 0,
+            instance: 0,
+            port: OUT,
+        },
+    ));
+    let key = link_key(chain, side, &links);
+    let scheme = commitment_scheme(key.trace_variables());
+    assert!(matches!(
+        prove(&key, &scheme, &[], &witness),
+        Err(WordProofError::Ports(PortError::Unequal { .. }))
+    ));
+}
+
+#[test]
+fn a_proof_does_not_verify_under_another_routing() {
+    let (chain, side) = (5, 3);
+    let (composition, links) = link_composition(chain, side);
+    let witness = link_values(&composition, chain, side);
+    let key = link_key(chain, side, &links);
+    let scheme = commitment_scheme(key.trace_variables());
+    let (commitment, proof) =
+        prove(&key, &scheme, &[], &witness).expect("the routed statement holds");
+
+    let mut other = links;
+    other.pop();
+    other.push((
+        PortRef {
+            call: 1,
+            instance: 2,
+            port: IN,
+        },
+        PortRef {
+            call: 0,
+            instance: 1,
+            port: OUT,
+        },
+    ));
+    let other = link_key(chain, side, &other);
+    assert!(verify_routed(&other, &other, &scheme, &commitment, &proof).is_err());
+    assert!(verify_routed(&key, &other, &scheme, &commitment, &proof).is_err());
+    assert!(verify_routed(&key, &key, &scheme, &commitment, &proof).is_ok());
+}
+
+#[test]
+fn ports_must_be_committed_slots() {
+    let (composition, links) = link_composition(2, 1);
+    assert_eq!(
+        PortRouting::new(&composition, &[vec![0, 2], vec![0, 1]], &links),
+        Err(PortError::UnknownSlot {
+            call: 0,
+            slot: 2,
+            slots: 2,
+        })
     );
 }

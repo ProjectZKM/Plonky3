@@ -32,6 +32,10 @@ pub mod packed_ext;
 pub mod proof;
 pub mod prover;
 pub mod rounds;
+pub use rounds::device::{
+    DeviceStage, InteractionSpec, Instruction, LinkSpec, LookupSpec, Program, SlotSpec, StageSpec,
+    TableSpec, ZerocheckDevice,
+};
 pub mod security;
 pub mod selectors;
 pub mod sliced;
@@ -41,14 +45,15 @@ pub mod verifier;
 pub mod zerocheck;
 
 pub use backend::{
-    BooleanTensorBackend, GenericBackend, ReprBackend, SubfieldBackend, ZerocheckBackend,
+    BooleanTensorBackend, DeviceBackend, GenericBackend, ReprBackend, SubfieldBackend,
+    ZerocheckBackend,
 };
-pub use bus::BusBindingError;
+pub use bus::{BusBindingError, BusFamilyDevice, BusLeafBlock, BusTermsSpec, DeviceBusTerms};
 pub use contract::{MachineDeclaration, SealedProof, TableDeclaration};
 pub use instance::{ProverInstance, ProverInstances, VerifierInstance, VerifierInstances};
-pub use keys::{ProvingKey, VerifyingKey, setup};
+pub use keys::{ProvingKey, VerifyingKey, setup, setup_with_tables};
 pub use p3_air::BoundaryIoError;
 pub use proof::MultiStarkProof;
-pub use prover::{ProvingError, prove, prove_with_backend, prove_with_security};
+pub use prover::{ProvingError, prove, prove_with_backend, prove_with_security, ProverBackend, BusLeaves, prove_on, HostProver};
 pub use security::{MultiStarkSecurityReport, SecurityError, security_report};
 pub use verifier::{VerificationError, verify, verify_with_security};

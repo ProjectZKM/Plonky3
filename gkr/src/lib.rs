@@ -25,6 +25,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod device;
 mod error;
 mod math;
 mod proof;
@@ -32,6 +33,7 @@ mod prover;
 mod shape;
 mod transcript;
 
+pub use device::{DeviceProductTrees, ProductTrees};
 pub use error::{ProductGkrError, ProductGkrShapeError};
 pub use proof::{
     DenseLeaves, PreparedProductGkr, ProductGkrLayerProof, ProductGkrOutput, ProductGkrProof,

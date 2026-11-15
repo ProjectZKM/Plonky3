@@ -23,6 +23,8 @@ mod poly_slice;
 mod subfield;
 mod tables;
 mod tower;
+#[doc(hidden)]
+pub use tower::private as tower_private;
 mod transcript;
 mod unreduced;
 
@@ -33,7 +35,7 @@ pub use bitslice::{
     Divisible, M128, M256, M512, PackedGf2, PackedGf2x8, PackedGf2x16, PackedGf2x32, PackedGf2x64,
     PackedGf2x128, PackedGf2x256, PackedGf2x512, Underlier, Word, transpose_8x8,
 };
-pub use challenger::BinaryChallenger;
+pub use challenger::{BinaryChallenger, GrindDevice};
 pub use coordinates::BitCoordinates;
 pub use fold_rows::fold_rows;
 pub use gf2::Gf2;

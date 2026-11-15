@@ -319,6 +319,7 @@ where
                 theta_beta_powers: lift(&self.coupling.theta_beta_powers),
             },
             lookup_scale: self.eta,
+            device: None,
             boundary: BoundaryEvals::new(R::from(EF::ONE - r), R::from(r), R::from(EF::ONE - r)),
         }
     }

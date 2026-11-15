@@ -72,22 +72,26 @@
 pub mod basis;
 pub mod claims;
 mod deferred;
+pub mod device;
 mod equality;
 pub mod packing;
 mod products;
 pub mod reduction;
 pub mod tensor;
+pub mod trace;
 pub mod transcript;
 
 pub use basis::Coefficients;
 pub use claims::{BitRingSwitchClaims, BitRingSwitchClaimsProof, ClaimElements};
 pub use deferred::{BitRingSwitchDeferredProof, DeferredClosing, DeferredWeight};
+pub use device::{HostPackingRounds, PackingRounds, PackingRoundsDevice};
 pub use packing::{BitPacking, BitPackingError, BitPackingView};
 pub use reduction::{
     BitRingSwitch, BitRingSwitchBatch, BitRingSwitchError, BitRingSwitchProof,
     BitRingSwitchProofError, SuccessorTensors,
 };
 pub use tensor::{BitTensor, MalformedBitTensor, SuffixTensors};
+pub use trace::{TraceBasis, TraceError, TraceProof, TraceReduction, TraceWeight, TraceWeights};
 pub use transcript::{
     BitRingSwitchClaimsProverTranscript, BitRingSwitchClaimsShape,
     BitRingSwitchClaimsVerifierTranscript, BitRingSwitchProverTranscript, BitRingSwitchShape,

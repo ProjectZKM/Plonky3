@@ -90,6 +90,7 @@ use p3_security::SecurityTerm;
 use p3_security::multilinear::{
     bit_ring_switch_claim_batching_term, bit_ring_switch_tensors_term, bit_ring_switch_term,
 };
+use p3_sumcheck::CodewordCommitter;
 use p3_sumcheck::layout::{Layout, SuffixProver, Table};
 use p3_sumcheck::ring_switch::bits::{
     BitPacking, BitPackingView, BitRingSwitch, BitRingSwitchClaims, BitRingSwitchClaimsProof,
@@ -134,6 +135,10 @@ pub trait BooleanBackend<EF> {
     fn num_variables(&self) -> usize;
 }
 
+/// The opening device of a commitment that opens on the host alone: there is none.
+#[derive(Debug)]
+pub enum NoOpeningDevice {}
+
 /// A commitment to a function from the hypercube to `{0, 1}`.
 ///
 /// The committed object is a bit witness.
@@ -159,6 +164,9 @@ pub trait BooleanBackend<EF> {
 ///
 /// Bit-slicing is a compression, not a reinterpretation.
 pub trait BooleanMultilinearPcs<EF, Challenger>: BooleanBackend<EF> {
+    /// Where [`Self::open_at_points_on`] runs.
+    type OpeningDevice: ?Sized;
+
     /// Bind a commitment into the transcript, as committing to one does.
     ///
     /// A prover binds while producing its commitment, and a verifier never produces one.
@@ -176,6 +184,41 @@ pub trait BooleanMultilinearPcs<EF, Challenger>: BooleanBackend<EF> {
         bits: &[PackedGf2<U>],
         challenger: &mut Challenger,
     ) -> Result<(Self::Commitment, Self::ProverData), Self::Error>;
+
+    /// [`Self::commit_bits`] with the codeword encoded and committed on `device`, which keeps it
+    /// for [`Self::open_at_points_on`]; the commitment is the one [`Self::commit_bits`] makes.
+    ///
+    /// The default commits on the host.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::commit_bits`].
+    fn commit_bits_on<U: Underlier>(
+        &self,
+        bits: &[PackedGf2<U>],
+        device: &Self::OpeningDevice,
+        challenger: &mut Challenger,
+    ) -> Result<(Self::Commitment, Self::ProverData), Self::Error> {
+        let _ = device;
+        self.commit_bits(bits, challenger)
+    }
+
+    /// The commitment [`Self::commit_bits`] makes to the `words` 64-bit words `device` holds,
+    /// bit `j` of word `w` being bit `64w + j` and every word past them zero: the message
+    /// committed where it lies, no word of it on the host, and opened there.
+    ///
+    /// # Errors
+    ///
+    /// When the words outrun the witness, and when `device` commits no message it holds.
+    fn commit_held_on(
+        &self,
+        words: usize,
+        device: &Self::OpeningDevice,
+        challenger: &mut Challenger,
+    ) -> Result<(Self::Commitment, Self::ProverData), Self::Error> {
+        let _ = (words, device, challenger);
+        unimplemented!("this scheme commits no message a device holds")
+    }
 
     /// Commit to a bit witness written into packed words, bit `j` of word `w` being bit `64w + j`.
     ///
@@ -266,6 +309,20 @@ pub trait BooleanMultilinearPcs<EF, Challenger>: BooleanBackend<EF> {
         challenger: &mut Challenger,
     ) -> Result<(Vec<EF>, Self::Proof), Self::Error>;
 
+    /// [`Self::open_at_points`] with the opening's dense work on `device`; the proof is the
+    /// one [`Self::open_at_points`] makes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_at_points`].
+    fn open_at_points_on(
+        &self,
+        prover_data: Self::ProverData,
+        points: &[Point<EF>],
+        device: &Self::OpeningDevice,
+        challenger: &mut Challenger,
+    ) -> Result<(Vec<EF>, Self::Proof), Self::Error>;
+
     /// Check one proof against the values it claims at every point.
     ///
     /// The commitment's binding is the caller's, replayed before this is reached.
@@ -281,6 +338,100 @@ pub trait BooleanMultilinearPcs<EF, Challenger>: BooleanBackend<EF> {
         proof: &Self::Proof,
         challenger: &mut Challenger,
     ) -> Result<(), Self::Error>;
+
+    /// Open a witness of this commitment and one of `second`'s, in that order, as one step.
+    ///
+    /// The second side's data is borrowed, so a reused commitment is read in place and never
+    /// copied. A commitment that cannot share one proximity opening between the two refuses.
+    ///
+    /// # Errors
+    ///
+    /// As [`open_readings`](BooleanMultilinearPcs::open_readings), for either side, or a
+    /// commitment that does not open pairs.
+    #[allow(clippy::type_complexity)]
+    fn open_readings_pair(
+        &self,
+        second: &Self,
+        first_side: (Self::ProverData, &[BitOpening<EF>]),
+        second_side: (&Self::ProverData, &[BitOpening<EF>]),
+        challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, Self::Proof>, Self::Error>;
+
+    /// [`open_readings_pair`](BooleanMultilinearPcs::open_readings_pair) with the pair's
+    /// opening on `device`, which committed the first side.
+    ///
+    /// # Errors
+    ///
+    /// As [`open_readings_pair`](BooleanMultilinearPcs::open_readings_pair), or a device that
+    /// does not open pairs.
+    #[allow(clippy::type_complexity)]
+    fn open_readings_pair_on(
+        &self,
+        second: &Self,
+        first_side: (Self::ProverData, &[BitOpening<EF>]),
+        second_side: (&Self::ProverData, &[BitOpening<EF>]),
+        device: &Self::OpeningDevice,
+        challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, Self::Proof>, Self::Error>;
+
+    /// Check what [`open_readings_pair`](BooleanMultilinearPcs::open_readings_pair) produced.
+    ///
+    /// # Errors
+    ///
+    /// As [`verify_readings`](BooleanMultilinearPcs::verify_readings), for either side.
+    fn verify_readings_pair(
+        &self,
+        second: &Self,
+        first_side: ReadingsCheck<'_, EF, Self::Commitment, Self::Proof>,
+        second_side: ReadingsCheck<'_, EF, Self::Commitment, Self::Proof>,
+        challenger: &mut Challenger,
+    ) -> Result<(), Self::Error> {
+        self.verify_readings(
+            first_side.commitment,
+            first_side.openings,
+            first_side.readings,
+            first_side.proof,
+            challenger,
+        )?;
+        second.verify_readings(
+            second_side.commitment,
+            second_side.openings,
+            second_side.readings,
+            second_side.proof,
+            challenger,
+        )
+    }
+
+    /// Every labelled algebraic error one pair opening charges, one report per side.
+    ///
+    /// Each side is `(claims, successor tensors)`, as
+    /// [`readings_security`](BooleanMultilinearPcs::readings_security) takes them.
+    fn readings_pair_security(
+        &self,
+        second: &Self,
+        first_side: (usize, bool),
+        second_side: (usize, bool),
+    ) -> Option<(PrescribedOpeningSecurity, PrescribedOpeningSecurity)> {
+        Some((
+            self.readings_security(first_side.0, first_side.1)?,
+            second.readings_security(second_side.0, second_side.1)?,
+        ))
+    }
+}
+
+/// Each side's readings and proof, first side first.
+pub type PairReadings<EF, P> = ((Vec<BitReadings<EF>>, P), (Vec<BitReadings<EF>>, P));
+
+/// One side of a pair opening, as the verifier checks it.
+pub struct ReadingsCheck<'a, EF, C, P> {
+    /// The side's commitment, bound by the caller.
+    pub commitment: &'a C,
+    /// The claims the side answers.
+    pub openings: &'a [BitOpening<EF>],
+    /// The readings it claims at each.
+    pub readings: &'a [BitReadings<EF>],
+    /// The side's proof.
+    pub proof: &'a P,
 }
 
 /// One claim about the bit witness: a point, and the readings asked for there.
@@ -543,6 +694,36 @@ where
 
     /// Commit to packed elements as the one column of the one table the layout stacks.
     #[allow(clippy::type_complexity)]
+    /// [`BooleanBackend::commit_packed`] through `committer`.
+    ///
+    /// # Errors
+    /// As [`BooleanBackend::commit_packed`].
+    pub fn commit_packed_with<Challenger, K>(
+        &self,
+        committer: &K,
+        packed: PackedWords<EF>,
+        challenger: &mut Challenger,
+    ) -> Result<(MT::Commitment, BinaryPcsProverData<EF, EF, MT>), BooleanPcsError<EF, MT::Error>>
+    where
+        K: CodewordCommitter<EF, MT>,
+        Challenger: FieldChallenger<EF> + CanObserve<MT::Commitment>,
+    {
+        let elements = packed.into_elements();
+        let actual = hypercube_variables(elements.len())?;
+        if actual != self.inner.num_variables() {
+            return Err(BooleanPcsError::WitnessArity {
+                expected: self.inner.num_variables(),
+                actual,
+            });
+        }
+        let len = elements.len();
+        let table = Table::new(RowMajorMatrix::new(elements, len));
+        let witness = SuffixProver::<EF, EF>::new_witness(vec![table], 0);
+        self.inner
+            .commit_with(committer, witness, challenger)
+            .map_err(BooleanPcsError::Commitment)
+    }
+
     fn commit_column<Challenger>(
         &self,
         elements: Vec<EF>,
@@ -746,8 +927,32 @@ where
         + CanObserve<MT::Commitment>
         + CanObserve<MX::Commitment>,
 {
+    type OpeningDevice = NoOpeningDevice;
+
     fn observe_commitment(&self, commitment: &Self::Commitment, challenger: &mut Challenger) {
         self.inner.observe_commitment(commitment, challenger);
+    }
+
+    fn open_readings_pair(
+        &self,
+        _second: &Self,
+        _first_side: (Self::ProverData, &[BitOpening<EF>]),
+        _second_side: (&Self::ProverData, &[BitOpening<EF>]),
+        _challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, Self::Proof>, Self::Error> {
+        Err(BooleanPcsError::PairUnsupported)
+    }
+
+    fn open_readings_pair_on(
+        &self,
+        _second: &Self,
+        _first_side: (Self::ProverData, &[BitOpening<EF>]),
+        _second_side: (&Self::ProverData, &[BitOpening<EF>]),
+        device: &NoOpeningDevice,
+        _challenger: &mut Challenger,
+    ) -> Result<PairReadings<EF, Self::Proof>, Self::Error> {
+        let _ = device;
+        unreachable!("no opening device exists")
     }
 
     fn open_readings(
@@ -819,6 +1024,17 @@ where
         Ok((values, proof))
     }
 
+    fn open_at_points_on(
+        &self,
+        _prover_data: Self::ProverData,
+        _points: &[Point<EF>],
+        device: &NoOpeningDevice,
+        _challenger: &mut Challenger,
+    ) -> Result<(Vec<EF>, Self::Proof), Self::Error> {
+        let _ = device;
+        unreachable!("no opening device exists")
+    }
+
     fn verify_at_points(
         &self,
         commitment: &Self::Commitment,
@@ -861,6 +1077,10 @@ pub struct BooleanProof<EF: Field, MT: Mmcs<EF>, MX: Mmcs<EF>> {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BooleanPcsError<EF, MmcsError> {
+    /// The folding-only commitment opens each commitment by its own proof, never as a pair.
+    #[error("the folding-only commitment does not open pairs")]
+    PairUnsupported,
+
     /// The witness is narrower than the coordinates one element absorbs.
     #[error("a bit witness of {actual} variables cannot absorb {needed} into one element")]
     WitnessTooNarrow {

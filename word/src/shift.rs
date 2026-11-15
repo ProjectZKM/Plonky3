@@ -1,12 +1,13 @@
 use core::marker::PhantomData;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::index::ValueIndex;
 use crate::word::{Word, sealed};
 
 /// A bit movement supported by a shifted word term.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ShiftKind {
     /// Moves bits left and fills with zero.
@@ -90,7 +91,8 @@ pub enum ShiftError {
 }
 
 /// One canonical bit movement.
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct Shift<W: Word> {
     /// The bit movement to apply.
     kind: ShiftKind,
@@ -201,7 +203,8 @@ pub enum ShiftSequenceError {
 }
 
 /// One indexed word after zero, one, or two canonical shifts.
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct ShiftedValue<W: Word> {
     /// The source word position.
     index: ValueIndex,

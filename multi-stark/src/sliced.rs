@@ -35,7 +35,7 @@ use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use p3_air::{Air, AirBuilder, RowWindow};
 use p3_bus::{BusActivation, BusDirection, BusInteractionRecorder, BusName, RecordToken};
 use p3_field::{Algebra, Field, HasSubfield, PrimeCharacteristicRing};
-use p3_lookup::{Count, IndexedLookupBuilder, InteractionBuilder, TraceWindow};
+use p3_lookup::{Count, IndexedLookupBuilder, IndexedPosition, InteractionBuilder, TraceWindow};
 
 use crate::folder::eval_boundary_io;
 use crate::selectors::BoundaryEvals;
@@ -826,10 +826,10 @@ where
     S: Field,
     R: Field,
 {
-    fn push_indexed_read(
+    fn push_indexed_read_at(
         &mut self,
         _table: &str,
-        _position: usize,
+        _position: IndexedPosition,
         payload: impl IntoIterator<Item = usize>,
     ) {
         payload.into_iter().for_each(drop);

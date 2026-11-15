@@ -11,10 +11,9 @@ mod error;
 mod transcript;
 
 pub use error::BusArgumentError;
-use p3_gkr::PreparedProductGkr;
 
 use self::transcript::{BusProverTranscript, BusVerifierTranscript};
-use crate::{BusDirection, BusPlan, ProductGkrOutput, ProductGkrProof};
+use crate::{BusDirection, BusPlan, ProductGkrOutput, ProductGkrProof, ProductTrees};
 
 /// Verifier challenges defining every bus leaf factor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,27 +84,86 @@ impl BusPlan {
         EF: ExtensionField<F>,
         Challenger: FieldChallenger<F>,
     {
+        self.prove_with::<F, EF, _>(
+            materialize,
+            |leaves, shape| {
+                // The leaves become the trees' lowest levels as they are, so none is copied.
+                tracing::info_span!("bus trees")
+                    .in_scope(|| ProductTrees::host::<F>(leaves, shape))
+            },
+            challenger,
+        )
+    }
+
+    /// [`Self::prove`] with the product trees built by `build` from the leaves and the
+    /// plan's shape, the push tree then the pull tree, wherever `build` keeps them.
+    ///
+    /// # Errors
+    /// As [`Self::prove`].
+    pub fn prove_with<F, EF, Challenger>(
+        &self,
+        materialize: impl FnOnce(&BusChallenges<EF>) -> [Vec<EF>; 2],
+        build: impl FnOnce([Vec<EF>; 2], crate::ProductGkrShape) -> ProductTrees<EF>,
+        challenger: &mut Challenger,
+    ) -> Result<(BusProof<EF>, BusReductionOutput<EF>), BusArgumentError>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        Challenger: FieldChallenger<F>,
+    {
+        self.prove_trees::<F, EF, _>(
+            |challenges, shape| {
+                let [pushes, pulls] = materialize(challenges);
+                // Validate every derived witness length before product reduction allocates by shape.
+                self.validate_leaf_count(BusDirection::Push, pushes.len())?;
+                self.validate_leaf_count(BusDirection::Pull, pulls.len())?;
+                Ok(build([pushes, pulls], shape))
+            },
+            challenger,
+        )
+    }
+
+    /// [`Self::prove`] over the product trees `trees` builds from the challenges and the
+    /// plan's shape, the push tree then the pull tree, each at the plan's height, wherever
+    /// the caller keeps them.
+    ///
+    /// # Errors
+    /// Returns the error `trees` returns, or an unbalanced pair of roots.
+    pub fn prove_trees<F, EF, Challenger>(
+        &self,
+        trees: impl FnOnce(
+            &BusChallenges<EF>,
+            crate::ProductGkrShape,
+        ) -> Result<ProductTrees<EF>, BusArgumentError>,
+        challenger: &mut Challenger,
+    ) -> Result<(BusProof<EF>, BusReductionOutput<EF>), BusArgumentError>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        Challenger: FieldChallenger<F>,
+    {
         // Sample the leaf polynomial only after the surrounding commitment is bound.
         let mut transcript = BusProverTranscript::<_, F, EF>::new(challenger, self);
         let challenges = transcript.challenges();
-        let [pushes, pulls] = materialize(&challenges);
+        let trees = match trees(&challenges, self.product_shape()) {
+            Ok(trees) => trees,
+            Err(error) => {
+                transcript.abort();
+                return Err(error);
+            }
+        };
 
-        // Validate every derived witness length before product reduction allocates by shape.
-        if let Err(error) = self
-            .validate_leaf_count(BusDirection::Push, pushes.len())
-            .and_then(|()| self.validate_leaf_count(BusDirection::Pull, pulls.len()))
-        {
-            transcript.abort();
-            return Err(error);
-        }
-
-        // Reuse the product layers' roots for the shared-root witness check.
-        let prepared = PreparedProductGkr::new_owned::<F>([pushes, pulls], self.product_shape());
-        if prepared.roots()[0] != prepared.roots()[1] {
+        // Shared-root encoding is a statement, so reject a false witness explicitly.
+        let roots = trees.roots();
+        if roots[0] != roots[1] {
             transcript.abort();
             return Err(BusArgumentError::UnbalancedProducts);
         }
-        let (product, output) = transcript.product(|challenger| prepared.prove::<F, _>(challenger));
+        let (product, output) = transcript.product(|challenger| {
+            tracing::info_span!("bus product gkr").in_scope(|| {
+                ProductGkrProof::prove_trees::<F, _>(trees, self.product_shape(), challenger)
+            })
+        });
         transcript.finish();
 
         Ok((

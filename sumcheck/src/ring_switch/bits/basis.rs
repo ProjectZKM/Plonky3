@@ -213,6 +213,11 @@ impl<EF: BitCoordinates, A: Field> CoordinateSums<EF, A> {
     /// The sum of the weights over the coordinates `value` has set.
     #[inline]
     #[must_use]
+    /// The tables, one per byte position, lowest first.
+    pub(crate) fn tables(&self) -> &[[A; 256]] {
+        &self.tables
+    }
+
     pub(crate) fn sum(&self, value: EF) -> A {
         self.tables
             .iter()

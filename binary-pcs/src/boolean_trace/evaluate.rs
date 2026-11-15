@@ -34,6 +34,49 @@ pub(super) const BLOCKS_PER_TASK: usize = 16;
 /// Minimum selected columns that amortize the shared subset-sum tables.
 const MIN_SHARED_COLUMNS: usize = 127;
 
+/// Row variables the low factor of a held table's row weights covers: one word of rows.
+pub const HELD_LOW_VARIABLES: usize = 6;
+
+/// The device that holds a committed trace's held tables, which weights their columns by
+/// rows there.
+pub trait HeldColumns<EF> {
+    /// For table `table`, with row weights `w(r) = high[r >> 6] * low[r mod 64]`, the sums
+    ///
+    /// ```text
+    ///     current[c] = sum_r w(r) * bit_c(r)
+    ///     next[c]    = sum_r w(r) * bit_c(min(r + 1, last))
+    /// ```
+    ///
+    /// over the columns `current`, then over the columns `next`.
+    fn held_column_values(
+        &self,
+        table: usize,
+        high: &[EF],
+        low: &[EF],
+        current: &[usize],
+        next: &[usize],
+    ) -> (Vec<EF>, Vec<EF>);
+}
+
+/// The factors of the row weights `eq(point, r)`: `high` over the leading coordinates, `low`
+/// over the last [`HELD_LOW_VARIABLES`], `eq(point, r) = high[r >> 6] * low[r mod 64]`.
+///
+/// # Panics
+///
+/// Panics on a point of fewer than [`HELD_LOW_VARIABLES`] coordinates.
+pub fn row_weight_factors<EF: Field>(point: &Point<EF>) -> (Vec<EF>, Vec<EF>) {
+    let n = point.num_variables();
+    assert!(n >= HELD_LOW_VARIABLES, "a held table spans whole words of rows");
+    let (high, low) = point.as_slice().split_at(n - HELD_LOW_VARIABLES);
+    let table = |coordinates: &[EF]| {
+        SplitEq::<EF, EF>::new_packed(&Point::new(coordinates.to_vec()), EF::ONE)
+            .materialize()
+            .as_slice()
+            .to_vec()
+    };
+    (table(high), table(low))
+}
+
 impl<EF, B> BooleanTraceCommitment<EF, B>
 where
     EF: BitCoordinates + ExtensionField<B::Val>,
@@ -75,6 +118,18 @@ where
     }
 
     /// Evaluate only the requested views, sharing packed-column work for dense selections and scanning sparse selections separately.
+    /// [`Self::evaluate_requested`] of table `table`, which `held` holds.
+    pub(super) fn evaluate_held(
+        held: &dyn HeldColumns<EF>,
+        table: usize,
+        point: &Point<EF>,
+        current: &[usize],
+        next: &[usize],
+    ) -> (Vec<EF>, Vec<EF>) {
+        let (high, low) = row_weight_factors(point);
+        held.held_column_values(table, &high, &low, current, next)
+    }
+
     pub(super) fn evaluate_requested(
         table: &Table<B::Val>,
         point: &Point<EF>,

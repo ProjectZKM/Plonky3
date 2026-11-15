@@ -26,6 +26,31 @@
 //!
 //! Readdressing checks the slot against that width, so an out-of-range one is refused.
 //!
+//! # Interleaved placement
+//!
+//! [`Composition::interleaved`] places a call's instances the other way round, as Binius64 does:
+//! the instance index is the low bits of both the word and the relation position.
+//!
+//! A call is cut into blocks of `2^k` instances, one per set bit of its count, and the blocks of
+//! every call are laid out largest first.  Each block's bases are then multiples of its own
+//! instance count, so in a block of `2^k` instances
+//!
+//! ```text
+//! word     = word base     + slot     * 2^k + instance
+//! relation = relation base + relation * 2^k + instance
+//! ```
+//!
+//! with both bases divisible by `2^k`.  An equality weight of a word and of a relation then
+//! factors into the low `k` coordinates, shared by the instance, and the high ones, which
+//! name the slot and the relation of the gadget: a sum over the instances is one product.
+//!
+//! Only the committed words and the relations need that alignment.  The public words stay in
+//! call order, each call's instances one after another, so a statement's leading public words
+//! are its first call's interfaces whatever the block sizes.
+//!
+//! An interleaved instance's words are not contiguous, so the slice accessors refuse it and
+//! [`Composition::resolve`] addresses its words one at a time.
+//!
 //! # Why instance-major
 //!
 //! Binius64 stores a repeated gadget's witness the other way round, instance index minor.
@@ -52,6 +77,7 @@
 
 use alloc::vec::Vec;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::constraint::{AndConstraint, IntegerMulConstraint, ZeroConstraint};
@@ -148,6 +174,9 @@ pub enum CompositionError {
         /// The rejected instance count.
         instances: usize,
     },
+    /// A slice accessor was asked for an instance of an interleaved composition.
+    #[error("an interleaved instance's words are not contiguous")]
+    Interleaved,
     /// A segment handed to a lookup does not have the composed length.
     #[error("expected {expected} {segment:?} words, received {actual}")]
     SegmentLength {
@@ -216,7 +245,8 @@ impl CompositionError {
 /// Its public segment is the interface one instance exposes.
 ///
 /// Its witness segment is the private storage one instance keeps.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct Component<W: Word> {
     /// Relations over component-local slots.
     body: ConstraintSystem<W>,
@@ -303,7 +333,8 @@ impl<W: Word> Component<W> {
 }
 
 /// One component together with the number of instances it is used for.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct ComponentCall<W: Word> {
     /// The gadget compiled once for every instance.
     component: Component<W>,
@@ -336,7 +367,7 @@ impl<W: Word> ComponentCall<W> {
 }
 
 /// Where one call's words and relations begin in the composed statement.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct CallBase {
     /// First public word of the call's block.
     public: usize,
@@ -346,15 +377,89 @@ struct CallBase {
     constraint: [usize; FAMILIES],
 }
 
+/// How a composition places the instances of a call.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Placement {
+    /// One contiguous run of words per instance.
+    #[default]
+    InstanceMajor,
+    /// The instance index in the low bits of every word and relation position.
+    Interleaved,
+}
+
+/// A run of `2^log_instances` instances of one call, interleaved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallBlock {
+    /// The call the instances belong to.
+    call: u32,
+    /// The call's index of the block's first instance.
+    first: u32,
+    /// The base-two logarithm of the block's instance count.
+    log_instances: u8,
+    /// Where the block's words and relations begin, each a multiple of its instance count.
+    base: CallBase,
+}
+
+impl CallBlock {
+    /// Returns the index of the call the block belongs to.
+    #[inline]
+    pub const fn call(&self) -> usize {
+        self.call as usize
+    }
+
+    /// Returns the call's index of the block's first instance.
+    #[inline]
+    pub const fn first_instance(&self) -> usize {
+        self.first as usize
+    }
+
+    /// Returns the base-two logarithm of the block's instance count.
+    #[inline]
+    pub const fn log_instances(&self) -> usize {
+        self.log_instances as usize
+    }
+
+    /// Returns the block's instance count.
+    #[inline]
+    pub const fn instances(&self) -> usize {
+        1 << self.log_instances
+    }
+
+    /// Returns the block's first public word: its instances' interfaces follow one another.
+    #[inline]
+    pub const fn public_base(&self) -> usize {
+        self.base.public
+    }
+
+    /// Returns the block's first committed word.
+    #[inline]
+    pub const fn witness_base(&self) -> usize {
+        self.base.witness
+    }
+
+    /// Returns the block's first relation within a family.
+    #[inline]
+    pub const fn constraint_base(&self, kind: ConstraintKind) -> usize {
+        self.base.constraint[kind.code() as usize]
+    }
+}
+
 /// Several component calls laid out into one statement.
 ///
 /// Each call owns a disjoint, instance-packed block of both segments.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct Composition<W: Word> {
     /// The calls in layout order.
     calls: Vec<ComponentCall<W>>,
     /// The block start of each call.
     bases: Vec<CallBase>,
+    /// How the calls' instances are placed.
+    #[serde(default)]
+    placement: Placement,
+    /// The interleaved blocks in layout order, largest first; empty when instance-major.
+    #[serde(default)]
+    blocks: Vec<CallBlock>,
     /// Total public words.
     public_len: u32,
     /// Total committed words.
@@ -430,10 +535,124 @@ impl<W: Word> Composition<W> {
         Ok(Self {
             calls,
             bases,
+            placement: Placement::InstanceMajor,
+            blocks: Vec::new(),
             public_len: public,
             witness_len: witness,
             relation_counts: counts,
         })
+    }
+
+    /// Lays out the calls interleaved: each call cut into blocks of `2^k` instances, one per
+    /// set bit of its count, the blocks of every call placed largest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a composed segment or family outgrows the compact address space.
+    pub fn interleaved(calls: Vec<ComponentCall<W>>) -> Result<Self, CompositionError> {
+        let mut cuts = Vec::new();
+        for (call, index) in calls.iter().zip(0_usize..) {
+            let instances = u32::try_from(call.instances).map_err(|_| {
+                CompositionError::TooManyInstances {
+                    call: index,
+                    instances: call.instances,
+                }
+            })?;
+            let mut first = 0_u32;
+            for log in (0..u32::BITS).rev() {
+                if (instances >> log) & 1 == 1 {
+                    cuts.push((log as u8, index as u32, first));
+                    first += 1 << log;
+                }
+            }
+        }
+        cuts.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+        let mut public_len = 0_usize;
+        let mut call_public = Vec::with_capacity(calls.len());
+        for call in &calls {
+            call_public.push(public_len);
+            public_len = CompositionError::extend_segment(
+                public_len,
+                call.component.interface_slots(),
+                call.instances,
+                Segment::Public,
+            )?;
+        }
+        let mut witness_len = 0_usize;
+        let mut relation_counts = [0_usize; FAMILIES];
+        let mut blocks = Vec::with_capacity(cuts.len());
+        for (log_instances, call, first) in cuts {
+            let component = &calls[call as usize].component;
+            let instances = 1_usize << log_instances;
+            blocks.push(CallBlock {
+                call,
+                first,
+                log_instances,
+                base: CallBase {
+                    public: call_public[call as usize]
+                        + first as usize * component.interface_slots(),
+                    witness: witness_len,
+                    constraint: relation_counts,
+                },
+            });
+            witness_len = CompositionError::extend_segment(
+                witness_len,
+                component.local_slots(),
+                instances,
+                Segment::Witness,
+            )?;
+            for (family, count) in component.relation_counts().into_iter().enumerate() {
+                let kind = ConstraintKind::from_code(family as u8)
+                    .expect("relation counts are indexed by assigned family codes");
+                relation_counts[family] = CompositionError::extend_family(
+                    relation_counts[family],
+                    count,
+                    instances,
+                    kind,
+                )?;
+            }
+        }
+
+        let public = CompositionError::bound_segment(public_len, Segment::Public)?;
+        let witness = CompositionError::bound_segment(witness_len, Segment::Witness)?;
+        let mut counts = [0_u32; FAMILIES];
+        for (family, count) in relation_counts.into_iter().enumerate() {
+            let kind = ConstraintKind::from_code(family as u8)
+                .expect("relation counts are indexed by assigned family codes");
+            counts[family] = u32::try_from(count)
+                .map_err(|_| CompositionError::TooManyConstraints { kind, len: count })?;
+        }
+        let bases = alloc::vec![
+            CallBase {
+                public: 0,
+                witness: 0,
+                constraint: [0; FAMILIES],
+            };
+            calls.len()
+        ];
+
+        Ok(Self {
+            calls,
+            bases,
+            placement: Placement::Interleaved,
+            blocks,
+            public_len: public,
+            witness_len: witness,
+            relation_counts: counts,
+        })
+    }
+
+    /// Returns how the calls' instances are placed.
+    #[inline]
+    pub const fn placement(&self) -> Placement {
+        self.placement
+    }
+
+    /// Returns the interleaved blocks in layout order; empty when instance-major.
+    #[inline]
+    pub fn blocks(&self) -> &[CallBlock] {
+        &self.blocks
     }
 
     /// Returns the calls in layout order.
@@ -635,6 +854,9 @@ impl<W: Word> Composition<W> {
     ///
     /// Returns an error when the composed statement outgrows the flat address space.
     pub fn lower(&self) -> Result<ConstraintSystem<W>, SystemError> {
+        if self.placement == Placement::Interleaved {
+            return self.lower_interleaved();
+        }
         let counts = self.relation_counts();
         let mut zero = Vec::with_capacity(counts[0]);
         let mut and = Vec::with_capacity(counts[1]);
@@ -680,6 +902,59 @@ impl<W: Word> Composition<W> {
         ConstraintSystem::new(self.public_len(), self.witness_len(), zero, and, product)
     }
 
+    /// The flat statement of an interleaved composition: block by block, each family's
+    /// relations ordered by the gadget's relation, then by the instance.
+    fn lower_interleaved(&self) -> Result<ConstraintSystem<W>, SystemError> {
+        let counts = self.relation_counts();
+        let mut zero = Vec::with_capacity(counts[0]);
+        let mut and = Vec::with_capacity(counts[1]);
+        let mut product = Vec::with_capacity(counts[2]);
+
+        for block in &self.blocks {
+            let component = &self.calls[block.call()].component;
+            let body = component.body();
+            let remap = |local: usize| {
+                let instance = block.first_instance() + local;
+                move |index: ValueIndex| -> ValueIndex {
+                    let position = self.place(block.call(), component, instance, index);
+                    match index.segment() {
+                        Segment::Public => ValueIndex::public(position),
+                        Segment::Witness => ValueIndex::witness(position),
+                    }
+                    .expect("a composed position was bounded when the layout was built")
+                }
+            };
+            for relation in body.zero_constraints() {
+                for local in 0..block.instances() {
+                    zero.push(ZeroConstraint::new(relation.value().readdress(remap(local))));
+                }
+            }
+            for relation in body.and_constraints() {
+                for local in 0..block.instances() {
+                    let remap = remap(local);
+                    and.push(AndConstraint::new(
+                        relation.left().readdress(remap),
+                        relation.right().readdress(remap),
+                        relation.output().readdress(remap),
+                    ));
+                }
+            }
+            for relation in body.integer_mul_constraints() {
+                for local in 0..block.instances() {
+                    let remap = remap(local);
+                    product.push(IntegerMulConstraint::new(
+                        relation.left().readdress(remap),
+                        relation.right().readdress(remap),
+                        relation.low().readdress(remap),
+                        relation.high().readdress(remap),
+                    ));
+                }
+            }
+        }
+
+        ConstraintSystem::new(self.public_len(), self.witness_len(), zero, and, product)
+    }
+
     /// Readdresses one component-local index into the composed segment.
     ///
     /// The slot is checked against the width of one instance's block.
@@ -695,7 +970,6 @@ impl<W: Word> Composition<W> {
         instance: usize,
         index: ValueIndex,
     ) -> Result<ValueIndex, CompositionError> {
-        let base = *self.base(call)?;
         let component = &self.check_instance(call, instance)?.component;
 
         // A slot outside the block is another instance's word, so it is refused.
@@ -712,12 +986,28 @@ impl<W: Word> Composition<W> {
             });
         }
 
-        let position = self.position(&base, component, instance, index);
+        let position = self.place(call, component, instance, index);
         Ok(match index.segment() {
             Segment::Public => ValueIndex::public(position),
             Segment::Witness => ValueIndex::witness(position),
         }
         .expect("an in-range slot of a laid-out call has a representable position"))
+    }
+
+    /// The composed word position of one component-local index, under either placement.
+    fn place(&self, call: usize, component: &Component<W>, instance: usize, index: ValueIndex) -> usize {
+        if self.placement == Placement::Interleaved {
+            let (block, local) = self.block_of(call, instance);
+            return match index.segment() {
+                Segment::Public => {
+                    block.public_base() + local * component.interface_slots() + index.position() as usize
+                }
+                Segment::Witness => {
+                    block.witness_base() + ((index.position() as usize) << block.log_instances) + local
+                }
+            };
+        }
+        self.position(&self.bases[call], component, instance, index)
     }
 
     /// Computes the composed word position of one component-local index.
@@ -737,10 +1027,27 @@ impl<W: Word> Composition<W> {
     }
 
     fn base(&self, call: usize) -> Result<&CallBase, CompositionError> {
-        self.bases.get(call).ok_or(CompositionError::UnknownCall {
+        let base = self.bases.get(call).ok_or(CompositionError::UnknownCall {
             call,
             calls: self.calls.len(),
-        })
+        })?;
+        if self.placement == Placement::Interleaved {
+            return Err(CompositionError::Interleaved);
+        }
+        Ok(base)
+    }
+
+    /// The interleaved block holding one instance of a call, and the instance's index in it.
+    fn block_of(&self, call: usize, instance: usize) -> (&CallBlock, usize) {
+        self.blocks
+            .iter()
+            .find(|block| {
+                block.call() == call
+                    && (block.first_instance()..block.first_instance() + block.instances())
+                        .contains(&instance)
+            })
+            .map(|block| (block, instance - block.first_instance()))
+            .expect("every instance of a laid-out call lies in one of its blocks")
     }
 
     fn check_instance(
@@ -1033,5 +1340,52 @@ mod tests {
         assert_eq!(composition.witness_len(), 1);
         assert_eq!(composition.public_base(1), Ok(0));
         assert_eq!(composition.relation_counts(), [0, 1, 0]);
+    }
+
+    #[test]
+    fn interleaved_blocks_are_aligned_to_their_instance_counts() {
+        let composition = Composition::interleaved(vec![
+            ComponentCall::new(masker(), 5),
+            ComponentCall::new(masker(), 3),
+        ])
+        .unwrap();
+        let shape = composition
+            .blocks()
+            .iter()
+            .map(|block| (block.call(), block.first_instance(), block.instances()))
+            .collect::<alloc::vec::Vec<_>>();
+        assert_eq!(shape, vec![(0, 0, 4), (1, 0, 2), (0, 4, 1), (1, 2, 1)]);
+        for block in composition.blocks() {
+            assert_eq!(block.witness_base() % block.instances(), 0);
+            assert_eq!(block.constraint_base(ConstraintKind::And) % block.instances(), 0);
+        }
+        let local = ValueIndex::witness(0).unwrap();
+        assert_eq!(composition.resolve(0, 3, local).unwrap().position(), 3);
+        assert_eq!(composition.resolve(1, 1, local).unwrap().position(), 5);
+        assert_eq!(composition.resolve(0, 4, local).unwrap().position(), 6);
+        assert_eq!(composition.witness_base(0), Err(CompositionError::Interleaved));
+    }
+
+    #[test]
+    fn interleaved_public_words_stay_in_call_order() {
+        let composition = Composition::interleaved(vec![
+            ComponentCall::new(masker(), 5),
+            ComponentCall::new(masker(), 3),
+        ])
+        .unwrap();
+        let input = ValueIndex::public(0).unwrap();
+        let output = ValueIndex::public(1).unwrap();
+        for instance in 0..5 {
+            assert_eq!(
+                composition.resolve(0, instance, input).unwrap().position() as usize,
+                2 * instance
+            );
+            assert_eq!(
+                composition.resolve(0, instance, output).unwrap().position() as usize,
+                2 * instance + 1
+            );
+        }
+        assert_eq!(composition.resolve(1, 0, input).unwrap().position(), 10);
+        assert_eq!(composition.resolve(1, 2, output).unwrap().position(), 15);
     }
 }

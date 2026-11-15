@@ -13,8 +13,9 @@ use p3_binary_field::{BinaryChallenger, BinaryField128, Gf2, Ghash128, PackedGf2
 use p3_binary_pcs::testing::assert_boolean_multilinear_commit_contract;
 use p3_binary_pcs::whir::{
     BinaryWhirBudget, BinaryWhirProfile, BooleanWhirDeferredProof, BooleanWhirDomain,
-    BooleanWhirError, BooleanWhirPcs, BooleanWhirProof, BooleanWhirProver, BooleanWhirTracePcs,
-    BudgetError, WeightedClaim, WeightedOpening, recommended_cap_height,
+    BooleanWhirError, BooleanWhirOpening, BooleanWhirPcs, BooleanWhirProof, BooleanWhirProver,
+    BooleanWhirTracePcs, BooleanWhirTraceProof, BudgetError, WeightedClaim, WeightedOpening,
+    recommended_cap_height,
 };
 use p3_binary_pcs::{
     BinaryPcsConfig, BinaryPcsParams, BitOpening, BitReadings, BooleanMultilinearPcs, BooleanPcs,
@@ -30,7 +31,7 @@ use p3_multilinear_util::point::Point;
 use p3_multilinear_util::poly::Poly;
 use p3_sumcheck::layout::{Table, plan_stacked_layout};
 use p3_sumcheck::ring_switch::bits::{
-    BitPacking, BitRingSwitch, BitRingSwitchClaims, BitRingSwitchProofError,
+    BitPacking, BitRingSwitch, BitRingSwitchClaims, BitRingSwitchProofError, TraceError,
 };
 use p3_sumcheck::{
     OpeningBatch, OpeningProtocol, PrescribedPointPcs, SumcheckData, TableShape, TableSpec,
@@ -659,7 +660,10 @@ fn a_batch_over_another_witness_leaves_a_claim_the_commitment_does_not_open() {
     .unwrap();
     assert_ne!(opening.evals[0].current()[0], surviving_value);
 
-    let proof = BooleanWhirProof { reduction, opening };
+    let proof = BooleanWhirProof {
+        reduction,
+        opening: BooleanWhirOpening::Own(opening),
+    };
     let mut verifier_chal = challenger();
     pcs.observe_commitment(&root_b, &mut verifier_chal);
     let refused = pcs
@@ -696,7 +700,7 @@ fn a_tampered_proximity_transcript_is_refused_by_the_opening() {
     let (values, proof) = pcs.open_at_points(data, &points, &mut prover_chal).unwrap();
 
     let mut tampered = proof.clone();
-    tampered.opening.whir.initial_ood_answers[0] += EF::ONE;
+    tampered.opening.whir_mut().unwrap().initial_ood_answers[0] += EF::ONE;
     let mut verifier_chal = challenger();
     pcs.observe_commitment(&commitment, &mut verifier_chal);
     let refused = pcs
@@ -730,7 +734,7 @@ fn unread_final_sumcheck_data_is_refused_by_the_opening() {
     let mut prover_chal = challenger();
     let (commitment, data) = pcs.commit_bits(&bits, &mut prover_chal).unwrap();
     let (values, proof) = pcs.open_at_points(data, &points, &mut prover_chal).unwrap();
-    assert!(proof.opening.whir.final_sumcheck.is_none());
+    assert!(proof.opening.whir().unwrap().final_sumcheck.is_none());
 
     // The untouched proof is accepted, so the rejection below is the attached data alone.
     let mut verifier_chal = challenger();
@@ -739,7 +743,7 @@ fn unread_final_sumcheck_data_is_refused_by_the_opening() {
         .unwrap();
 
     let mut tampered = proof;
-    tampered.opening.whir.final_sumcheck = Some(SumcheckData {
+    tampered.opening.whir_mut().unwrap().final_sumcheck = Some(SumcheckData {
         polynomial_evaluations: vec![[EF::ONE, EF::TWO]],
         pow_witnesses: vec![],
     });
@@ -1275,4 +1279,333 @@ fn sparse_successors_and_indexed_extras_use_hybrid_claims_through_whir() {
                 .is_err()
         );
     }
+}
+
+/// Two Boolean traces, the second stacking below the first, opened under one proximity opening.
+mod pair {
+    use p3_sumcheck::{PairCheck, PairOpening};
+
+    use super::*;
+
+    /// The main trace's shape, which fixes the committed arity of both.
+    const MAIN: TableShape = TableShape::new(10, 4);
+
+    /// The second trace's shape, stacking one variable below the main one.
+    const SECOND: TableShape = TableShape::new(9, 4);
+
+    /// One trace commitment at the main trace's arity, for either side.
+    fn trace_pcs() -> TracePcs {
+        let (arity, _) = plan_stacked_layout(&[MAIN]);
+        let domain = BooleanWhirDomain::default();
+        let config = BinaryWhirProfile::unique_decoding(SECURITY_LEVEL, LOG_INV_RATE, FOLDING)
+            .config::<EF, EF, MyChallenger, _>(arity - ABSORBED, &domain)
+            .unwrap();
+        let cap_height = recommended_cap_height(&config);
+        TracePcs::from_commitment(
+            BooleanWhirPcs::new(Prover::new(config, domain, mmcs(cap_height)), arity).unwrap(),
+        )
+    }
+
+    fn table(shape: TableShape, seed: u64) -> Table<EF> {
+        let rows = 1usize << shape.num_variables();
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let cells = (0..shape.width() * rows)
+            .map(|_| EF::from_bool(rng.random::<bool>()))
+            .collect();
+        Table::new(RowMajorMatrix::new(cells, rows))
+    }
+
+    /// Every column of the table, at the current row and one ahead.
+    fn protocol(shape: TableShape) -> OpeningProtocol {
+        OpeningProtocol::new(vec![TableSpec::new(
+            shape,
+            vec![OpeningBatch::new(vec![0, 1, 2, 3], vec![0, 1, 2, 3])],
+        )])
+    }
+
+    fn row_point(shape: TableShape, seed: u64) -> Vec<Point<EF>> {
+        vec![Point::<EF>::rand(
+            &mut SmallRng::seed_from_u64(seed),
+            shape.num_variables(),
+        )]
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Tamper {
+        None,
+        MainValue,
+        SecondValue,
+        Swapped,
+    }
+
+    fn run(tamper: Tamper) -> Result<(), String> {
+        let (main_pcs, second_pcs) = (trace_pcs(), trace_pcs());
+        let (main_protocol, second_protocol) = (protocol(MAIN), protocol(SECOND));
+        let (main_points, second_points) = (row_point(MAIN, 1), row_point(SECOND, 2));
+
+        let mut prover = challenger();
+        let (main_root, main_data) = MultilinearPcs::<EF, MyChallenger>::commit(
+            &main_pcs,
+            vec![table(MAIN, 3)],
+            &mut prover,
+        )
+        .unwrap();
+        let (second_root, second_data) = MultilinearPcs::<EF, MyChallenger>::commit(
+            &second_pcs,
+            vec![table(SECOND, 4)],
+            &mut prover,
+        )
+        .unwrap();
+        let (mut main_proof, mut second_proof) =
+            PrescribedPointPcs::<EF, MyChallenger>::open_pair_at(
+                &main_pcs,
+                &second_pcs,
+                PairOpening {
+                    prover_data: main_data,
+                    protocol: &main_protocol,
+                    points: &main_points,
+                    known: &[None],
+                },
+                PairOpening {
+                    prover_data: &second_data,
+                    protocol: &second_protocol,
+                    points: &second_points,
+                    known: &[None],
+                },
+                &mut prover,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+        assert!(matches!(
+            main_proof.opening.opening,
+            BooleanWhirOpening::Paired
+        ));
+        assert!(matches!(
+            second_proof.opening.opening,
+            BooleanWhirOpening::Pair(_)
+        ));
+
+        match tamper {
+            Tamper::MainValue => main_proof.values[0] += EF::ONE,
+            Tamper::SecondValue => second_proof.values[5] += EF::ONE,
+            Tamper::Swapped => core::mem::swap(&mut main_proof, &mut second_proof),
+            Tamper::None => {}
+        }
+
+        let mut verifier = challenger();
+        MultilinearPcs::<EF, MyChallenger>::observe_commitment(
+            &main_pcs,
+            &main_root,
+            &mut verifier,
+        );
+        MultilinearPcs::<EF, MyChallenger>::observe_commitment(
+            &second_pcs,
+            &second_root,
+            &mut verifier,
+        );
+        let (main_evals, second_evals) = PrescribedPointPcs::<EF, MyChallenger>::verify_pair_at(
+            &main_pcs,
+            &second_pcs,
+            PairCheck {
+                commitment: &main_root,
+                proof: &main_proof,
+                protocol: &main_protocol,
+                points: &main_points,
+            },
+            PairCheck {
+                commitment: &second_root,
+                proof: &second_proof,
+                protocol: &second_protocol,
+                points: &second_points,
+            },
+            &mut verifier,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+
+        // The values are the columns themselves, at the point and one row ahead.
+        let expect = |table: &Table<EF>, point: &Point<EF>| -> Vec<EF> {
+            (0..4)
+                .map(|column| Poly::new(table.poly(column).as_slice().to_vec()).eval_base(point))
+                .collect()
+        };
+        assert_eq!(
+            main_evals[0].current(),
+            expect(&table(MAIN, 3), &main_points[0])
+        );
+        assert_eq!(
+            second_evals[0].current(),
+            expect(&table(SECOND, 4), &second_points[0])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_traces_open_under_one_proximity_opening() {
+        run(Tamper::None).unwrap();
+    }
+
+    #[test]
+    fn a_false_value_on_either_side_is_refused() {
+        for tamper in [Tamper::MainValue, Tamper::SecondValue, Tamper::Swapped] {
+            assert!(run(tamper).is_err(), "{tamper:?}");
+        }
+    }
+
+    #[test]
+    fn a_trace_stacking_below_its_commitment_opens_alone() {
+        let pcs = trace_pcs();
+        let protocol = protocol(SECOND);
+        let mut prover = challenger();
+        let (root, data) =
+            MultilinearPcs::<EF, MyChallenger>::commit(&pcs, vec![table(SECOND, 5)], &mut prover)
+                .unwrap();
+        let proof =
+            MultilinearPcs::<EF, MyChallenger>::open(&pcs, data, protocol.clone(), &mut prover)
+                .unwrap();
+        MultilinearPcs::<EF, MyChallenger>::verify(
+            &pcs,
+            &root,
+            &proof,
+            &mut challenger(),
+            protocol,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_pair_is_priced_once_with_its_batching_draw() {
+        let (main_pcs, second_pcs) = (trace_pcs(), trace_pcs());
+        let (first, second) = PrescribedPointPcs::<EF, MyChallenger>::prescribed_pair_security(
+            &main_pcs,
+            &second_pcs,
+            &protocol(MAIN),
+            &protocol(SECOND),
+        )
+        .expect("the pair is priced");
+        let labels = |report: &p3_sumcheck::PrescribedOpeningSecurity| {
+            report
+                .terms
+                .iter()
+                .map(|term| term.label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(&first),
+            vec![
+                p3_security::whir::WHIR_OPENING_LABEL,
+                p3_binary_pcs::whir::PAIR_BATCHING_LABEL,
+                p3_security::BIT_RING_SWITCH_LABEL,
+                p3_security::COLUMN_BATCH_LABEL
+            ]
+        );
+        assert_eq!(
+            labels(&second),
+            vec![
+                p3_security::BIT_RING_SWITCH_LABEL,
+                p3_security::COLUMN_BATCH_LABEL
+            ]
+        );
+        // The batching draw is ground to the starting fold's strength, so it never binds below
+        // the opening it shares a schedule with.
+        assert!(first.terms[1].bits.bits() >= first.terms[0].bits.bits());
+    }
+}
+
+#[test]
+fn trace_readings_round_trip_through_the_first_fold() {
+    // Invariant: the trace reduction's relation is closed by WHIR's first fold, and the
+    // readings it reports are the witness's evaluations at the points.
+    let profile = BinaryWhirProfile::proven_list_decoding(SECURITY_LEVEL, LOG_INV_RATE, FOLDING);
+    let pcs = whir_pcs(profile);
+    let bits = witness(0x7A0E);
+    let mut points = points_at(0x7A0F, 3);
+    // One point addresses a slot through a Boolean prefix.
+    let mut prefixed = points[2].as_slice().to_vec();
+    prefixed[0] = EF::ONE;
+    prefixed[1] = EF::ZERO;
+    points[2] = Point::new(prefixed);
+    let openings = current_openings(&points);
+    let mut chal = challenger();
+    let (root, data) = pcs.commit_bits(&bits, &mut chal).unwrap();
+    let expected = points
+        .iter()
+        .map(|point| embedded(&bits).eval_base(point))
+        .collect::<Vec<_>>();
+    let (readings, proof) = pcs.open_readings_trace(data, &openings, &mut chal).unwrap();
+    for (reading, expected) in readings.iter().zip(&expected) {
+        assert_eq!(reading.current, Some(*expected));
+        assert_eq!(reading.next, None);
+    }
+    assert_eq!(proof.reduction.traces.len(), 128);
+    let mut verifier_chal = challenger();
+    pcs.observe_commitment(&root, &mut verifier_chal);
+    pcs.verify_readings_trace(&root, &openings, &readings, &proof, &mut verifier_chal)
+        .unwrap();
+    // A false reading is refused: either a trace message has trace one, or the fold misses.
+    let mut wrong = readings.clone();
+    wrong[1].current = Some(expected[1] + EF::ONE);
+    let mut verifier_chal = challenger();
+    pcs.observe_commitment(&root, &mut verifier_chal);
+    let refused = pcs
+        .verify_readings_trace(&root, &openings, &wrong, &proof, &mut verifier_chal)
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            BooleanWhirError::Trace(TraceError::TraceOne { .. }) | BooleanWhirError::Opening(_)
+        ),
+        "{refused:?}"
+    );
+    // A successor reading is not answered by the trace reduction.
+    let mut successor = openings.clone();
+    successor[0].next = true;
+    let (_, data) = pcs.commit_bits(&bits, &mut challenger()).unwrap();
+    let refused = pcs
+        .open_readings_trace(data, &successor, &mut challenger())
+        .err()
+        .expect("a successor reading is refused");
+    assert!(
+        matches!(
+            refused,
+            BooleanWhirError::Trace(TraceError::Successor { claim: 0 })
+        ),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_trace_proof_about_another_witness_is_refused() {
+    // Invariant: the first fold ties the relation to the committed polynomial.
+    let profile = BinaryWhirProfile::proven_list_decoding(SECURITY_LEVEL, LOG_INV_RATE, FOLDING);
+    let pcs = whir_pcs(profile);
+    let points = points_at(0x7B00, 2);
+    let openings = current_openings(&points);
+    let mut chal = challenger();
+    let (root_a, data_a) = pcs.commit_bits(&witness(0xA7A7), &mut chal).unwrap();
+    let (readings, proof) = pcs
+        .open_readings_trace(data_a, &openings, &mut chal)
+        .unwrap();
+    let _: &BooleanWhirTraceProof<EF, EF, MyMmcs> = &proof;
+    // The readings of witness B at the same points, with A's proof.
+    let bits_b = witness(0xB7B7);
+    let (root_b, _) = pcs.commit_bits(&bits_b, &mut challenger()).unwrap();
+    let readings_b = points
+        .iter()
+        .map(|point| BitReadings {
+            current: Some(embedded(&bits_b).eval_base(point)),
+            next: None,
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(readings, readings_b);
+    let mut verifier_chal = challenger();
+    pcs.observe_commitment(&root_b, &mut verifier_chal);
+    assert!(
+        pcs.verify_readings_trace(&root_b, &openings, &readings, &proof, &mut verifier_chal)
+            .is_err()
+    );
+    let mut verifier_chal = challenger();
+    pcs.observe_commitment(&root_a, &mut verifier_chal);
+    assert!(
+        pcs.verify_readings_trace(&root_a, &openings, &readings_b, &proof, &mut verifier_chal)
+            .is_err()
+    );
 }

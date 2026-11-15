@@ -635,7 +635,7 @@ fn transcript<B>(
     packed: bool,
 ) -> (Vec<u8>, Tower)
 where
-    B: ZerocheckBackend<Tower, Tower, FixtureAir>,
+    B: ZerocheckBackend<Tower, Tower, FixtureAir> + Default,
 {
     transcript_with_storage::<B>(
         DEFAULT_SLICED_ROUNDS,
@@ -654,7 +654,7 @@ fn transcript_with_storage<B>(
     is_packed: impl Fn(usize, &Instance) -> bool,
 ) -> (Vec<u8>, Tower)
 where
-    B: ZerocheckBackend<Tower, Tower, FixtureAir>,
+    B: ZerocheckBackend<Tower, Tower, FixtureAir> + Default,
 {
     let airs = instances
         .iter()
@@ -717,6 +717,7 @@ where
             &public_values,
             lookup,
             sliced_rounds,
+            &B::default(),
             &mut challenger,
         );
     let bytes = postcard::to_allocvec(&(
@@ -1151,6 +1152,7 @@ fn representation_invalid_proofs_are_rejected_at_n11() {
                     &[&instance.public_values],
                     LookupRuntime::Inactive,
                     DEFAULT_SLICED_ROUNDS,
+                    &ReprBackend::<Gf4, PolyBasis, true>::default(),
                     &mut challenger(),
                 )
             } else {
@@ -1160,6 +1162,7 @@ fn representation_invalid_proofs_are_rejected_at_n11() {
                     &[&instance.public_values],
                     LookupRuntime::Inactive,
                     DEFAULT_SLICED_ROUNDS,
+                    &ReprBackend::<Gf4, PolyBasis>::default(),
                     &mut challenger(),
                 )
             };
@@ -1198,6 +1201,7 @@ fn representation_tensor4_invalid_proof_at_n10_is_rejected() {
         &[&instance.public_values],
         LookupRuntime::Inactive,
         DEFAULT_SLICED_ROUNDS,
+        &ReprBackend::<Gf4, PolyBasis>::default(),
         &mut challenger(),
     );
     assert!(
@@ -1225,6 +1229,7 @@ fn representation_tensor4_honest_proof_verifies() {
             &[&instance.public_values],
             LookupRuntime::Inactive,
             DEFAULT_SLICED_ROUNDS,
+            &ReprBackend::<Gf4, PolyBasis>::default(),
             &mut challenger(),
         );
     let verified = zerocheck
@@ -1246,6 +1251,7 @@ fn representation_late_boundary_honest_proof_verifies() {
             &[&instance.public_values],
             LookupRuntime::Inactive,
             DEFAULT_SLICED_ROUNDS,
+            &ReprBackend::<Gf4, PolyBasis, true>::default(),
             &mut challenger(),
         );
     let verified = zerocheck
@@ -1353,6 +1359,7 @@ fn representation_infinity_tensor_proof_verifies() {
             &[&instance.public_values],
             LookupRuntime::Inactive,
             DEFAULT_SLICED_ROUNDS,
+            &ReprBackend::<Gf4, PolyBasis, true>::default(),
             &mut challenger(),
         );
     let verified = zerocheck
@@ -1366,7 +1373,7 @@ fn representation_infinity_tensor_proof_verifies() {
 /// The round loop runs on the calling thread, so only this proof moves the thread's counter.
 fn late_boundary_rounds<B>(instances: &[Instance]) -> usize
 where
-    B: ZerocheckBackend<Tower, Tower, FixtureAir>,
+    B: ZerocheckBackend<Tower, Tower, FixtureAir> + Default,
 {
     let before = LATE_BOUNDARY_ROUNDS.with(Cell::get);
     let _ = transcript::<B>(instances, LookupRuntime::Inactive, 0, false);

@@ -10,7 +10,8 @@ use p3_air::symbolic::{
 use p3_air::{Air, AirBuilder, DebugConstraintBuilder, ExtensionBuilder, PermutationAirBuilder};
 use p3_field::{Algebra, ExtensionField, Field, PrimeCharacteristicRing};
 use p3_lookup::{
-    Count, IndexedLookupBuilder, InteractionBuilder, InteractionSymbolicBuilder, TraceWindow,
+    Count, IndexedLookupBuilder, IndexedPosition, InteractionBuilder, InteractionSymbolicBuilder,
+    TraceWindow,
 };
 
 use crate::{BusDirection, BusName};
@@ -472,10 +473,10 @@ impl<F: Field, EF: ExtensionField<F>> InteractionBuilder for BusSymbolicBuilder<
 }
 
 impl<F: Field, EF: ExtensionField<F>> IndexedLookupBuilder for BusSymbolicBuilder<F, EF> {
-    fn push_indexed_read(
+    fn push_indexed_read_at(
         &mut self,
         _table: &str,
-        _position: usize,
+        _position: IndexedPosition,
         payload: impl IntoIterator<Item = usize>,
     ) {
         // Indexed declarations are recorded by their own symbolic builder.

@@ -4,22 +4,22 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 use p3_word::{
-    ComponentCall, Composition, ConstraintKind, ConstraintSystem, ConstraintTerm, OperandRole,
+    ComponentCall, Composition, ConstraintKind, ConstraintSystem, OperandRole, Placement,
     Segment, Shift, Word,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod builder;
 mod code;
 
-use builder::CountingSegment;
-use code::{KeyCode, ShiftSequenceCode};
+use code::ShiftSequenceCode;
 
 /// Number of relation families a statement can declare.
 const FAMILIES: usize = 3;
 
 /// A compact index into one operation family.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConstraintReference {
     /// The operand's semantic role within its relation.
     operand: OperandRole,
@@ -60,6 +60,9 @@ pub struct CompiledKey<'a, W: Word> {
     references: &'a [ConstraintReference],
     /// The instance's first relation position within this key's family.
     constraint_offset: u32,
+    /// The power of two a slot-local relation position is scaled by: the instance count of an
+    /// interleaved block, one otherwise.
+    constraint_shift: u8,
 }
 
 impl<W: Word> CompiledKey<'_, W> {
@@ -95,18 +98,19 @@ impl<W: Word> CompiledKey<'_, W> {
         &self,
     ) -> impl ExactSizeIterator<Item = ConstraintReference> + Clone + use<'_, W> {
         let offset = self.constraint_offset;
+        let shift = self.constraint_shift;
         self.references.iter().map(move |reference| {
             // The stored position is slot-local, so the instance is added here.
             ConstraintReference {
                 operand: reference.operand,
-                constraint: reference.constraint + offset,
+                constraint: (reference.constraint << shift) + offset,
             }
         })
     }
 }
 
 /// One stored key before its references are resolved to borrowed slices.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct StoredKey {
     /// The relation family consuming the word.
     operation: ConstraintKind,
@@ -121,7 +125,7 @@ struct StoredKey {
 /// A flat statement is the degenerate case.
 ///
 /// It is one block of one instance whose slots are the segment's own words.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct InstanceBlock {
     /// The block's first word in the composed segment.
     word_base: u32,
@@ -135,6 +139,14 @@ struct InstanceBlock {
     strides: [u32; FAMILIES],
     /// The first relation position of instance zero, in family-code order.
     constraint_base: [u32; FAMILIES],
+    /// Whether the instance index is the low bits of the block's words, the instance count
+    /// then a power of two.
+    #[serde(default)]
+    interleaved: bool,
+    /// Whether the instance index is the low bits of the block's relations, the instance count
+    /// then a power of two.
+    #[serde(default)]
+    scaled: bool,
 }
 
 impl InstanceBlock {
@@ -149,8 +161,60 @@ impl InstanceBlock {
     #[inline]
     const fn split(&self, word: u32) -> (u32, u32) {
         let local = word - self.word_base;
+        if self.interleaved {
+            return (local & (self.instances - 1), local >> self.log_instances());
+        }
         (local / self.slots, local % self.slots)
     }
+
+    /// The base-two logarithm of an interleaved block's instance count; zero otherwise.
+    #[inline]
+    const fn log_instances(&self) -> u32 {
+        if self.interleaved {
+            self.instances.trailing_zeros()
+        } else {
+            0
+        }
+    }
+
+    /// The power of two a slot-local relation position is scaled by.
+    #[inline]
+    const fn relation_shift(&self) -> u32 {
+        if self.scaled {
+            self.instances.trailing_zeros()
+        } else {
+            0
+        }
+    }
+
+    /// The first relation of an instance within a family.
+    #[inline]
+    const fn constraint_offset(&self, family: usize, instance: u32) -> u32 {
+        if self.scaled {
+            self.constraint_base[family] + instance
+        } else {
+            self.constraint_base[family] + instance * self.strides[family]
+        }
+    }
+}
+
+/// One instance block as the wiring evaluation reads it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BlockView {
+    /// The block's first word.
+    pub word_base: usize,
+    /// Words one instance occupies.
+    pub slots: usize,
+    /// Live instances.
+    pub instances: usize,
+    /// The block's first entry in the slot-key table.
+    pub slot_base: usize,
+    /// The first relation of the block in each family.
+    pub constraint_base: [usize; FAMILIES],
+    /// Relations one instance adds to each family.
+    pub strides: [usize; FAMILIES],
+    /// The base-two logarithm of the instance count when interleaved.
+    pub interleaved: Option<usize>,
 }
 
 /// Storage the compiled metadata of one segment occupies.
@@ -192,7 +256,8 @@ impl LayoutFootprint {
 }
 
 /// Metadata compiled independently for one visibility segment.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct CompiledSegment<W: Word> {
     /// The distinct shift-sequence spellings.
     shifts: Vec<[Shift<W>; 2]>,
@@ -247,11 +312,37 @@ impl<W: Word> CompiledSegment<W> {
 
         // Every family shifts by this instance's own share of that family.
         let offsets = [
-            block.constraint_base[0] + instance * block.strides[0],
-            block.constraint_base[1] + instance * block.strides[1],
-            block.constraint_base[2] + instance * block.strides[2],
+            block.constraint_offset(0, instance),
+            block.constraint_offset(1, instance),
+            block.constraint_offset(2, instance),
         ];
-        Some(keys.iter().map(move |key| self.resolve(key, offsets)))
+        let shift = block.relation_shift() as u8;
+        Some(keys.iter().map(move |key| self.resolve(key, offsets, shift)))
+    }
+
+    /// The instance blocks in word order.
+    pub(crate) fn block_views(&self) -> impl Iterator<Item = BlockView> + '_ {
+        self.blocks.iter().map(|block| BlockView {
+            word_base: block.word_base as usize,
+            slots: block.slots as usize,
+            instances: block.instances as usize,
+            slot_base: block.slot_base as usize,
+            constraint_base: block.constraint_base.map(|base| base as usize),
+            strides: block.strides.map(|stride| stride as usize),
+            interleaved: (block.interleaved && block.scaled)
+                .then(|| block.log_instances() as usize),
+        })
+    }
+
+    /// The slot-local keys of one stored slot: relation positions unscaled and unshifted.
+    pub(crate) fn slot_keys(
+        &self,
+        slot: usize,
+    ) -> impl ExactSizeIterator<Item = CompiledKey<'_, W>> + '_ {
+        let range = &self.slot_keys[slot];
+        self.keys[range.start as usize..range.end as usize]
+            .iter()
+            .map(|key| self.resolve(key, [0; FAMILIES], 0))
     }
 
     /// Returns the dense shift-sequence table.
@@ -271,7 +362,82 @@ impl<W: Word> CompiledSegment<W> {
         (word < block.word_base + block.width()).then_some(block)
     }
 
-    fn resolve(&self, key: &StoredKey, offsets: [u32; FAMILIES]) -> CompiledKey<'_, W> {
+    /// The wiring flattened for a device, each reference's operand placed by `operand_index`.
+    pub(crate) fn shift_layout(
+        &self,
+        operand_index: impl Fn(ConstraintKind, OperandRole) -> usize,
+    ) -> crate::ShiftLayout {
+        let blocks = self
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                [
+                    block.word_base,
+                    block.slots,
+                    block.instances
+                        | (u32::from(block.interleaved) << 31)
+                        | (u32::from(block.scaled) << 30),
+                    block.slot_base,
+                ]
+                .into_iter()
+                .chain(block.strides)
+                .chain(block.constraint_base)
+            })
+            .collect();
+        let slot_keys = self
+            .slot_keys
+            .iter()
+            .flat_map(|range| [range.start, range.end])
+            .collect();
+        let mut operands = Vec::with_capacity(self.references.len());
+        let mut keys = Vec::with_capacity(4 * self.keys.len());
+        for key in &self.keys {
+            keys.extend([
+                u32::from(key.operation.code()),
+                key.shift,
+                key.references.start,
+                key.references.end,
+            ]);
+        }
+        let mut owner = alloc::vec![ConstraintKind::Zero; self.references.len()];
+        for key in &self.keys {
+            for at in key.references.clone() {
+                owner[at as usize] = key.operation;
+            }
+        }
+        for (reference, &kind) in self.references.iter().zip(&owner) {
+            let index = operand_index(kind, reference.operand);
+            operands.push(u8::try_from(index).expect("an operand position fits a byte"));
+        }
+        crate::ShiftLayout {
+            blocks,
+            slot_keys,
+            keys,
+            operands,
+            constraints: self
+                .references
+                .iter()
+                .map(|reference| reference.constraint)
+                .collect(),
+            shifts: self.shifts.len(),
+            sequences: self
+                .shifts
+                .iter()
+                .flat_map(|sequence| {
+                    sequence.iter().flat_map(|shift| {
+                        [crate::device::shift_kind_code(shift.kind()), shift.amount()]
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn resolve(
+        &self,
+        key: &StoredKey,
+        offsets: [u32; FAMILIES],
+        shift: u8,
+    ) -> CompiledKey<'_, W> {
         // Construction bounds every dense index and contiguous reference span.
         CompiledKey {
             operation: key.operation,
@@ -280,12 +446,14 @@ impl<W: Word> CompiledSegment<W> {
             references: &self.references
                 [key.references.start as usize..key.references.end as usize],
             constraint_offset: offsets[key.operation.code() as usize],
+            constraint_shift: shift,
         }
     }
 }
 
 /// Public and committed shift metadata, kept in separate index spaces.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct CompiledKeyLayout<W: Word> {
     /// The metadata for verifier-known words.
     public: CompiledSegment<W>,
@@ -303,30 +471,10 @@ impl<W: Word> CompiledKeyLayout<W> {
     /// - Terms retain their supplied order and multiplicity.
     /// - Each word's keys retain the first occurrence of each group.
     pub fn new(system: &ConstraintSystem<W>) -> Result<Self, KeyCompileError> {
-        // The first pass counts exact per-word storage without nested allocations.
-        let mut public = CountingSegment::new(system.public_len(), Segment::Public)?;
-        let mut witness = CountingSegment::new(system.witness_len(), Segment::Witness)?;
-        for term in system.terms() {
-            let reference = Reference::from(term);
-            match reference.segment {
-                Segment::Public => public.count(reference)?,
-                Segment::Witness => witness.count(reference)?,
-            }
-        }
-
-        // Prefix sums allocate one contiguous reference table per segment.
-        let mut public = public.prepare()?;
-        let mut witness = witness.prepare()?;
-
-        // The second pass places every reference into its reserved word span.
-        for term in system.terms() {
-            let reference = Reference::from(term);
-            match reference.segment {
-                Segment::Public => public.insert(reference),
-                Segment::Witness => witness.insert(reference),
-            }
-        }
-
+        // Each word's references in stream order, then its keys grouped.
+        let (public, witness) = tracing::info_span!("place references")
+            .in_scope(|| builder::prepare_flat(system))?;
+        let _span = tracing::info_span!("group references").entered();
         Ok(Self {
             public: public.compile()?,
             witness: witness.compile()?,
@@ -347,6 +495,9 @@ impl<W: Word> CompiledKeyLayout<W> {
     ///
     /// Returns an error when a gadget or the merged layout outgrows the compact key.
     pub fn compose(composition: &Composition<W>) -> Result<Self, KeyCompileError> {
+        if composition.placement() == Placement::Interleaved {
+            return Self::compose_interleaved(composition);
+        }
         let mut public = Vec::with_capacity(composition.calls().len());
         let mut witness = Vec::with_capacity(composition.calls().len());
         let mut constraint_base = [0_u32; FAMILIES];
@@ -363,12 +514,16 @@ impl<W: Word> CompiledKeyLayout<W> {
                 instances,
                 strides,
                 constraint_base,
+                interleaved: false,
+                scaled: false,
             });
             witness.push(SegmentPiece {
                 segment: compiled.witness,
                 instances,
                 strides,
                 constraint_base,
+                interleaved: false,
+                scaled: false,
             });
 
             // The next call's relations start past this call's whole block.
@@ -383,6 +538,53 @@ impl<W: Word> CompiledKeyLayout<W> {
             }
         }
 
+        Ok(Self {
+            public: CompiledSegment::merge(public, Segment::Public)?,
+            witness: CompiledSegment::merge(witness, Segment::Witness)?,
+        })
+    }
+
+    /// [`Self::compose`] for an interleaved composition: one piece per block, each call's
+    /// body compiled once.
+    fn compose_interleaved(composition: &Composition<W>) -> Result<Self, KeyCompileError> {
+        let compiled = composition
+            .calls()
+            .iter()
+            .map(|call| Self::new(call.component().body()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut public = Vec::with_capacity(composition.blocks().len());
+        let mut witness = Vec::with_capacity(composition.blocks().len());
+        for block in composition.blocks() {
+            let call = &composition.calls()[block.call()];
+            let strides = SegmentPiece::strides(call, block.call())?;
+            let constraint_base = core::array::from_fn(|family| {
+                let kind = ConstraintKind::from_code(family as u8)
+                    .expect("relation bases are indexed by assigned family codes");
+                block.constraint_base(kind) as u32
+            });
+            let instances = block.instances() as u32;
+            public.push((
+                block.public_base(),
+                SegmentPiece {
+                    segment: compiled[block.call()].public.clone(),
+                    instances,
+                    strides,
+                    constraint_base,
+                    interleaved: false,
+                    scaled: true,
+                },
+            ));
+            witness.push(SegmentPiece {
+                segment: compiled[block.call()].witness.clone(),
+                instances,
+                strides,
+                constraint_base,
+                interleaved: true,
+                scaled: true,
+            });
+        }
+        public.sort_by_key(|(base, _)| *base);
+        let public = public.into_iter().map(|(_, piece)| piece).collect();
         Ok(Self {
             public: CompiledSegment::merge(public, Segment::Public)?,
             witness: CompiledSegment::merge(witness, Segment::Witness)?,
@@ -418,6 +620,10 @@ struct SegmentPiece<W: Word> {
     strides: [u32; FAMILIES],
     /// The first relation position of instance zero.
     constraint_base: [u32; FAMILIES],
+    /// Whether the instances' words are interleaved.
+    interleaved: bool,
+    /// Whether the instances' relations are interleaved.
+    scaled: bool,
 }
 
 impl<W: Word> SegmentPiece<W> {
@@ -525,6 +731,8 @@ impl<W: Word> CompiledSegment<W> {
                     slot_base,
                     strides: piece.strides,
                     constraint_base: piece.constraint_base,
+                    interleaved: piece.interleaved,
+                    scaled: piece.scaled,
                 });
                 words = words.checked_add(width).ok_or_else(too_wide)?;
             }
@@ -593,36 +801,6 @@ impl KeyCompileError {
             component,
             len,
         })
-    }
-}
-
-/// One semantic term translated into backend storage coordinates.
-#[derive(Clone, Copy)]
-struct Reference {
-    /// The visibility class containing the source word.
-    segment: Segment,
-    /// The source offset within its visibility class.
-    word: usize,
-    /// The encoded operation and shift sequence.
-    key_code: KeyCode,
-    /// The relation consumer of the shifted word.
-    constraint: ConstraintReference,
-}
-
-impl<W: Word> From<ConstraintTerm<'_, W>> for Reference {
-    fn from(value: ConstraintTerm<'_, W>) -> Self {
-        // The checked semantic term already carries its family provenance.
-        let term = value.term();
-        let index = term.index();
-        Self {
-            segment: index.segment(),
-            word: index.position() as usize,
-            key_code: KeyCode::new(value.kind(), term.shifts()),
-            constraint: ConstraintReference {
-                operand: value.role(),
-                constraint: value.constraint(),
-            },
-        }
     }
 }
 
@@ -882,17 +1060,5 @@ mod tests {
         assert_eq!(keys.len(), target);
         assert_eq!(layout.witness().shift_sequences().len(), target);
         assert!(keys.map(|key| key.shift_index()).max().unwrap() > u32::from(u16::MAX));
-    }
-
-    #[test]
-    fn word_offset_length_overflow_is_rejected() {
-        assert!(matches!(
-            CountingSegment::new(usize::MAX, Segment::Witness),
-            Err(KeyCompileError::LayoutTooLarge {
-                segment: Segment::Witness,
-                component: LayoutComponent::WordOffsets,
-                len: usize::MAX,
-            })
-        ));
     }
 }

@@ -1,6 +1,6 @@
 //! Full-width unsigned multiplication, reduced to evaluation claims on its four operand columns.
 //!
-//! Each multiplication row states one integer identity over words of width `w`.
+//! Each multiplication row states one integer identity over words of width `w = 2^k`.
 //!
 //! ```text
 //!     a * b = lo + 2^w * hi        (as integers)
@@ -10,23 +10,34 @@
 //!
 //! ```text
 //!     g         a generator of the challenge field's multiplicative group, of order 2^n - 1
+//!     G_t       g^(2^t)
 //!
-//!     factor(row) = prod_{i, j < w} (1 + a_i * b_j * (g^(2^(i + j)) - 1))  = g^(a * b)
-//!     result(row) = prod_{t < 2w}   (1 + c_t * (g^(2^t) - 1))              = g^(lo + 2^w * hi)
-//!
-//!     c         the 2w bits of lo followed by those of hi
+//!     base(x)   = prod_{i < w}  (1 + a_i(x) * (G_i - 1))                 = g^a
+//!     power(x)  = prod_{i < w}  (1 + b_i(x) * (base(x)^(2^i) - 1))       = g^(a * b)
+//!     result(x) = prod_{t < 2w} (1 + c_t(x) * (G_t - 1))                 = g^(lo + 2^w * hi)
 //! ```
 //!
-//! The reduction proves `factor(row) = result(row)` on every row in four steps.
+//! The reduction proves `power(row) = result(row)` on every row, then ties both sides to bits.
 //!
 //! 1. A random row point compares the two lifts at one value, the root.
-//! 2. A product check walks the factor tree from that root down to its leaves.
-//! 3. A second product check walks the result tree from the same root.
-//! 4. Each leaf check ends on evaluations of the committed operand columns.
+//! 2. A product check walks the power tree to its `w` leaf columns at one row point.
+//! 3. Each leaf column is a Frobenius power of a selector of `base`, so twisting the claims
+//!    turns them into claims on `base` and on the bits of `b`, which one sumcheck checks.
+//! 4. A product check walks the base tree from that claim on `base` to the bits of `a`.
+//! 5. A product check walks the result tree from the root to the bits of both limbs.
 //!
-//! The four evaluations leave as claims at two points the caller must still discharge.
+//! Squaring is linear over GF(2), so for a Boolean `x` and every bit `i`
 //!
-//! This module is the whole relation, so a faster construction replaces it as one unit.
+//! ```text
+//!     phi(y) = y^2,   phi^(-i)(1 + b_i * (base^(2^i) - 1)) = 1 + b_i * (base - 1)
+//!     phi^(-i)(sum_x eq(r, x) * v(x)) = sum_x eq(phi^(-i)(r), x) * phi^(-i)(v(x))
+//! ```
+//!
+//! so a claim on leaf column `i` at `r` becomes a claim on `1 + b_i * (base - 1)` at the
+//! twisted point, and every bit's claim reads the same `base`.
+//!
+//! Each tree's prover sends the row extension of every leaf column at the point its layers end
+//! on, and a random point folds those per-bit values into one claim on the operand column.
 //!
 //! # Soundness
 //!
@@ -50,11 +61,13 @@
 //!
 //! ```text
 //!     row point       m / 2^n
-//!     tree of depth D sum_{d < D} (3 * (m + d) + 1) / 2^n  +  3 * (m + D) / 2^n
-//!
-//!     factor tree     D = 2k
-//!     result tree     D = k + 1
+//!     tree of depth D sum_{d < D} (3 * (m + d) + 1) / 2^n
+//!     trees           power and base of depth k, result of depth k + 1
+//!     selector        3 * m / 2^n
+//!     folds           four points of k coordinates, k / 2^n each
 //! ```
+//!
+//! The twist is a bijection, so it adds no error.
 //!
 //! The field check runs at different moments on the two sides.
 //!
@@ -64,14 +77,12 @@
 //!
 //! Either way a small field never yields an accepted proof.
 //!
-//! The prover performs `O(2^m * w^2)` field operations, dominated by the factor tree leaves.
-//!
-//! It also holds `O(2^m * w^2)` field elements, roughly 260 KB per padded 64-bit product with a 128-bit field, plus the proof and transcript.
+//! The prover performs `O(2^m * w)` field operations and holds `O(2^m * w)` field elements.
 //!
 //! ```text
-//!     factor leaves     w^2 per row, 4096 at w = 64
-//!     leaf tables       a, b, and the weights, each repeated over the w^2 leaf cells
-//!     layers            consumed before allocating the leaf tables
+//!     power and base leaves     w per row
+//!     result leaves             2w per row
+//!     selector tables           2w per row
 //! ```
 
 mod error;
@@ -80,28 +91,40 @@ mod record;
 mod round;
 mod transcript;
 
+use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::iter;
 
 pub use error::IntegerMulError;
-use exponent::{evaluate, factor_weights, generator_squarings, result_weights};
+use exponent::{evaluate, generator_squarings};
 use p3_challenger::fs::TranscriptField;
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{ExtensionField, Field};
+use p3_maybe_rayon::prelude::*;
 use p3_multilinear_util::point::Point;
 use p3_security::word::WordIntegerMulSecurityModel;
 use p3_sumcheck::generic_degree::RoundProver;
 pub use record::IntegerMulProof;
 use record::{LayerProof, TreeProof};
-use round::{Composite, DEGREE};
+use round::{DEGREE, ProductLayer, Selector};
+use serde::{Deserialize, Serialize};
+use tracing::{info_span, instrument};
 use transcript::{ProverTranscript, TranscriptShape, VerifierTranscript};
 
+use crate::device::{DeviceTree, PRODUCT_COLUMNS, WordDevice, Words, from_device, slice_to_device};
 use crate::{Packed, PackedWord};
 
-/// One of the two product trees the reduction walks.
+/// Rows one parallel task covers.
+const BLOCK: usize = 1 << 12;
+
+/// One of the three product trees the reduction walks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Tree {
-    /// The tree whose leaves select `g^(2^(i + j))` by the bit pair `a_i * b_j`.
-    Factor,
+    /// The tree whose leaves select `base^(2^i)` by bit `i` of the right factor.
+    Power,
+    /// The tree whose leaves select `g^(2^i)` by bit `i` of the left factor.
+    Base,
     /// The tree whose leaves select `g^(2^t)` by bit `t` of the two limbs.
     Result,
 }
@@ -110,17 +133,22 @@ impl Tree {
     /// Returns the number of layers between the root and the leaves.
     const fn depth(self, bit_variables: usize) -> usize {
         match self {
-            // Two bit indices address one leaf.
-            Self::Factor => 2 * bit_variables,
+            Self::Power | Self::Base => bit_variables,
             // One index over twice the word width addresses one leaf.
             Self::Result => bit_variables + 1,
         }
     }
 
-    /// Returns the name reported by a depth mismatch.
+    /// Returns the number of leaf columns, one per bit the tree selects by.
+    const fn leaves(self, bit_variables: usize) -> usize {
+        1 << self.depth(bit_variables)
+    }
+
+    /// Returns the name reported by a shape mismatch.
     const fn name(self) -> &'static str {
         match self {
-            Self::Factor => "factor",
+            Self::Power => "power",
+            Self::Base => "base",
             Self::Result => "result",
         }
     }
@@ -128,16 +156,27 @@ impl Tree {
     /// Returns the transcript label around one layer sumcheck.
     const fn layer_label(self) -> &'static str {
         match self {
-            Self::Factor => "factor_layer",
+            Self::Power => "power_layer",
+            Self::Base => "base_layer",
             Self::Result => "result_layer",
         }
     }
 
-    /// Returns the transcript label around the leaf sumcheck.
-    const fn leaf_label(self) -> &'static str {
+    /// Returns the transcript label of the leaf evaluations.
+    const fn leaves_label(self) -> &'static str {
         match self {
-            Self::Factor => "factor_leaf",
-            Self::Result => "result_leaf",
+            Self::Power => "power_leaves",
+            Self::Base => "base_leaves",
+            Self::Result => "result_leaves",
+        }
+    }
+
+    /// Returns the transcript label of the point folding the leaf evaluations.
+    const fn point_label(self) -> &'static str {
+        match self {
+            Self::Power => "fold_point",
+            Self::Base => "left_point",
+            Self::Result => "limb_point",
         }
     }
 }
@@ -152,7 +191,7 @@ pub(crate) struct OperandClaim<F> {
 }
 
 /// The multiplication reduction of one statement.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct IntegerMulReduction {
     /// Variables selecting one padded multiplication row.
     row_variables: usize,
@@ -177,16 +216,20 @@ impl IntegerMulReduction {
         1 << self.bit_variables
     }
 
-    /// Rejects a challenge field whose multiplicative group is too small for the lift.
+    /// Rejects a challenge field too small for the lift, or not of characteristic two.
     ///
     /// # Errors
     ///
-    /// Returns an error when the field has fewer than `2^(2w)` elements.
+    /// Returns an error when the field has fewer than `2^(2w)` elements or its order is not a
+    /// power of two.
     pub(crate) fn check_field<EF: Field>(&self) -> Result<(), IntegerMulError> {
         // A field of order at least 2^(2w) has a group of order at least 2^(2w) - 1.
         let required = 2 * self.width();
         if EF::order().bits() <= required as u64 {
             return Err(IntegerMulError::FieldTooSmall { required });
+        }
+        if binary_degree::<EF>().is_none() {
+            return Err(IntegerMulError::FieldNotBinary);
         }
         Ok(())
     }
@@ -209,10 +252,13 @@ impl IntegerMulReduction {
 
     /// Proves every product and returns claims on the left, right, low, and high columns.
     ///
+    /// `columns` are on the host, or `None` when `device` holds them as its product columns.
+    ///
     /// The field must already have passed [`Self::check_field`].
     pub(crate) fn prove<F, EF, W, C>(
         &self,
-        columns: &[Vec<Packed<W>>; 4],
+        columns: Option<&[Vec<Packed<W>>; 4]>,
+        device: Option<&dyn WordDevice>,
         challenger: &mut C,
     ) -> (IntegerMulProof<F, EF>, [OperandClaim<EF>; 4])
     where
@@ -221,126 +267,168 @@ impl IntegerMulReduction {
         W: PackedWord,
         C: FieldChallenger<F> + GrindingChallenger<Witness = F>,
     {
+        // Padding rows are zero products, which lift to one on both sides.
+        let rows = 1 << self.row_variables;
+        let host = columns.map(|columns| {
+            columns.each_ref().map(|column| {
+                let mut words = column
+                    .par_iter()
+                    .map(|&packed| W::unpack(packed).to_u64())
+                    .collect::<Vec<_>>();
+                words.resize(rows, 0);
+                words
+            })
+        });
+        let words: [Words<'_>; 4] = match &host {
+            Some(host) => core::array::from_fn(|i| Words::Host(&host[i])),
+            None => core::array::from_fn(|i| Words::Column(PRODUCT_COLUMNS + i)),
+        };
+        let mut transcript = ProverTranscript::<C, F, EF>::new(challenger, self.transcript_shape());
+        let proved = self.prove_words(&mut transcript, words, [words[0], words[1]], device);
+        transcript.finish();
+        proved
+    }
+
+    /// Runs the reduction over padded words, the power tree built over `power`'s factors, every
+    /// tree and the selector on `device` when there is one.
+    fn prove_words<C, F, EF>(
+        &self,
+        transcript: &mut ProverTranscript<'_, C, F, EF>,
+        words: [Words<'_>; 4],
+        power: [Words<'_>; 2],
+        device: Option<&dyn WordDevice>,
+    ) -> (IntegerMulProof<F, EF>, [OperandClaim<EF>; 4])
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F>,
+        C: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
         let (m, k, width) = (self.row_variables, self.bit_variables, self.width());
+        let degree = binary_degree::<EF>().expect("the field is binary");
+        let powers = generator_squarings::<EF>(2 * width);
+        let [left, right, low, high] = words;
+
         let rows = 1 << m;
 
-        // Padding rows are zero products, which lift to one on both sides.
-        let words = columns.each_ref().map(|column| {
-            (0..rows)
-                .map(|row| {
-                    column
-                        .get(row)
-                        .map_or(0, |&packed| W::unpack(packed).to_u64())
-                })
-                .collect::<Vec<_>>()
+        // Power tree: the root compares both lifts, and the leaves leave one value per bit.
+        let mut tree = Layers::power(
+            &powers[..width],
+            power[0],
+            power[1],
+            rows,
+            width,
+            Tree::Power.depth(k),
+            device,
+        );
+        let (row_point, root) = transcript.row_point(m, |point| tree.top_at(point));
+        let (layers, point, _) =
+            prove_layers(transcript, Tree::Power, &mut tree, row_point.clone(), root);
+        let leaves = tree.leaf_values(width, &point[..m]);
+        drop(tree);
+        let fold = transcript.leaves(Tree::Power, &leaves, k);
+
+        // Selector: the twisted leaf claims, batched by the fold, read the base and right bits.
+        let gamma = Point::new(fold.as_slice()).equality_weights_msb();
+        let claimed = twisted_sum(&leaves, &gamma, degree);
+        let twisted = twisted_points(&point[..m], width, degree);
+        let selector = device.map(|device| {
+            device.selector(
+                &twisted
+                    .iter()
+                    .map(|point| slice_to_device(point))
+                    .collect::<Vec<_>>(),
+                &slice_to_device(&gamma),
+                right,
+                &slice_to_device(&powers[..width]),
+                left,
+                rows,
+                Selector::<EF>::device_nodes(),
+            )
         });
-        let [left, right, low, high] = &words;
-        let powers = generator_squarings::<EF>(2 * width);
-
-        let factor_layers = product_layers(
-            factor_leaves(left, right, width, &powers),
-            Tree::Factor.depth(k),
+        let mut prover = selector.map_or_else(
+            || {
+                let weights = twisted
+                    .iter()
+                    .zip(&gamma)
+                    .map(|(twisted, &scale)| {
+                        let mut table = Point::new(twisted.as_slice()).equality_weights_msb();
+                        table.par_iter_mut().for_each(|value| *value *= scale);
+                        table
+                    })
+                    .collect();
+                let base = lifts(left.host(), &powers[..width]);
+                let bits = (0..width)
+                    .map(|bit| {
+                        right
+                            .host()
+                            .par_iter()
+                            .map(|&word| EF::from_bool((word >> bit) & 1 == 1))
+                            .collect()
+                    })
+                    .collect();
+                Selector::new(weights, bits, base)
+            },
+            Selector::Device,
         );
-
-        // One row point compares the two lifts, and the factor root is the shared value.
-        let mut transcript = ProverTranscript::<C, F, EF>::new(challenger, self.transcript_shape());
-        let (row_point, root) = transcript.row_point(m, |point| evaluate(&factor_layers[0], point));
-
-        // Factor tree: the leaf check ends on a(x, i) and b(x, j).
-        let (layers, point, claim) = prove_layers(
-            &mut transcript,
-            Tree::Factor,
-            factor_layers,
-            row_point.clone(),
-            root,
-        );
-        let [a, b, p] = factor_leaf_tables::<EF>(left, right, width);
-        let mut prover = Composite::new(
-            [Point::new(point.as_slice()).equality_weights_msb(), a, b, p],
-            |&[eq, a, b, p]| eq * (EF::ONE + a * b * p),
-        );
-        let rounds = point.len();
-        let ((leaf, end), values) = transcript.leaf(Tree::Factor, |challenger| {
-            let (proof, end) = prover.prove::<F, _>(challenger, rounds, DEGREE, 0, claim);
-            let [_, a, b, _] = prover.terminal();
-            ((proof, end), [a, b])
+        let ((selector, end), selected, right_point) = transcript.selector(k, |challenger| {
+            let (proof, end) = info_span!("selector")
+                .in_scope(|| prover.prove::<F, _>(challenger, m, DEGREE, 0, claimed));
+            ((proof, end), prover.terminal())
         });
-        // Folding truncates the tables but retains their allocations.
         drop(prover);
-        let (x, bits) = end.as_slice().split_at(m);
-        let factor = TreeProof {
-            layers,
-            leaf,
-            values,
-        };
-        let left_claim = OperandClaim {
-            point: [x, &bits[..k]].concat(),
-            value: values[0],
-        };
+        let end = end.as_slice().to_vec();
         let right_claim = OperandClaim {
-            point: [x, &bits[k..]].concat(),
-            value: values[1],
+            point: [end.as_slice(), &right_point].concat(),
+            value: evaluate(&selected[1..], &right_point),
         };
+        let power = TreeProof { layers, leaves };
 
-        // The factor tree has been consumed before allocating the result tree.
-        let result_layers = product_layers(
-            result_leaves(low, high, width, &powers),
-            Tree::Result.depth(k),
+        // Base tree: from the selector's claim on the base lift down to the left bits.
+        let mut tree = Layers::bits(
+            &[left],
+            &powers[..width],
+            rows,
+            width,
+            Tree::Base.depth(k),
+            device,
         );
-
-        // Result tree: the leaf check ends on c(x, s, t), split into its two limbs.
-        let (layers, point, claim) = prove_layers(
-            &mut transcript,
-            Tree::Result,
-            result_layers,
-            row_point,
-            root,
-        );
-        let [c, q] = result_leaf_tables::<EF>(low, high, width);
-        let mut prover = Composite::new(
-            [Point::new(point.as_slice()).equality_weights_msb(), c, q],
-            |&[eq, c, q]| eq * (EF::ONE + c * q),
-        );
-        let rounds = point.len();
-        let low_bits = bit_rows::<EF>(low, width);
-        let high_bits = bit_rows::<EF>(high, width);
-        let ((leaf, end), values) = transcript.leaf(Tree::Result, |challenger| {
-            let (proof, end) = prover.prove::<F, _>(challenger, rounds, DEGREE, 0, claim);
-
-            // The limb selector is the coordinate after the rows, so each limb is read without it.
-            let (x, rest) = end.as_slice().split_at(m);
-            let limb_point = [x, &rest[1..]].concat();
-            let values = [
-                evaluate(&low_bits, &limb_point),
-                evaluate(&high_bits, &limb_point),
-            ];
-            ((proof, end), values)
-        });
-        transcript.finish();
-        let (x, rest) = end.as_slice().split_at(m);
-        let limb_point = [x, &rest[1..]].concat();
-        let result = TreeProof {
-            layers,
-            leaf,
-            values,
+        let (layers, point, _) = prove_layers(transcript, Tree::Base, &mut tree, end, selected[0]);
+        drop(tree);
+        let leaves = column_bits(&[left], width, &point[..m], device);
+        let left_point = transcript.leaves(Tree::Base, &leaves, k);
+        let left_claim = OperandClaim {
+            point: [&point[..m], &left_point].concat(),
+            value: evaluate(&leaves, &left_point),
         };
+        let base = TreeProof { layers, leaves };
 
+        // Result tree: from the shared root down to the bits of both limbs.
+        let mut tree =
+            Layers::bits(&[low, high], &powers, rows, width, Tree::Result.depth(k), device);
+        let (layers, point, _) = prove_layers(transcript, Tree::Result, &mut tree, row_point, root);
+        drop(tree);
+        let leaves = column_bits(&[low, high], width, &point[..m], device);
+        let limb_point = transcript.leaves(Tree::Result, &leaves, k);
+        let limb_claims = leaves.split_at(width);
+        let limb_claim = |bits: &[EF]| OperandClaim {
+            point: [&point[..m], &limb_point].concat(),
+            value: evaluate(bits, &limb_point),
+        };
         let claims = [
             left_claim,
             right_claim,
-            OperandClaim {
-                point: limb_point.clone(),
-                value: values[0],
-            },
-            OperandClaim {
-                point: limb_point,
-                value: values[1],
-            },
+            limb_claim(limb_claims.0),
+            limb_claim(limb_claims.1),
         ];
+        let result = TreeProof { layers, leaves };
+
         (
             IntegerMulProof {
                 root,
-                factor,
+                power,
+                selector,
+                selected,
+                base,
                 result,
             },
             claims,
@@ -362,10 +450,15 @@ impl IntegerMulReduction {
         EF: ExtensionField<F>,
         C: FieldChallenger<F> + GrindingChallenger<Witness = F>,
     {
-        // The field and both depths are checked before the reduction's own transcript absorbs anything.
+        // The field and every record shape are checked before the transcript absorbs anything.
         self.check_field::<EF>()?;
-        for (tree, record) in [(Tree::Factor, &proof.factor), (Tree::Result, &proof.result)] {
-            let expected = tree.depth(self.bit_variables);
+        let k = self.bit_variables;
+        for (tree, record) in [
+            (Tree::Power, &proof.power),
+            (Tree::Base, &proof.base),
+            (Tree::Result, &proof.result),
+        ] {
+            let expected = tree.depth(k);
             if record.layers.len() != expected {
                 return Err(IntegerMulError::TreeDepth {
                     tree: tree.name(),
@@ -373,6 +466,21 @@ impl IntegerMulReduction {
                     actual: record.layers.len(),
                 });
             }
+            let expected = tree.leaves(k);
+            if record.leaves.len() != expected {
+                return Err(IntegerMulError::LeafCount {
+                    step: tree.name(),
+                    expected,
+                    actual: record.leaves.len(),
+                });
+            }
+        }
+        if proof.selected.len() != self.width() + 1 {
+            return Err(IntegerMulError::LeafCount {
+                step: "selector",
+                expected: self.width() + 1,
+                actual: proof.selected.len(),
+            });
         }
 
         let mut transcript =
@@ -389,7 +497,7 @@ impl IntegerMulReduction {
         }
     }
 
-    /// Replays both trees, stopping at the first failed check.
+    /// Replays every step, stopping at the first failed check.
     fn replay<C, F, EF>(
         &self,
         transcript: &mut VerifierTranscript<'_, C, F, EF>,
@@ -401,33 +509,81 @@ impl IntegerMulReduction {
         C: FieldChallenger<F> + GrindingChallenger<Witness = F>,
     {
         let (m, k, width) = (self.row_variables, self.bit_variables, self.width());
+        let degree = binary_degree::<EF>().ok_or(IntegerMulError::FieldNotBinary)?;
+        let powers = generator_squarings::<EF>(2 * width);
+        let malformed = |step, values: &[EF], expected| IntegerMulError::LeafCount {
+            step,
+            expected,
+            actual: values.len(),
+        };
         let row_point = transcript.row_point(m, proof.root);
 
-        // Factor tree: the leaf closes on eq * (1 + a * b * (g^(2^(i + j)) - 1)).
+        // Power tree: the leaf values must extend the claim the layers left.
         let (point, claim) = verify_layers(
             transcript,
-            Tree::Factor,
-            &proof.factor.layers,
+            Tree::Power,
+            &proof.power.layers,
             row_point.clone(),
             proof.root,
         )?;
-        let (end, value) = verify_leaf(transcript, Tree::Factor, &proof.factor, &point, claim)?;
-        let [a, b] = proof.factor.values;
-        let weight = evaluate(&factor_weights::<EF>(width), &end[m..]);
-        if value != Point::eval_eq(&point, &end) * (EF::ONE + a * b * weight) {
+        let (x, z) = point.split_at(m);
+        if claim != evaluate(&proof.power.leaves, z) {
             return Err(IntegerMulError::LeafClaim);
         }
-        let (x, bits) = end.split_at(m);
-        let left_claim = OperandClaim {
-            point: [x, &bits[..k]].concat(),
-            value: a,
-        };
+        let fold = transcript
+            .leaves(Tree::Power, &proof.power.leaves, k)
+            .ok_or_else(|| malformed(Tree::Power.name(), &proof.power.leaves, width))?;
+
+        // Selector: its sum is the twisted leaf values, and it closes on the selected values.
+        let gamma = Point::new(fold.as_slice()).equality_weights_msb();
+        if proof.selector.claimed_sum != twisted_sum(&proof.power.leaves, &gamma, degree) {
+            return Err(IntegerMulError::EnteringClaim);
+        }
+        let (replay, right_point) = transcript
+            .selector(&proof.selected, k, |challenger| {
+                proof.selector.verify(challenger, m, DEGREE, 0)
+            })
+            .ok_or_else(|| malformed("selector", &proof.selected, width + 1))?;
+        let (end, value) = replay?;
+        let end = end.as_slice();
+        let (base, bits) = (proof.selected[0], &proof.selected[1..]);
+        let expected: EF = twisted_points(x, width, degree)
+            .iter()
+            .zip(&gamma)
+            .zip(bits)
+            .map(|((twisted, &scale), &bit)| {
+                scale * Point::eval_eq(twisted, end) * (EF::ONE + bit * (base - EF::ONE))
+            })
+            .sum();
+        if value != expected {
+            return Err(IntegerMulError::SelectorClaim);
+        }
         let right_claim = OperandClaim {
-            point: [x, &bits[k..]].concat(),
-            value: b,
+            point: [end, &right_point].concat(),
+            value: evaluate(bits, &right_point),
         };
 
-        // Result tree: the limb selector s mixes the two limbs, c = (1 - s) * lo + s * hi.
+        // Base tree: from the selected base lift down to the left bits.
+        let (point, claim) = verify_layers(
+            transcript,
+            Tree::Base,
+            &proof.base.layers,
+            end.to_vec(),
+            base,
+        )?;
+        let (x, z) = point.split_at(m);
+        if claim != leaf_closing(&proof.base.leaves, &powers[..width], z) {
+            return Err(IntegerMulError::LeafClaim);
+        }
+        let left_point = transcript
+            .leaves(Tree::Base, &proof.base.leaves, k)
+            .ok_or_else(|| malformed(Tree::Base.name(), &proof.base.leaves, width))?;
+        let left_claim = OperandClaim {
+            point: [x, &left_point].concat(),
+            value: evaluate(&proof.base.leaves, &left_point),
+        };
+
+        // Result tree: from the shared root down to the bits of both limbs.
         let (point, claim) = verify_layers(
             transcript,
             Tree::Result,
@@ -435,29 +591,236 @@ impl IntegerMulReduction {
             row_point,
             proof.root,
         )?;
-        let (end, value) = verify_leaf(transcript, Tree::Result, &proof.result, &point, claim)?;
-        let [low, high] = proof.result.values;
-        let selector = end[m];
-        let limbs = low + selector * (high - low);
-        let weight = evaluate(&result_weights::<EF>(width), &end[m..]);
-        if value != Point::eval_eq(&point, &end) * (EF::ONE + limbs * weight) {
+        let (x, z) = point.split_at(m);
+        if claim != leaf_closing(&proof.result.leaves, &powers, z) {
             return Err(IntegerMulError::LeafClaim);
         }
-        let limb_point = [&end[..m], &end[m + 1..]].concat();
+        let limb_point = transcript
+            .leaves(Tree::Result, &proof.result.leaves, k)
+            .ok_or_else(|| malformed(Tree::Result.name(), &proof.result.leaves, 2 * width))?;
+        let (low, high) = proof.result.leaves.split_at(width);
+        let limb_claim = |bits: &[EF]| OperandClaim {
+            point: [x, &limb_point].concat(),
+            value: evaluate(bits, &limb_point),
+        };
 
-        Ok([
-            left_claim,
-            right_claim,
-            OperandClaim {
-                point: limb_point.clone(),
-                value: low,
-            },
-            OperandClaim {
-                point: limb_point,
-                value: high,
-            },
-        ])
+        Ok([left_claim, right_claim, limb_claim(low), limb_claim(high)])
     }
+}
+
+/// Returns the degree of the field over GF(2), or nothing when its order is not a power of two.
+fn binary_degree<F: Field>() -> Option<usize> {
+    let order = F::order();
+    (order.count_ones() == 1).then(|| order.bits() as usize - 1)
+}
+
+/// Applies `phi^(-i)`, the inverse of the `i`-th Frobenius power, to one element.
+fn twist<F: Field>(value: F, i: usize, degree: usize) -> F {
+    // phi has order `degree`, so its inverse power is the complementary forward power.
+    value.exp_power_of_2((degree - i % degree) % degree)
+}
+
+/// Returns `phi^(-i)(point)`, coordinate by coordinate, for every `i < count`.
+fn twisted_points<F: Field>(point: &[F], count: usize, degree: usize) -> Vec<Vec<F>> {
+    let squarings = point
+        .iter()
+        .map(|&coordinate| {
+            iter::successors(Some(coordinate), |value| Some(value.square()))
+                .take(degree)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    (0..count)
+        .map(|i| {
+            squarings
+                .iter()
+                .map(|powers| powers[(degree - i % degree) % degree])
+                .collect()
+        })
+        .collect()
+}
+
+/// Returns `sum_i gamma_i * phi^(-i)(leaf_i)`, the selector sumcheck's claimed sum.
+fn twisted_sum<F: Field>(leaves: &[F], gamma: &[F], degree: usize) -> F {
+    leaves
+        .iter()
+        .zip(gamma)
+        .enumerate()
+        .map(|(i, (&leaf, &scale))| scale * twist(leaf, i, degree))
+        .sum()
+}
+
+/// Returns `sum_t eq(z, t) * (1 + bit_t * (powers_t - 1))`, a selector leaf layer at `z`.
+fn leaf_closing<F: Field>(bits: &[F], powers: &[F], z: &[F]) -> F {
+    Point::new(z)
+        .equality_weights_msb()
+        .into_iter()
+        .zip(bits)
+        .zip(powers)
+        .map(|((weight, &bit), &power)| weight * (F::ONE + bit * (power - F::ONE)))
+        .sum()
+}
+
+/// Adds two equal-length accumulators.
+fn add_into<F: Field>(mut acc: Vec<F>, other: Vec<F>) -> Vec<F> {
+    for (slot, value) in acc.iter_mut().zip(other) {
+        *slot += value;
+    }
+    acc
+}
+
+/// Returns `g^x` for every row's word, from byte tables of the squarings `powers[t] = g^(2^t)`.
+#[instrument(skip_all)]
+fn lifts<F: Field>(words: &[u64], powers: &[F]) -> Vec<F> {
+    let tables = powers
+        .chunks(8)
+        .map(|group| {
+            let mut table = vec![F::ONE; 1 << group.len()];
+            for subset in 1..table.len() {
+                // Each subset extends the one without its lowest member.
+                table[subset] =
+                    table[subset & (subset - 1)] * group[subset.trailing_zeros() as usize];
+            }
+            table
+        })
+        .collect::<Vec<_>>();
+    words
+        .par_iter()
+        .map(|&word| {
+            tables
+                .iter()
+                .enumerate()
+                .map(|(group, table)| table[(word >> (8 * group)) as usize & (table.len() - 1)])
+                .product()
+        })
+        .collect()
+}
+
+/// Returns the power-tree leaves of every row, addressed `(row, i)`.
+///
+/// Leaf `i` is `base^(2^i)` when bit `i` of the right factor is set, and one otherwise.
+#[instrument(skip_all)]
+fn power_leaves<F: Field>(bases: &[F], right: &[u64], width: usize) -> Vec<F> {
+    let mut leaves = F::zero_vec(bases.len() * width);
+    leaves
+        .par_chunks_mut(width)
+        .zip(bases.par_iter().zip(right.par_iter()))
+        .for_each(|(row, (&base, &word))| {
+            let mut power = base;
+            for (i, leaf) in row.iter_mut().enumerate() {
+                *leaf = if (word >> i) & 1 == 1 { power } else { F::ONE };
+                power = power.square();
+            }
+        });
+    leaves
+}
+
+/// Returns the leaves selecting `powers[t]` by bit `t` of each row's words, addressed `(row, t)`.
+///
+/// The words of one row are read in order, `width` bits each.
+#[instrument(skip_all)]
+fn bit_leaves<F: Field>(columns: &[&[u64]], powers: &[F], width: usize) -> Vec<F> {
+    let cells = columns.len() * width;
+    let mut leaves = vec![F::ONE; columns[0].len() * cells];
+    leaves
+        .par_chunks_mut(cells)
+        .enumerate()
+        .for_each(|(row, leaves)| {
+            for (limb, column) in columns.iter().enumerate() {
+                let word = column[row];
+                for bit in 0..width {
+                    if (word >> bit) & 1 == 1 {
+                        leaves[limb * width + bit] = powers[limb * width + bit];
+                    }
+                }
+            }
+        });
+    leaves
+}
+
+/// Returns each leaf column's row extension at `point`.
+#[instrument(skip_all)]
+fn leaf_values<F: Field>(leaves: &[F], count: usize, point: &[F]) -> Vec<F> {
+    let weights = Point::new(point).equality_weights_msb();
+    leaves
+        .par_chunks(count)
+        .zip(weights.par_iter())
+        .par_fold_reduce(
+            || F::zero_vec(count),
+            |mut acc, (row, &weight)| {
+                for (slot, &value) in acc.iter_mut().zip(row) {
+                    *slot += weight * value;
+                }
+                acc
+            },
+            add_into,
+        )
+}
+
+/// Returns each bit's row extension at `point`, word after word, `width` bits each, on
+/// `device` when there is one.
+#[instrument(skip_all, name = "bit_values")]
+fn column_bits<F: Field>(
+    columns: &[Words<'_>],
+    width: usize,
+    point: &[F],
+    device: Option<&dyn WordDevice>,
+) -> Vec<F> {
+    match device {
+        Some(device) => device
+            .bit_values(columns, width, &slice_to_device(point))
+            .into_iter()
+            .map(from_device)
+            .collect(),
+        None => {
+            let columns = columns.iter().map(|words| words.host()).collect::<Vec<_>>();
+            bit_values(&columns, width, point)
+        }
+    }
+}
+
+/// Returns each bit's row extension at `point`, word after word, `width` bits each.
+fn bit_values<F: Field>(columns: &[&[u64]], width: usize, point: &[F]) -> Vec<F> {
+    let weights = Point::new(point).equality_weights_msb();
+    let bytes = width.div_ceil(8);
+    let rows = weights.len();
+
+    // Each row adds its weight to the slot its byte selects, one table per byte position.
+    let slots = columns.len() * bytes * 256;
+    let accumulated = (0..rows.div_ceil(BLOCK)).into_par_iter().par_fold_reduce(
+        || F::zero_vec(slots),
+        |mut acc, block| {
+            for row in block * BLOCK..rows.min((block + 1) * BLOCK) {
+                let weight = weights[row];
+                for (index, column) in columns.iter().enumerate() {
+                    let mut word = column[row];
+                    for byte in 0..bytes {
+                        let selected = (word & 0xff) as usize;
+                        if selected != 0 {
+                            acc[(index * bytes + byte) * 256 + selected] += weight;
+                        }
+                        word >>= 8;
+                    }
+                }
+            }
+            acc
+        },
+        add_into,
+    );
+
+    // A bit's value collects every byte value that sets it.
+    (0..columns.len())
+        .flat_map(|index| {
+            let accumulated = &accumulated;
+            (0..width).map(move |bit| {
+                let table = &accumulated[(index * bytes + bit / 8) * 256..][..256];
+                (0..256)
+                    .filter(|selected| (selected >> (bit % 8)) & 1 == 1)
+                    .map(|selected| table[selected])
+                    .sum()
+            })
+        })
+        .collect()
 }
 
 /// Builds every layer of a product tree from its leaves, root first.
@@ -465,21 +828,102 @@ impl IntegerMulReduction {
 /// ```text
 ///     V_d(z) = V_{d+1}(z, 0) * V_{d+1}(z, 1)
 /// ```
+#[instrument(skip_all)]
 fn product_layers<F: Field>(leaves: Vec<F>, depth: usize) -> Vec<Vec<F>> {
     let mut layers = Vec::with_capacity(depth + 1);
     layers.push(leaves);
     for _ in 0..depth {
         let below = layers.last().expect("the leaves are always present");
         let above = below
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&[zero, one]| zero * one)
+            .par_chunks_exact(2)
+            .map(|pair| pair[0] * pair[1])
             .collect();
         layers.push(above);
     }
     layers.reverse();
     layers
+}
+
+/// Every layer of one product tree, root first, on the host or on the device.
+enum Layers<F> {
+    Host(Vec<Vec<F>>),
+    Device(Box<dyn DeviceTree>, usize),
+}
+
+impl<F: Field> Layers<F> {
+    /// The power tree over the lifts of `left` by `lift_powers` and the bits of `right`, on
+    /// `device` when there is one.
+    fn power(
+        lift_powers: &[F],
+        left: Words<'_>,
+        right: Words<'_>,
+        rows: usize,
+        width: usize,
+        depth: usize,
+        device: Option<&dyn WordDevice>,
+    ) -> Self {
+        match device {
+            Some(device) => Self::Device(
+                device.power_tree(&slice_to_device(lift_powers), left, right, rows, width, depth),
+                depth,
+            ),
+            None => Self::Host(product_layers(
+                power_leaves(&lifts(left.host(), lift_powers), right.host(), width),
+                depth,
+            )),
+        }
+    }
+
+    /// The bit tree over `columns`, on `device` when there is one.
+    fn bits(
+        columns: &[Words<'_>],
+        powers: &[F],
+        rows: usize,
+        width: usize,
+        depth: usize,
+        device: Option<&dyn WordDevice>,
+    ) -> Self {
+        match device {
+            Some(device) => Self::Device(
+                device.bit_tree(columns, &slice_to_device(powers), rows, width, depth),
+                depth,
+            ),
+            None => {
+                let columns = columns.iter().map(|words| words.host()).collect::<Vec<_>>();
+                Self::Host(product_layers(bit_leaves(&columns, powers, width), depth))
+            }
+        }
+    }
+
+    /// The top layer, one product per row, evaluated at `point`.
+    fn top_at(&self, point: &[F]) -> F {
+        match self {
+            Self::Host(layers) => evaluate(&layers[0], point),
+            Self::Device(tree, _) => from_device(tree.top_at(&slice_to_device(point))),
+        }
+    }
+
+    /// The number of layers below the top.
+    fn depth(&self) -> usize {
+        match self {
+            Self::Host(layers) => layers.len() - 1,
+            Self::Device(_, depth) => *depth,
+        }
+    }
+
+    /// Each leaf cell's row extension at `point`.
+    fn leaf_values(&self, count: usize, point: &[F]) -> Vec<F> {
+        match self {
+            Self::Host(layers) => {
+                leaf_values(layers.last().expect("a tree has leaves"), count, point)
+            }
+            Self::Device(tree, _) => tree
+                .leaf_values(&slice_to_device(point))
+                .into_iter()
+                .map(from_device)
+                .collect(),
+        }
+    }
 }
 
 /// Runs every layer reduction of one tree, returning the leaf point and claim.
@@ -490,10 +934,11 @@ fn product_layers<F: Field>(leaves: Vec<F>, depth: usize) -> Vec<Vec<F>> {
 ///     sumcheck ends at r'     ->  halves h_0 = V_{d+1}(r', 0), h_1 = V_{d+1}(r', 1)
 ///     line challenge tau      ->  V_{d+1}(r', tau) = h_0 + tau * (h_1 - h_0)
 /// ```
+#[instrument(skip_all, fields(tree = tree.name()))]
 fn prove_layers<C, F, EF>(
     transcript: &mut ProverTranscript<'_, C, F, EF>,
     tree: Tree,
-    layers: Vec<Vec<EF>>,
+    layers: &mut Layers<EF>,
     mut point: Vec<EF>,
     mut claim: EF,
 ) -> (Vec<LayerProof<F, EF>>, Vec<EF>, EF)
@@ -502,31 +947,26 @@ where
     EF: ExtensionField<F>,
     C: FieldChallenger<F> + GrindingChallenger<Witness = F>,
 {
-    let mut proofs = Vec::with_capacity(layers.len() - 1);
-    // The root is already evaluated.
-    // Each lower layer is needed only until it is split.
-    for below in layers.into_iter().skip(1) {
-        // The new variable is the least significant, so halves are even and odd entries.
-        let (even, odd): (Vec<EF>, Vec<EF>) = below
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .copied()
-            .map(|[zero, one]| (zero, one))
-            .unzip();
-        drop(below);
-        let mut prover = Composite::new(
-            [
-                Point::new(point.as_slice()).equality_weights_msb(),
-                even,
-                odd,
-            ],
-            |&[eq, zero, one]| eq * zero * one,
-        );
+    let depth = layers.depth();
+    let mut proofs = Vec::with_capacity(depth);
+    for layer in 0..depth {
+        let _span = info_span!("product layer", layer, rounds = point.len()).entered();
+        let mut prover = match layers {
+            Layers::Host(layers) => {
+                // The new variable is the least significant, so halves are even and odd entries.
+                let below = &layers[layer + 1];
+                let even = below.par_chunks_exact(2).map(|pair| pair[0]).collect();
+                let odd = below.par_chunks_exact(2).map(|pair| pair[1]).collect();
+                ProductLayer::new(point.clone(), [even, odd], claim)
+            }
+            Layers::Device(tree, _) => {
+                ProductLayer::on_device(point.clone(), &mut **tree, layer, claim)
+            }
+        };
         let rounds = point.len();
         let ((sumcheck, end), halves, line) = transcript.layer(tree, |challenger| {
             let (proof, end) = prover.prove::<F, _>(challenger, rounds, DEGREE, 0, claim);
-            let [_, zero, one] = prover.terminal();
+            let [zero, one] = prover.terminal();
             ((proof, end), [zero, one])
         });
 
@@ -574,118 +1014,6 @@ where
     Ok((point, claim))
 }
 
-/// Replays one leaf sumcheck, returning its end point and final value.
-fn verify_leaf<C, F, EF>(
-    transcript: &mut VerifierTranscript<'_, C, F, EF>,
-    tree: Tree,
-    record: &TreeProof<F, EF>,
-    point: &[EF],
-    claim: EF,
-) -> Result<(Vec<EF>, EF), IntegerMulError>
-where
-    F: TranscriptField,
-    EF: ExtensionField<F>,
-    C: FieldChallenger<F> + GrindingChallenger<Witness = F>,
-{
-    if record.leaf.claimed_sum != claim {
-        return Err(IntegerMulError::EnteringClaim);
-    }
-    let (end, value) = transcript.leaf(tree, &record.values, |challenger| {
-        record.leaf.verify(challenger, point.len(), DEGREE, 0)
-    })?;
-    Ok((end.as_slice().to_vec(), value))
-}
-
-/// Returns the factor-tree leaves of every row, addressed `(row, i, j)`.
-///
-/// Leaf `(i, j)` is `g^(2^(i + j))` when `a_i * b_j = 1`, and one otherwise.
-fn factor_leaves<F: Field>(left: &[u64], right: &[u64], width: usize, powers: &[F]) -> Vec<F> {
-    let mut leaves = Vec::with_capacity(left.len() * width * width);
-    for (&a, &b) in left.iter().zip(right) {
-        for i in 0..width {
-            leaves.extend((0..width).map(|j| {
-                if (a >> i) & (b >> j) & 1 == 1 {
-                    powers[i + j]
-                } else {
-                    F::ONE
-                }
-            }));
-        }
-    }
-    leaves
-}
-
-/// Returns the result-tree leaves of every row, addressed `(row, t)`.
-///
-/// Leaf `t` is `g^(2^t)` when bit `t` of `lo + 2^w * hi` is set, and one otherwise.
-fn result_leaves<F: Field>(low: &[u64], high: &[u64], width: usize, powers: &[F]) -> Vec<F> {
-    let mut leaves = Vec::with_capacity(low.len() * 2 * width);
-    for (&lo, &hi) in low.iter().zip(high) {
-        let limbs = u128::from(lo) | (u128::from(hi) << width);
-        leaves.extend((0..2 * width).map(|t| {
-            if (limbs >> t) & 1 == 1 {
-                powers[t]
-            } else {
-                F::ONE
-            }
-        }));
-    }
-    leaves
-}
-
-/// Returns the factor leaf tables `a(x, i)`, `b(x, j)`, and `g^(2^(i + j)) - 1`.
-///
-/// Each spans the leaf cube `(row, i, j)`, so `a` repeats each bit `w` times.
-fn factor_leaf_tables<F: Field>(left: &[u64], right: &[u64], width: usize) -> [Vec<F>; 3] {
-    let weights = factor_weights::<F>(width);
-    let cells = left.len() * width * width;
-    let (mut a, mut b, mut p) = (
-        Vec::with_capacity(cells),
-        Vec::with_capacity(cells),
-        Vec::with_capacity(cells),
-    );
-    for (&x, &y) in left.iter().zip(right) {
-        for i in 0..width {
-            for j in 0..width {
-                a.push(bit::<F>(x, i));
-                b.push(bit::<F>(y, j));
-                p.push(weights[i * width + j]);
-            }
-        }
-    }
-    [a, b, p]
-}
-
-/// Returns the result leaf tables `c(x, s, t)` and `g^(2^t) - 1`.
-///
-/// The limb selector `s` picks the low limb at zero and the high limb at one.
-fn result_leaf_tables<F: Field>(low: &[u64], high: &[u64], width: usize) -> [Vec<F>; 2] {
-    let weights = result_weights::<F>(width);
-    let cells = low.len() * 2 * width;
-    let (mut c, mut q) = (Vec::with_capacity(cells), Vec::with_capacity(cells));
-    for (&lo, &hi) in low.iter().zip(high) {
-        let limbs = [lo, hi];
-        for t in 0..2 * width {
-            c.push(bit::<F>(limbs[t / width], t % width));
-            q.push(weights[t]);
-        }
-    }
-    [c, q]
-}
-
-/// Returns bit `index` of a word as a field element.
-fn bit<F: Field>(word: u64, index: usize) -> F {
-    F::from_bool((word >> index) & 1 == 1)
-}
-
-/// Expands one word per row into its bit table, row major and bit minor.
-fn bit_rows<F: Field>(words: &[u64], width: usize) -> Vec<F> {
-    words
-        .iter()
-        .flat_map(|&word| (0..width).map(move |index| bit(word, index)))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -694,7 +1022,7 @@ mod tests {
     use p3_challenger::{CanSample, HashChallenger};
     use p3_field::PrimeCharacteristicRing;
     use p3_keccak::Keccak256Hash;
-    use p3_word::{Word32, Word64};
+    use p3_word::{Word, Word32, Word64};
     use proptest::prelude::*;
 
     use super::*;
@@ -704,6 +1032,14 @@ mod tests {
 
     fn challenger() -> Challenger {
         Challenger::from_hasher(Vec::new(), Keccak256Hash)
+    }
+
+    // Expands one word per row into its bit table, row major and bit minor.
+    fn bit_rows(words: &[u64], width: usize) -> Vec<EF> {
+        words
+            .iter()
+            .flat_map(|&word| (0..width).map(move |index| EF::from_bool((word >> index) & 1 == 1)))
+            .collect()
     }
 
     // Packs one row per product into the four operand columns.
@@ -716,7 +1052,7 @@ mod tests {
         let reduction = IntegerMulReduction::new(rows.len(), W::BITS.ilog2() as usize).unwrap();
         let columns = columns(rows);
         let mut prover = challenger();
-        let (proof, claims) = reduction.prove::<EF, EF, W, _>(&columns, &mut prover);
+        let (proof, claims) = reduction.prove::<EF, EF, W, _>(Some(&columns), None, &mut prover);
         let mut verifier = challenger();
         let replayed = reduction.verify::<EF, EF, _>(&proof, &mut verifier)?;
 
@@ -737,7 +1073,7 @@ mod tests {
                         .map_or(0, |&packed| W::unpack(packed).to_u64())
                 })
                 .collect::<Vec<_>>();
-            let bits = bit_rows::<EF>(&words, W::BITS as usize);
+            let bits = bit_rows(&words, W::BITS as usize);
             assert_eq!(evaluate(&bits, &claim.point), claim.value);
         }
         Ok(())
@@ -751,231 +1087,6 @@ mod tests {
     fn word32_row(a: u32, b: u32) -> [Word32; 4] {
         let product = u64::from(a) * u64::from(b);
         [a, b, product as u32, (product >> 32) as u32].map(Word32::new)
-    }
-
-    #[test]
-    fn serialized_word64_proofs_keep_the_transcript_schedule() {
-        use p3_symmetric::CryptographicHasher;
-
-        // Baseline proof digests pin both a single row and a padded three-row trace.
-        for (rows, length, digest) in [
-            (
-                1,
-                7316,
-                [
-                    0x39, 0x22, 0xe6, 0xd6, 0xa4, 0x41, 0x7c, 0x76, 0x79, 0xdd, 0xcd, 0x51, 0xa8,
-                    0x2d, 0x7f, 0xf0, 0x6b, 0x96, 0xcb, 0xf5, 0x37, 0x62, 0xcc, 0x22, 0x37, 0xca,
-                    0xb8, 0xb3, 0x89, 0xb4, 0x55, 0x7f,
-                ],
-            ),
-            (
-                3,
-                9739,
-                [
-                    0x8c, 0x42, 0xbb, 0x89, 0x36, 0x56, 0x32, 0x48, 0xcf, 0x67, 0xa1, 0xed, 0x27,
-                    0x00, 0xc3, 0x7a, 0xd3, 0xd0, 0xc0, 0x53, 0x48, 0x27, 0x0f, 0xb7, 0x18, 0x45,
-                    0x7c, 0xdf, 0xb5, 0xc1, 0x71, 0xd5,
-                ],
-            ),
-        ] {
-            let rows = (0..rows)
-                .map(|row| {
-                    let a = (row as u64)
-                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                        .wrapping_add(0x0123_4567_89ab_cdef);
-                    let b = (row as u64)
-                        .wrapping_mul(0xd1b5_4a32_d192_ed03)
-                        .wrapping_add(0xfedc_ba98_7654_3210);
-                    word64_row(a, b)
-                })
-                .collect::<Vec<_>>();
-            let reduction = IntegerMulReduction::new(rows.len(), 6).unwrap();
-            let mut prover = challenger();
-            let (proof, claims) =
-                reduction.prove::<EF, EF, Word64, _>(&columns(&rows), &mut prover);
-            let bytes = postcard::to_allocvec(&proof).unwrap();
-            assert_eq!(bytes.len(), length);
-            assert_eq!(Keccak256Hash.hash_iter(bytes), digest);
-
-            let mut verifier = challenger();
-            assert_eq!(
-                reduction
-                    .verify::<EF, EF, _>(&proof, &mut verifier)
-                    .unwrap(),
-                claims
-            );
-            assert_eq!(
-                CanSample::<EF>::sample(&mut prover),
-                CanSample::<EF>::sample(&mut verifier)
-            );
-        }
-    }
-
-    // One dishonest prover step, each aimed at a single verifier check.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Forgery {
-        // The result tree starts from its own lift instead of the shared root.
-        ResultTreeFromItsOwnRoot,
-        // The false root runs down the result layers, and the leaf restarts from the truth.
-        ResultLeafFromItsTrueClaim,
-        // The factor tree reads the claimed low limb times one.
-        FactorTreeOverTheClaimedProduct,
-    }
-
-    // Proves a 64-bit record like the honest prover, except for the one forged step.
-    //
-    // Every operand value it reports is the true evaluation of its column.
-    fn forge(rows: &[[Word64; 4]], forgery: Forgery) -> IntegerMulProof<EF, EF> {
-        let reduction = IntegerMulReduction::new(rows.len(), 6).unwrap();
-        let (m, k, width) = (
-            reduction.row_variables,
-            reduction.bit_variables,
-            reduction.width(),
-        );
-        let words: [Vec<u64>; 4] = core::array::from_fn(|column| {
-            (0..1 << m)
-                .map(|row| rows.get(row).map_or(0, |row| row[column].get()))
-                .collect()
-        });
-        let [left, right, low, high] = &words;
-        let ones = vec![1; 1 << m];
-        let (tree_left, tree_right) = if forgery == Forgery::FactorTreeOverTheClaimedProduct {
-            (low, &ones)
-        } else {
-            (left, right)
-        };
-        let powers = generator_squarings::<EF>(2 * width);
-        let factor_layers = product_layers(
-            factor_leaves(tree_left, tree_right, width, &powers),
-            Tree::Factor.depth(k),
-        );
-        let result_layers = product_layers(
-            result_leaves(low, high, width, &powers),
-            Tree::Result.depth(k),
-        );
-        let mut sponge = challenger();
-        let mut transcript =
-            ProverTranscript::<Challenger, EF, EF>::new(&mut sponge, reduction.transcript_shape());
-        let (row_point, root) = transcript.row_point(m, |point| evaluate(&factor_layers[0], point));
-
-        // Factor tree over the forged or honest factors.
-        let (layers, point, claim) = prove_layers(
-            &mut transcript,
-            Tree::Factor,
-            factor_layers,
-            row_point.clone(),
-            root,
-        );
-        let [a, b, p] = factor_leaf_tables::<EF>(tree_left, tree_right, width);
-        let mut prover = Composite::new(
-            [Point::new(point.as_slice()).equality_weights_msb(), a, b, p],
-            |&[eq, a, b, p]| eq * (EF::ONE + a * b * p),
-        );
-        let (leaf, values) = transcript.leaf(Tree::Factor, |challenger| {
-            let (proof, end) = prover.prove::<EF, _>(challenger, point.len(), DEGREE, 0, claim);
-            let (x, bits) = end.as_slice().split_at(m);
-            let values = [
-                evaluate(&bit_rows(left, width), &[x, &bits[..k]].concat()),
-                evaluate(&bit_rows(right, width), &[x, &bits[k..]].concat()),
-            ];
-            (proof, values)
-        });
-        let factor = TreeProof {
-            layers,
-            leaf,
-            values,
-        };
-
-        // Result tree, entered from the root, from its own lift, or through forged halves.
-        let (layers, point, claim) = match forgery {
-            Forgery::ResultTreeFromItsOwnRoot => {
-                let own = evaluate(&result_layers[0], &row_point);
-                prove_layers(&mut transcript, Tree::Result, result_layers, row_point, own)
-            }
-            Forgery::ResultLeafFromItsTrueClaim => {
-                let (layers, point) =
-                    carry_false_claim(&mut transcript, &result_layers, row_point, root);
-                let truth = evaluate(result_layers.last().unwrap(), &point);
-                (layers, point, truth)
-            }
-            Forgery::FactorTreeOverTheClaimedProduct => prove_layers(
-                &mut transcript,
-                Tree::Result,
-                result_layers,
-                row_point,
-                root,
-            ),
-        };
-        let [c, q] = result_leaf_tables::<EF>(low, high, width);
-        let mut prover = Composite::new(
-            [Point::new(point.as_slice()).equality_weights_msb(), c, q],
-            |&[eq, c, q]| eq * (EF::ONE + c * q),
-        );
-        let (leaf, values) = transcript.leaf(Tree::Result, |challenger| {
-            let (proof, end) = prover.prove::<EF, _>(challenger, point.len(), DEGREE, 0, claim);
-            let (x, rest) = end.as_slice().split_at(m);
-            let limb_point = [x, &rest[1..]].concat();
-            let values = [
-                evaluate(&bit_rows(low, width), &limb_point),
-                evaluate(&bit_rows(high, width), &limb_point),
-            ];
-            (proof, values)
-        });
-        transcript.finish();
-        IntegerMulProof {
-            root,
-            factor,
-            result: TreeProof {
-                layers,
-                leaf,
-                values,
-            },
-        }
-    }
-
-    // Runs every result layer from a false claim, closing each one through its upper half.
-    //
-    //     v    the value the verifier's replay of the round polynomials reaches
-    //     h_0  the true lower half
-    //     h_1  v / (eq * h_0), so eq * h_0 * h_1 = v
-    fn carry_false_claim(
-        transcript: &mut ProverTranscript<'_, Challenger, EF, EF>,
-        layers: &[Vec<EF>],
-        mut point: Vec<EF>,
-        mut claim: EF,
-    ) -> (Vec<LayerProof<EF, EF>>, Vec<EF>) {
-        let mut proofs = Vec::new();
-        for below in &layers[1..] {
-            let (even, odd) = below
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&[zero, one]| (zero, one))
-                .unzip();
-            let mut prover = Composite::new(
-                [
-                    Point::new(point.as_slice()).equality_weights_msb(),
-                    even,
-                    odd,
-                ],
-                |&[eq, zero, one]| eq * zero * one,
-            );
-            let rounds = point.len();
-            let ((sumcheck, end), halves, line) = transcript.layer(Tree::Result, |challenger| {
-                // A copy of the sponge replays the rounds exactly as the verifier will.
-                let mut replay = (**challenger).clone();
-                let (proof, end) = prover.prove::<EF, _>(challenger, rounds, DEGREE, 0, claim);
-                let (_, reached) = proof.verify(&mut replay, rounds, DEGREE, 0).unwrap();
-                let [_, zero, _] = prover.terminal();
-                let one = reached * (Point::eval_eq(&point, end.as_slice()) * zero).inverse();
-                ((proof, end), [zero, one])
-            });
-            claim = halves[0] + line * (halves[1] - halves[0]);
-            point = end.as_slice().to_vec();
-            point.push(line);
-            proofs.push(LayerProof { sumcheck, halves });
-        }
-        (proofs, point)
     }
 
     #[test]
@@ -1017,7 +1128,8 @@ mod tests {
         let reduction = IntegerMulReduction::new(1, 6).unwrap();
 
         // The reduction's prover does not check the field, so it produces a record.
-        let (proof, _) = reduction.prove::<Small, Small, Word64, _>(&columns(&[row]), &mut small());
+        let (proof, _) =
+            reduction.prove::<Small, Small, Word64, _>(Some(&columns(&[row])), None, &mut small());
 
         // The verifier refuses it on its own.
         assert_eq!(
@@ -1027,70 +1139,50 @@ mod tests {
     }
 
     #[test]
-    fn a_result_tree_that_leaves_the_shared_root_is_refused() {
-        // Fixture state: the middle high limb is one too large, so the two lifts differ there.
-        let mut rows = [
-            word64_row(3, 5),
-            word64_row(0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210),
-            word64_row(7, 9),
-        ];
-        rows[1][3] = Word64::new(rows[1][3].get() + 1);
-
-        // The forger starts the result tree from its own lift, and is honest everywhere else.
-        let proof = forge(&rows, Forgery::ResultTreeFromItsOwnRoot);
-
-        // Only the first result layer's entering claim ties that tree to the root.
-        assert_eq!(
-            IntegerMulReduction::new(3, 6)
-                .unwrap()
-                .verify::<EF, EF, _>(&proof, &mut challenger()),
-            Err(IntegerMulError::EnteringClaim)
-        );
-    }
-
-    #[test]
-    fn a_result_leaf_that_restarts_from_its_true_claim_is_refused() {
-        // Fixture state: the same false product.
-        let mut rows = [
-            word64_row(3, 5),
-            word64_row(0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210),
-            word64_row(7, 9),
-        ];
-        rows[1][3] = Word64::new(rows[1][3].get() + 1);
-
-        // The forger carries the false root through every result layer, closing each by its halves.
-        //
-        // The leaf sumcheck then restarts from the true leaf evaluation.
-        let proof = forge(&rows, Forgery::ResultLeafFromItsTrueClaim);
-
-        // Only the leaf's entering claim ties it to the claim the last layer left.
-        assert_eq!(
-            IntegerMulReduction::new(3, 6)
-                .unwrap()
-                .verify::<EF, EF, _>(&proof, &mut challenger()),
-            Err(IntegerMulError::EnteringClaim)
-        );
-    }
-
-    #[test]
-    fn a_factor_tree_over_other_factors_is_refused() {
+    fn a_power_tree_over_other_factors_is_refused() {
         // Fixture state: 3 * 5 claimed as 17, and 7 * 9 claimed as 63.
         //
         // Both claimed products are odd, so the low bit agrees.
         let rows = [[3, 5, 17, 0], [7, 9, 63, 0]].map(|row| row.map(Word64::new));
+        let reduction = IntegerMulReduction::new(2, 6).unwrap();
+        let words = columns(&rows).map(|column| {
+            column
+                .iter()
+                .map(|&packed| Word64::unpack(packed).to_u64())
+                .collect::<Vec<_>>()
+        });
+        let ones = vec![1; 2];
 
-        // The forger walks the factor tree over (17, 1) and (63, 1), so both lifts agree.
+        // The forger walks the power tree over (17, 1) and (63, 1), so both lifts agree.
         //
-        // It then reports the true evaluations of a and b at the leaf point.
-        let proof = forge(&rows, Forgery::FactorTreeOverTheClaimedProduct);
-
-        // Only the factor leaf check ties the tree to the reported factors.
-        assert_eq!(
-            IntegerMulReduction::new(2, 6)
-                .unwrap()
-                .verify::<EF, EF, _>(&proof, &mut challenger()),
-            Err(IntegerMulError::LeafClaim)
+        // The selector then runs over the true factors.
+        let mut sponge = challenger();
+        let mut transcript =
+            ProverTranscript::<Challenger, EF, EF>::new(&mut sponge, reduction.transcript_shape());
+        let (proof, _) = reduction.prove_words(
+            &mut transcript,
+            words.each_ref().map(|words| Words::Host(words)),
+            [Words::Host(&words[2]), Words::Host(&ones)],
+            None,
         );
+        transcript.finish();
+
+        // The selector's sum follows the forged leaves, so only its closing check sees the factors.
+        assert_eq!(
+            reduction.verify::<EF, EF, _>(&proof, &mut challenger()),
+            Err(IntegerMulError::SelectorClaim)
+        );
+    }
+
+    #[test]
+    fn the_twist_inverts_the_frobenius_power() {
+        // Invariant: phi^(-i)(y^(2^i)) = y for every i below the degree.
+        let degree = binary_degree::<EF>().unwrap();
+        assert_eq!(degree, 128);
+        let y = EF::GENERATOR * EF::GENERATOR + EF::ONE;
+        for i in [0, 1, 5, 63, 127] {
+            assert_eq!(twist(y.exp_power_of_2(i), i, degree), y);
+        }
     }
 
     #[test]

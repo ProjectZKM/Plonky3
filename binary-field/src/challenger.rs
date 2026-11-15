@@ -1,15 +1,19 @@
 //! A byte-sampling Fiat–Shamir challenger for the binary tower fields.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
+use core::fmt;
 use core::iter::repeat;
 use core::marker::PhantomData;
 
+use p3_blake3::Blake3;
 use p3_challenger::{
     CanObserve, CanSample, CanSampleBits, CanSampleUniformBits, FieldChallenger,
     GrindingChallenger, HashChallenger, ResamplingError,
 };
 use p3_field::BasedVectorSpace;
-use p3_maybe_rayon::search::find_map_first;
+use p3_maybe_rayon::prelude::*;
 use p3_symmetric::{CryptographicHasher, Hash, MerkleCap};
 use tracing::instrument;
 
@@ -62,10 +66,23 @@ const GRIND_MARGIN_BITS: usize = 8;
 ///
 /// So the levels below `GF(2^32)` implement [`GrindingChallenger`] without being usable
 /// proof-of-work witness types, and a 128-bit witness buys no more width than a 64-bit one.
-#[derive(Clone, Debug)]
+///
+/// A challenger can carry a [`GrindDevice`], which then searches its proof-of-work witnesses;
+/// every clone shares it.
+#[derive(Clone)]
 pub struct BinaryChallenger<F, Inner> {
     inner: Inner,
+    grinder: Option<Arc<dyn GrindDevice>>,
     _marker: PhantomData<F>,
+}
+
+impl<F, Inner: fmt::Debug> fmt::Debug for BinaryChallenger<F, Inner> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BinaryChallenger")
+            .field("inner", &self.inner)
+            .field("grinder", &self.grinder.is_some())
+            .finish()
+    }
 }
 
 impl<F, Inner> BinaryChallenger<F, Inner> {
@@ -73,8 +90,18 @@ impl<F, Inner> BinaryChallenger<F, Inner> {
     pub const fn new(inner: Inner) -> Self {
         Self {
             inner,
+            grinder: None,
             _marker: PhantomData,
         }
+    }
+
+    /// This challenger with its proof-of-work witnesses searched on `grinder`.
+    ///
+    /// The witness is the one the host search finds, so the transcript is unchanged.
+    #[must_use]
+    pub fn with_grinder(mut self, grinder: Arc<dyn GrindDevice>) -> Self {
+        self.grinder = Some(grinder);
+        self
     }
 }
 
@@ -238,17 +265,104 @@ fn candidate<F: TowerLevel>(index: u64) -> F {
     F::from_le_byte_iter(index.to_le_bytes().into_iter().chain(repeat(0)))
 }
 
+/// The bytes a candidate witness contributes to the transcript.
+fn candidate_bytes<F: TowerLevel>(index: u64) -> ([u8; 16], usize) {
+    let mut bytes = [0; 16];
+    for (slot, byte) in bytes.iter_mut().zip(candidate::<F>(index).into_bytes()) {
+        *slot = byte;
+    }
+    (bytes, F::NUM_BYTES)
+}
+
+/// Whether a Blake3 digest passes a `bits`-wide grind: the sampled word is
+/// the digest's last eight bytes, last first, as `sample_bits` reads them.
+fn digest_passes(digest: &[u8; 32], bits: usize) -> bool {
+    let mut bytes = [0u8; BITS_SAMPLE_BYTES];
+    for (slot, byte) in bytes.iter_mut().zip(digest.iter().rev()) {
+        *slot = *byte;
+    }
+    u64::from_le_bytes(bytes) & ((1u64 << bits) - 1) == 0
+}
+
+/// The first window [`smallest_witness`] scans, and the width its windows stop growing at.
+const GRIND_FIRST_WINDOW: u64 = 1 << 16;
+const GRIND_MAX_WINDOW: u64 = 1 << 26;
+
+/// The smallest candidate index below `num_candidates` that `search` accepts.
+///
+/// The candidates are scanned in ascending windows that double up to [`GRIND_MAX_WINDOW`],
+/// each searched in parallel for its first passing index, so the witness does not depend on
+/// how the threads are scheduled and a proof is reproducible, while every window still
+/// spreads over all threads.
+fn smallest_witness<W>(
+    num_candidates: u64,
+    mut search: impl FnMut(core::ops::Range<u64>) -> Option<W>,
+) -> Option<W> {
+    let mut start = 0u64;
+    let mut width = GRIND_FIRST_WINDOW;
+    while start < num_candidates {
+        let end = start.saturating_add(width).min(num_candidates);
+        if let Some(witness) = search(start..end) {
+            return Some(witness);
+        }
+        start = end;
+        width = width.saturating_mul(2).min(GRIND_MAX_WINDOW);
+    }
+    None
+}
+
+/// A device that searches the proof-of-work witnesses of a Blake3 transcript.
+pub trait GrindDevice: Send + Sync {
+    /// The smallest index below `candidates` whose candidate passes a `bits`-wide grind.
+    ///
+    /// The candidate of an index is its little-endian bytes, cut or zero-extended to `len`;
+    /// it passes when the Blake3 digest of `pending` followed by it has its last eight bytes,
+    /// last first, zero in their low `bits` bits.
+    ///
+    /// # Panics
+    ///
+    /// When the search fails, or no candidate passes.
+    fn blake3_smallest(&self, pending: &[u8], len: usize, bits: usize, candidates: u64) -> u64;
+}
+
+/// Whether the candidates of `F` below `candidates` are the little-endian bytes of their
+/// indices, the encoding a [`GrindDevice`] searches.
+fn candidates_are_indices<F: TowerLevel>(candidates: u64) -> bool {
+    [0, 1, 0x0102_0304_0506_0708, u64::MAX].iter().all(|&index| {
+        let index = index.min(candidates - 1);
+        let (bytes, len) = candidate_bytes::<F>(index);
+        let le = index.to_le_bytes();
+        (0..len).all(|k| bytes[k] == le.get(k).copied().unwrap_or(0))
+    })
+}
+
+/// The transcript, when it is a Blake3 hash challenger.
+fn blake3_transcript<Inner: Any>(inner: &Inner) -> Option<&HashChallenger<u8, Blake3, 32>> {
+    (inner as &dyn Any).downcast_ref::<HashChallenger<u8, Blake3, 32>>()
+}
+
+/// The Blake3 state over everything the transcript holds pending, when
+/// the transcript is a Blake3 hash challenger: a candidate's digest is
+/// this state continued with the candidate's bytes, which is what the
+/// transcript computes when it observes the candidate and samples.
+fn blake3_pending<Inner: Any>(inner: &Inner) -> Option<blake3::Hasher> {
+    let transcript = blake3_transcript(inner)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(transcript.pending_input());
+    Some(hasher)
+}
+
 impl<F, Inner> GrindingChallenger for BinaryChallenger<F, Inner>
 where
     F: TowerLevel,
-    Inner: CanSample<u8> + CanObserve<u8> + Clone + Send + Sync,
+    Inner: CanSample<u8> + CanObserve<u8> + Clone + Send + Sync + 'static,
 {
     type Witness = F;
 
     /// # Panics
     /// Panics unless `bits + GRIND_MARGIN_BITS <= min(F::bits(), 64)`. See the per-level
     /// ceiling tabulated on [`BinaryChallenger`].
-    #[instrument(name = "grind for proof-of-work witness", skip_all)]
+    #[instrument(name = "grind for proof-of-work witness", skip_all, fields(bits))]
     fn grind(&mut self, bits: usize) -> Self::Witness {
         // Trivial case: 0 bits mean no PoW is required and any witness is valid.
         if bits == 0 {
@@ -269,17 +383,47 @@ where
             1u64 << F::bits()
         };
 
-        // The smallest passing candidate, whatever the thread count.
-        let witness = find_map_first(
-            0..num_candidates,
-            || self.clone(),
-            |worker, index| {
-                worker.inner.clone_from(&self.inner);
-                let witness = candidate(index);
-                worker.check_witness(bits, witness).then_some(witness)
-            },
-        )
-        .expect("failed to find witness");
+        let witness = if let Some(grinder) = self.grinder.as_deref() {
+            let transcript = blake3_transcript(&self.inner)
+                .expect("a grinder searches the witnesses of a Blake3 transcript");
+            assert!(
+                candidates_are_indices::<F>(num_candidates),
+                "a grinder searches candidates that are their indices' bytes"
+            );
+            candidate(grinder.blake3_smallest(
+                transcript.pending_input(),
+                F::NUM_BYTES,
+                bits,
+                num_candidates,
+            ))
+        } else if let Some(pending) = blake3_pending(&self.inner) {
+            smallest_witness(num_candidates, |window| {
+                window.into_par_iter().find_first(|&index| {
+                    let (bytes, len) = candidate_bytes::<F>(index);
+                    let mut hasher = pending.clone();
+                    hasher.update(&bytes[..len]);
+                    digest_passes(hasher.finalize().as_bytes(), bits)
+                })
+            })
+            .map(candidate)
+            .expect("failed to find witness")
+        } else {
+            let this = &*self;
+            smallest_witness(num_candidates, |window| {
+                window
+                    .into_par_iter()
+                    .map_init(
+                        || this.clone(),
+                        |worker, index| {
+                            worker.inner.clone_from(&this.inner);
+                            let witness = candidate(index);
+                            worker.check_witness(bits, witness).then_some(witness)
+                        },
+                    )
+                    .find_map_first(core::convert::identity)
+            })
+            .expect("failed to find witness")
+        };
         assert!(self.check_witness(bits, witness));
         witness
     }
@@ -290,6 +434,85 @@ where
     F: TowerLevel,
     Inner: CanSample<u8> + CanObserve<u8> + Clone + Send + Sync,
 {
+}
+
+#[cfg(test)]
+mod blake3_grind_tests {
+    extern crate std;
+
+    use alloc::vec;
+
+    use p3_challenger::{CanObserve, GrindingChallenger};
+
+    use super::*;
+    use crate::BinaryField128;
+
+    /// A twenty-bit grind over a large pending buffer, timed on both paths.
+    #[test]
+    #[ignore]
+    fn grind_timing_over_a_large_buffer() {
+        let mut challenger =
+            BinaryChallenger::<BinaryField128, _>::from_hasher(vec![7u8; 4], Blake3);
+        for i in 0..40_000u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            challenger.observe(BinaryField128::from_le_bytes(bytes));
+        }
+        let pending = blake3_pending(&challenger.inner).expect("a Blake3 transcript");
+        let started = std::time::Instant::now();
+        let found = (0..u64::MAX)
+            .into_par_iter()
+            .find_any(|&index| {
+                let (bytes, len) = candidate_bytes::<BinaryField128>(index);
+                let mut hasher = pending.clone();
+                hasher.update(&bytes[..len]);
+                digest_passes(hasher.finalize().as_bytes(), 20)
+            })
+            .expect("found");
+        std::println!("fast path: {:?} (index {found})", started.elapsed());
+        let started = std::time::Instant::now();
+        let mut reference = challenger.clone();
+        let witness = reference.grind(20);
+        std::println!("grind(): {:?}", started.elapsed());
+        assert!(challenger.clone().check_witness(20, witness));
+    }
+
+    /// The Blake3 fast path returns the smallest witness the transcript accepts, so two
+    /// grinds of one transcript agree however the threads are scheduled.
+    #[test]
+    fn fast_grind_returns_the_smallest_passing_witness() {
+        let mut challenger =
+            BinaryChallenger::<BinaryField128, _>::from_hasher(vec![7u8; 4], Blake3);
+        challenger.observe(BinaryField128::from_le_bytes([3u8; 16]));
+        let witness = challenger.clone().grind(14);
+        let smallest = (0..u64::MAX)
+            .map(candidate::<BinaryField128>)
+            .find(|&w| challenger.clone().check_witness(14, w))
+            .expect("a passing witness");
+        assert_eq!(witness, smallest);
+    }
+
+    /// The Blake3 fast path finds a witness the transcript accepts, after
+    /// a large pending buffer, and the digest it computes is the
+    /// transcript's.
+    #[test]
+    fn fast_grind_agrees_with_the_transcript() {
+        let mut challenger =
+            BinaryChallenger::<BinaryField128, _>::from_hasher(vec![7u8; 4], Blake3);
+        for i in 0..5000u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            challenger.observe(BinaryField128::from_le_bytes(bytes));
+        }
+        let pending = blake3_pending(&challenger.inner).expect("a Blake3 transcript");
+        let mut reference = challenger.clone();
+        let witness = challenger.grind(12);
+        assert!(reference.check_witness(12, witness));
+        let (bytes, len) = candidate_bytes::<BinaryField128>(0);
+        let mut hasher = pending;
+        hasher.update(&bytes[..len]);
+        let _ = digest_passes(hasher.finalize().as_bytes(), 12);
+    }
 }
 
 #[cfg(test)]
@@ -672,6 +895,50 @@ mod tests {
         let mut challenger = mk::<BinaryField128>();
         let witness = challenger.clone().grind(8);
         assert!(challenger.check_witness(8, witness));
+    }
+
+    /// The device contract searched in host memory, one candidate after another.
+    struct HostGrind;
+
+    impl super::GrindDevice for HostGrind {
+        fn blake3_smallest(&self, pending: &[u8], len: usize, bits: usize, candidates: u64) -> u64 {
+            (0..candidates)
+                .find(|&index| {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(pending);
+                    hasher.update(&index.to_le_bytes()[..len.min(8)]);
+                    hasher.update(&[0u8; 8][..len.saturating_sub(8)]);
+                    super::digest_passes(hasher.finalize().as_bytes(), bits)
+                })
+                .expect("a passing candidate")
+        }
+    }
+
+    #[test]
+    fn a_grinder_finds_the_host_witness() {
+        let blake3 = || {
+            BinaryChallenger::<BinaryField128, _>::from_hasher(vec![7u8; 4], p3_blake3::Blake3)
+        };
+        for bits in [1, 6, 12] {
+            let mut host = blake3();
+            let mut device = blake3().with_grinder(alloc::sync::Arc::new(HostGrind));
+            assert_eq!(device.grind(bits), host.grind(bits));
+            assert_eq!(
+                p3_challenger::CanSample::<BinaryField128>::sample(&mut device),
+                p3_challenger::CanSample::<BinaryField128>::sample(&mut host)
+            );
+        }
+    }
+
+    #[test]
+    fn grind_returns_the_smallest_passing_witness() {
+        let challenger = mk::<BinaryField128>();
+        let witness = challenger.clone().grind(10);
+        let smallest = (0..u64::MAX)
+            .map(super::candidate::<BinaryField128>)
+            .find(|&w| challenger.clone().check_witness(10, w))
+            .expect("a passing witness");
+        assert_eq!(witness, smallest);
     }
 
     #[test]

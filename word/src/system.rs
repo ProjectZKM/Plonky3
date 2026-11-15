@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::constraint::{AndConstraint, IntegerMulConstraint, Operand, ZeroConstraint};
@@ -10,7 +11,7 @@ use crate::shift::ShiftedValue;
 use crate::word::Word;
 
 /// A homogeneous relation family.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ConstraintKind {
     /// An XOR operand must vanish.
@@ -45,7 +46,7 @@ impl ConstraintKind {
 }
 
 /// An operand's role within a relation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OperandRole {
     /// The only operand of a zero relation.
     Value,
@@ -185,7 +186,8 @@ pub enum VerificationError {
 }
 
 /// A checked collection of word-level relations.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct ConstraintSystem<W: Word> {
     /// The declared number of public words.
     public_len: u32,

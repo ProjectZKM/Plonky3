@@ -7,7 +7,7 @@ use p3_air::{AirBuilder, DebugConstraintBuilder, SymbolicExpression};
 use p3_field::{ExtensionField, Field};
 
 use crate::count::Count;
-use crate::indexed::TraceWindow;
+use crate::indexed::{IndexedPosition, TraceWindow};
 
 /// One message sent on a named bus during symbolic evaluation.
 ///
@@ -237,6 +237,33 @@ pub trait IndexedLookupBuilder: AirBuilder {
         table: &str,
         position: usize,
         payload: impl IntoIterator<Item = usize>,
+    ) {
+        self.push_indexed_read_at(table, IndexedPosition::Column(position), payload);
+    }
+
+    /// Record that this AIR reads a named table, naming each row's entry by its bit columns.
+    ///
+    /// The bits are given least significant first, and need no column beyond the ones the
+    /// trace already holds; see [`IndexedPosition::Bits`].
+    fn push_indexed_read_bits(
+        &mut self,
+        table: &str,
+        bits: impl IntoIterator<Item = usize>,
+        payload: impl IntoIterator<Item = usize>,
+    ) {
+        self.push_indexed_read_at(
+            table,
+            IndexedPosition::Bits(bits.into_iter().collect()),
+            payload,
+        );
+    }
+
+    /// Record that this AIR reads a named table, with the position in either form.
+    fn push_indexed_read_at(
+        &mut self,
+        table: &str,
+        position: IndexedPosition,
+        payload: impl IntoIterator<Item = usize>,
     );
 
     /// Record that this AIR provides a named table.
@@ -285,10 +312,10 @@ impl<F: Field, EF: ExtensionField<F>> InteractionBuilder for DebugConstraintBuil
 }
 
 impl<F: Field, EF: ExtensionField<F>> IndexedLookupBuilder for DebugConstraintBuilder<'_, F, EF> {
-    fn push_indexed_read(
+    fn push_indexed_read_at(
         &mut self,
         _table: &str,
-        _position: usize,
+        _position: IndexedPosition,
         payload: impl IntoIterator<Item = usize>,
     ) {
         // This builder checks constraints row by row and proves nothing.

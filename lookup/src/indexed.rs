@@ -42,12 +42,45 @@ pub enum TraceWindow {
 pub struct IndexedRead {
     /// Name of the table this reader pulls from.
     pub table: String,
-    /// Main-trace column holding the entry each row names.
+    /// Where each row names the entry it reads.
     ///
     /// The position is witness data rather than a fixed column, so it lives in the main trace.
-    pub position: usize,
+    pub position: IndexedPosition,
     /// Main-trace columns holding the values pulled, in table-column order.
     pub payload: Vec<usize>,
+}
+
+/// Where a reader's rows name the entries they read.
+///
+/// The embedding of an entry is the sum of the basis elements its set bits pick out, so a row
+/// may name its entry either as one column holding that sum, or as the bit columns themselves,
+/// least significant first, each weighed by the element its bit switches on.  The second form
+/// costs a Boolean trace no column of its own: the bits are the ones it already holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexedPosition {
+    /// One main-trace column holding the entry under the embedding.
+    Column(usize),
+    /// Main-trace columns holding the bits of the entry, least significant first.
+    Bits(Vec<usize>),
+}
+
+impl IndexedPosition {
+    /// The main-trace columns the position reads, each once, in first
+    /// appearance order: a column may stand for several bits.
+    pub fn columns(&self) -> Vec<usize> {
+        match self {
+            Self::Column(column) => alloc::vec![*column],
+            Self::Bits(bits) => {
+                let mut columns: Vec<usize> = Vec::with_capacity(bits.len());
+                for &bit in bits {
+                    if !columns.contains(&bit) {
+                        columns.push(bit);
+                    }
+                }
+                columns
+            }
+        }
+    }
 }
 
 /// One table's declaration of the columns an entry carries.
@@ -94,12 +127,20 @@ impl IndexedLookups {
         for read in &reads {
             // The position and the pulled values are witness data, so both sit in the main trace.
             let width = layout.main_width;
-            if read.position >= width {
-                return Err(IndexedLookupError::ColumnOutOfRange {
+            let position = read.position.columns();
+            if position.is_empty() {
+                return Err(IndexedLookupError::EmptyPayload {
                     table: read.table.clone(),
-                    column: read.position,
-                    width,
                 });
+            }
+            for &column in &position {
+                if column >= width {
+                    return Err(IndexedLookupError::ColumnOutOfRange {
+                        table: read.table.clone(),
+                        column,
+                        width,
+                    });
+                }
             }
             if read.payload.is_empty() {
                 return Err(IndexedLookupError::EmptyPayload {
@@ -339,7 +380,7 @@ mod tests {
     fn read(payload: Vec<usize>) -> IndexedRead {
         IndexedRead {
             table: String::from("t"),
-            position: 0,
+            position: IndexedPosition::Column(0),
             payload,
         }
     }
@@ -373,7 +414,7 @@ mod tests {
         let error = IndexedLookups::new(
             vec![IndexedRead {
                 table: String::from("t"),
-                position: 4,
+                position: IndexedPosition::Column(4),
                 payload: vec![1],
             }],
             Vec::new(),

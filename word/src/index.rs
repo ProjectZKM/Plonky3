@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A word's visibility segment.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Segment {
     /// Values supplied as part of the public statement.
     Public,
@@ -22,7 +23,7 @@ pub enum IndexError {
 }
 
 /// An opaque position in either the public or committed word segment.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ValueIndex {
     /// The visibility class containing the word.
     segment: Segment,

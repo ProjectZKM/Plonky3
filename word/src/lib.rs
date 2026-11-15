@@ -19,7 +19,9 @@ mod shift;
 mod system;
 mod word;
 
-pub use component::{Component, ComponentCall, ComponentError, Composition, CompositionError};
+pub use component::{
+    CallBlock, Component, ComponentCall, ComponentError, Composition, CompositionError, Placement,
+};
 pub use constraint::{
     AndConstraint, EvaluationError, IntegerMulConstraint, Operand, ZeroConstraint,
 };

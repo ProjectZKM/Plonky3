@@ -2,19 +2,24 @@
 //!
 //! Every step replays the proving order exactly, slot for slot.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use p3_binary_field::Gf2;
-use p3_binary_pcs::BooleanMultilinearPcs;
+use p3_binary_pcs::{BitReadings, BooleanMultilinearPcs, ReadingsCheck};
 use p3_challenger::fs::TranscriptField;
 use p3_challenger::{FieldChallenger, GrindingChallenger};
-use p3_field::{Algebra, ExtensionField};
+use p3_field::{Algebra, ExtensionField, Field};
 use p3_multilinear_util::point::Point;
 use p3_word::{Segment, Word};
 
 use super::error::WordProofError;
 use super::key::WordProofKey;
+use super::prover::current_openings;
 use super::record::WordProof;
-use super::relation::{ZEROCHECK_DEGREE, claimed_sum, closing_value};
+use super::relation::{ZEROCHECK_DEGREE, claimed_sum, closing_value, relation_point};
 use super::transcript::ProofVerifierTranscript;
+use crate::{Deferred, WiringQuery};
 
 impl<W: Word> WordProofKey<W> {
     /// Verifies every relation against the committed trace.
@@ -41,6 +46,139 @@ impl<W: Word> WordProofKey<W> {
         Pcs: BooleanMultilinearPcs<EF, Challenger>,
         Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
     {
+        self.verify_with(
+            pcs,
+            commitment,
+            public,
+            proof,
+            challenger,
+            &mut |kind, query| self.deferred(kind, public, public.len(), query),
+        )
+    }
+
+    /// The deferred value `kind` at `query`, for the public words `public` of which those
+    /// from `inputs` on are the key's: the steps of [`Self::verify`] whose cost grows with the
+    /// statement.
+    pub fn deferred<F: Field + Algebra<Gf2>>(
+        &self,
+        kind: Deferred,
+        public: &[W],
+        inputs: usize,
+        query: &WiringQuery<F>,
+    ) -> F {
+        self.shift.deferred(kind, public, inputs, query)
+    }
+
+    /// Per public word below `inputs`, the weight of each of its bits in the
+    /// [`Deferred::Inputs`] share at `query`.
+    pub fn input_bit_weights<F: Field + Algebra<Gf2>>(
+        &self,
+        inputs: usize,
+        query: &WiringQuery<F>,
+    ) -> Vec<Vec<F>> {
+        self.shift.input_bit_weights(inputs, query)
+    }
+
+    /// [`Self::verify`] with the shift reduction's public share and wiring factor taken from
+    /// `deferred`, so a caller can evaluate them its own way or defer them.  The proof is sound
+    /// when every value `deferred` returns is [`Self::deferred`] at its query.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify`].
+    pub fn verify_with<F, EF, Pcs, Challenger>(
+        &self,
+        pcs: &Pcs,
+        commitment: &Pcs::Commitment,
+        public: &[W],
+        proof: &WordProof<F, EF, Pcs::Proof>,
+        challenger: &mut Challenger,
+        deferred: &mut dyn FnMut(Deferred, &WiringQuery<EF>) -> EF,
+    ) -> Result<(), WordProofError<Pcs::Error>>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F> + Algebra<Gf2>,
+        Pcs: BooleanMultilinearPcs<EF, Challenger>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        self.verify_inner(pcs, commitment, None, public, proof, challenger, deferred)
+    }
+
+    /// [`Self::verify`] for a key that routes ports, against the routing commitment
+    /// [`Self::port_commitment`] made.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify`], or a port reduction or routing opening that does not close.
+    pub fn verify_routed<F, EF, Pcs, Challenger>(
+        &self,
+        pcs: &Pcs,
+        commitment: &Pcs::Commitment,
+        routing: &Pcs::Commitment,
+        public: &[W],
+        proof: &WordProof<F, EF, Pcs::Proof>,
+        challenger: &mut Challenger,
+    ) -> Result<(), WordProofError<Pcs::Error>>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F> + Algebra<Gf2>,
+        Pcs: BooleanMultilinearPcs<EF, Challenger>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        self.verify_routed_with(
+            pcs,
+            commitment,
+            routing,
+            public,
+            proof,
+            challenger,
+            &mut |kind, query| self.deferred(kind, public, public.len(), query),
+        )
+    }
+
+    /// [`Self::verify_routed`] with the deferred claims answered by `deferred`, as
+    /// [`Self::verify_with`] answers them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_routed`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_routed_with<F, EF, Pcs, Challenger>(
+        &self,
+        pcs: &Pcs,
+        commitment: &Pcs::Commitment,
+        routing: &Pcs::Commitment,
+        public: &[W],
+        proof: &WordProof<F, EF, Pcs::Proof>,
+        challenger: &mut Challenger,
+        deferred: &mut dyn FnMut(Deferred, &WiringQuery<EF>) -> EF,
+    ) -> Result<(), WordProofError<Pcs::Error>>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F> + Algebra<Gf2>,
+        Pcs: BooleanMultilinearPcs<EF, Challenger>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        self.verify_inner(pcs, commitment, Some(routing), public, proof, challenger, deferred)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_inner<F, EF, Pcs, Challenger>(
+        &self,
+        pcs: &Pcs,
+        commitment: &Pcs::Commitment,
+        routing: Option<&Pcs::Commitment>,
+        public: &[W],
+        proof: &WordProof<F, EF, Pcs::Proof>,
+        challenger: &mut Challenger,
+        deferred: &mut dyn FnMut(Deferred, &WiringQuery<EF>) -> EF,
+    ) -> Result<(), WordProofError<Pcs::Error>>
+    where
+        F: TranscriptField,
+        EF: ExtensionField<F> + Algebra<Gf2>,
+        Pcs: BooleanMultilinearPcs<EF, Challenger>,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
         // Statement dimensions are checked before any transcript replay.
         let commitment_variables = pcs.num_variables();
         self.validate_arity(commitment_variables)?;
@@ -54,9 +192,21 @@ impl<W: Word> WordProofKey<W> {
         if proof.integer_mul.is_some() != self.integer_mul.is_some() {
             return Err(WordProofError::ProductRecord);
         }
+        let routed = self.ports.is_some();
+        if (proof.ports.is_some(), proof.port_opening.is_some()) != (routed, routed) {
+            return Err(WordProofError::PortRecord);
+        }
+        let routing = match (&self.ports, routing) {
+            (Some(_), Some(routing)) => Some(routing),
+            (Some(_), None) => return Err(WordProofError::PortCommitment),
+            (None, _) => None,
+        };
 
         // The verifier reaches the prover's sponge state from the same commitment.
         pcs.observe_commitment(commitment, challenger);
+        if let Some(routing) = routing {
+            pcs.observe_commitment(routing, challenger);
+        }
         let variables = self.zerocheck_variables();
         let mut transcript = ProofVerifierTranscript::<_, F, EF>::new(
             challenger,
@@ -102,6 +252,7 @@ impl<W: Word> WordProofKey<W> {
             }
         };
         transcript.finish();
+        let point = relation_point(&point, Self::bit_variables());
 
         // Every equality factor is public and is evaluated from its point directly.
         let equality = Point::eval_eq(&vanishing_point, point.as_slice());
@@ -122,21 +273,53 @@ impl<W: Word> WordProofKey<W> {
         }
 
         // Each operand claim is tied to the committed words by the shift reduction.
-        let opening = self.shift.verify::<F, EF, _>(
-            public,
-            &self.operand_claim(&point, &proof.operands),
-            &proof.shift,
-            challenger,
-        )?;
+        let claim = self.operand_claim(&point, &proof.operands);
+        let opening =
+            self.shift
+                .verify_with::<F, EF, _>(public, &claim, &proof.shift, challenger, deferred)?;
+        let mut points = vec![self.commitment_point(opening.point(), commitment_variables)];
+        let mut values = vec![opening.value()];
+        let mut routing_claim = None;
+        if let (Some(ports), Some(record)) = (&self.ports, &proof.ports) {
+            let claims = ports
+                .verify::<F, EF, _>(
+                    record,
+                    self.shift.word_variables(),
+                    claim.bit_point(),
+                    challenger,
+                )
+                .map_err(WordProofError::PortProof)?;
+            points.push(self.commitment_point(&claims.trace.0, commitment_variables));
+            values.push(claims.trace.1);
+            routing_claim = Some(claims.routing);
+        }
 
         // One authenticated opening closes the whole protocol.
-        pcs.verify_at_points(
-            commitment,
-            &[self.commitment_point(opening.point(), commitment_variables)],
-            &[opening.value()],
-            &proof.opening,
-            challenger,
-        )
+        match (routing, routing_claim, &proof.port_opening) {
+            (Some(routing), Some((point, value)), Some(opening)) => {
+                let routing_point = [self.commitment_point(&point, commitment_variables)];
+                let readings = |values: &[EF]| -> Vec<BitReadings<EF>> {
+                    values.iter().map(|&value| BitReadings { current: Some(value), next: None }).collect()
+                };
+                pcs.verify_readings_pair(
+                    pcs,
+                    ReadingsCheck {
+                        commitment,
+                        openings: &current_openings(&points),
+                        readings: &readings(&values),
+                        proof: &proof.opening,
+                    },
+                    ReadingsCheck {
+                        commitment: routing,
+                        openings: &current_openings(&routing_point),
+                        readings: &readings(&[value]),
+                        proof: opening,
+                    },
+                    challenger,
+                )
+            }
+            _ => pcs.verify_at_points(commitment, &points, &values, &proof.opening, challenger),
+        }
         .map_err(WordProofError::Commitment)
     }
 }
@@ -164,9 +347,13 @@ mod tests {
 
     use super::*;
     use crate::columns::bit_table;
-    use crate::proof::relation::{OPERAND_EVALUATIONS, RelationZerocheck, ZEROCHECK_DEGREE};
+    use crate::proof::relation::{
+        OPERAND_EVALUATIONS, RelationWords, RelationZerocheck, ZEROCHECK_DEGREE, relation_point,
+    };
     use crate::proof::transcript::{ProofProverTranscript, ProofVerifierTranscript};
-    use crate::{OperationColumns, PackedWitness, PackedWord, ShiftReductionError, WordProofKey};
+    use crate::{
+        OperationColumns, Packed, PackedWitness, PackedWord, ShiftReductionError, WordProofKey,
+    };
 
     type EF = BinaryField128;
     type MyHash = SerializingHasher<Keccak256Hash>;
@@ -397,6 +584,7 @@ mod tests {
             })
             .unwrap();
         transcript.finish();
+        let point = relation_point(&point, WordProofKey::<Word64>::bit_variables());
 
         // Evaluate each operand column directly from the words the statement declares.
         let (constraint_point, bit_point) = point.split_at(key.shift.constraint_variables());
@@ -628,11 +816,34 @@ mod tests {
         assert_ne!(claimed, EF::ZERO, "a false statement has a nonzero sum");
 
         // Everything after the claimed sum is an honest run over that sum.
-        let mut prover =
-            RelationZerocheck::new(equality, Some(linear), Some(bitwise), None, batching);
+        let unpack = |column: &[Packed<Word64>]| -> Vec<u64> {
+            column
+                .iter()
+                .map(|&packed| Word64::unpack(packed).to_u64())
+                .collect()
+        };
+        let words = RelationWords {
+            linear: unpack(columns.zero()),
+            bitwise: columns
+                .bitwise_and()
+                .each_ref()
+                .map(|column| unpack(column)),
+            product: None,
+        };
+        let mut prover = RelationZerocheck::new(
+            &vanishing_point,
+            key.shift.constraint_variables(),
+            WordProofKey::<Word64>::bit_variables(),
+            words,
+            None,
+            batching,
+            None,
+            false,
+        );
         let (zerocheck, point) = transcript.zerocheck(|challenger| {
             prover.prove::<EF, _>(challenger, variables, ZEROCHECK_DEGREE, 0, claimed)
         });
+        let point = relation_point(&point, WordProofKey::<Word64>::bit_variables());
         let operands = prover.terminal_operands();
         transcript.finish();
         let (shift, opening) = key
@@ -651,7 +862,9 @@ mod tests {
             zerocheck,
             operands,
             shift,
+            ports: None,
             opening: opening_proof,
+            port_opening: None,
         };
 
         // Replay far enough to show the closing check accepts this proof unaided.
@@ -672,6 +885,7 @@ mod tests {
             })
             .unwrap();
         verifier.finish();
+        let end = relation_point(&end, WordProofKey::<Word64>::bit_variables());
         assert_eq!(
             final_claim,
             closing_value(

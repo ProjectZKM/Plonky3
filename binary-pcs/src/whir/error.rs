@@ -1,6 +1,6 @@
 //! Why a binary WHIR commitment, schedule or opening was refused.
 
-use p3_sumcheck::ring_switch::bits::{BitRingSwitchError, BitRingSwitchProofError};
+use p3_sumcheck::ring_switch::bits::{BitRingSwitchError, BitRingSwitchProofError, TraceError};
 use p3_whir::{VerifierError, WhirConfigError};
 use thiserror::Error;
 
@@ -41,6 +41,14 @@ pub enum BooleanWhirError {
     /// No opening point was supplied, so there is nothing to prove.
     #[error("an opening needs at least one point")]
     NoPoints,
+
+    /// The opening device does not open pairs.
+    #[error("the opening device does not open pairs")]
+    NoPairDevice,
+
+    /// The opening device commits no message it holds.
+    #[error("the opening device commits no message it holds")]
+    NoDeviceCommitter,
 
     /// The claim counts on the two sides of an opening disagree.
     #[error("{expected} points against {values} values and {reductions} reductions")]
@@ -99,6 +107,10 @@ pub enum BooleanWhirError {
     #[error(transparent)]
     ReductionProof(BitRingSwitchProofError),
 
+    /// The trace reduction refused the claims or its proof.
+    #[error("trace reduction: {0}")]
+    Trace(TraceError),
+
     /// The proximity argument refused to commit or to open.
     #[error(transparent)]
     Commit(WhirConfigError),
@@ -110,6 +122,19 @@ pub enum BooleanWhirError {
     /// A surviving claim was not closed by the value the commitment opened.
     #[error("a surviving claim does not match the opened value")]
     SurvivingClaim,
+
+    /// A proof discharges its claim another way than the verifier was asked to check.
+    #[error("the proof's opening is not the kind this check reads")]
+    OpeningKind,
+
+    /// A pair's two commitments are not words of one code.
+    #[error("a pair opening needs one code: witnesses of {first} and {second} variables")]
+    PairShape {
+        /// Variables of the first side's witness.
+        first: usize,
+        /// Variables of the second side's witness.
+        second: usize,
+    },
 }
 
 /// Why a schedule or a proof was refused by the ceiling.

@@ -10,9 +10,15 @@ use serde::{Deserialize, Serialize};
 pub struct IntegerMulProof<F, EF> {
     /// Shared value of both exponent lifts at the sampled row point.
     pub(crate) root: EF,
-    /// Reduction of the factor tree, `g^(a * b)`, to its two factor columns.
-    pub(crate) factor: TreeProof<F, EF>,
-    /// Reduction of the result tree, `g^(lo + 2^w * hi)`, to its two limb columns.
+    /// Reduction of the power tree, `(g^a)^b`, to its per-bit leaf evaluations.
+    pub(crate) power: TreeProof<F, EF>,
+    /// Sumcheck tying the twisted power leaves to the right factor and the base lift.
+    pub(crate) selector: GenericDegreeProof<F, EF>,
+    /// The base lift `g^a`, then every bit of the right factor, where the selector ends.
+    pub(crate) selected: Vec<EF>,
+    /// Reduction of the base tree, `g^a`, to the bits of the left factor.
+    pub(crate) base: TreeProof<F, EF>,
+    /// Reduction of the result tree, `g^(lo + 2^w * hi)`, to the bits of both limbs.
     pub(crate) result: TreeProof<F, EF>,
 }
 
@@ -21,10 +27,8 @@ pub struct IntegerMulProof<F, EF> {
 pub struct TreeProof<F, EF> {
     /// One reduction per layer, from the root towards the leaves.
     pub(crate) layers: Vec<LayerProof<F, EF>>,
-    /// Sumcheck reducing the leaf claim to the committed operand columns.
-    pub(crate) leaf: GenericDegreeProof<F, EF>,
-    /// Operand evaluations the leaf sumcheck ends on.
-    pub(crate) values: [EF; 2],
+    /// The row extension of every leaf column at the point the layers end on.
+    pub(crate) leaves: Vec<EF>,
 }
 
 /// Transcript record of one product layer.

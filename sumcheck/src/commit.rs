@@ -74,6 +74,103 @@ pub fn write_stacked_message<F: Field>(
 /// Nothing is absorbed here.
 ///
 /// The caller owns the transcript and absorbs the returned root itself.
+/// Encodes and commits a message wherever it keeps the codeword: the host's encoder and
+/// Merkle tree, or a device's.  The result is what `mmcs.commit_matrix(encoded)` returns
+/// for the same message, so a proof opens it the same way.
+pub trait CodewordCommitter<F: Field, MT: Mmcs<F>> {
+    /// Commit the codeword of `message` at rate `2^-log_inv_rate`, its rows the message's
+    /// rows.
+    fn commit_message(
+        &self,
+        message: RowMajorMatrixView<'_, F>,
+        log_inv_rate: usize,
+    ) -> (MT::Commitment, MT::ProverData<DenseMatrix<F>>);
+
+    /// Commit the codeword of the message this committer holds, `2^num_variables` elements in
+    /// rows of `2^folding`, at rate `2^-log_inv_rate`: the commitment of a held table, whose
+    /// values never reach the host.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the committer holds the message, which the host's never does.
+    fn commit_held(
+        &self,
+        num_variables: usize,
+        folding: usize,
+        log_inv_rate: usize,
+    ) -> (MT::Commitment, MT::ProverData<DenseMatrix<F>>) {
+        let _ = (num_variables, folding, log_inv_rate);
+        panic!("this committer holds no message")
+    }
+}
+
+/// A committer behind a reference to its trait object.
+pub struct DynCommitter<'a, F: Field, MT: Mmcs<F>>(pub &'a dyn CodewordCommitter<F, MT>);
+
+impl<F: Field, MT: Mmcs<F>> CodewordCommitter<F, MT> for DynCommitter<'_, F, MT> {
+    fn commit_message(
+        &self,
+        message: RowMajorMatrixView<'_, F>,
+        log_inv_rate: usize,
+    ) -> (MT::Commitment, MT::ProverData<DenseMatrix<F>>) {
+        self.0.commit_message(message, log_inv_rate)
+    }
+
+    fn commit_held(
+        &self,
+        num_variables: usize,
+        folding: usize,
+        log_inv_rate: usize,
+    ) -> (MT::Commitment, MT::ProverData<DenseMatrix<F>>) {
+        self.0.commit_held(num_variables, folding, log_inv_rate)
+    }
+}
+
+/// The host's committer: `encoder` then `mmcs`.
+#[derive(Debug)]
+pub struct HostCommitter<'a, E, MT> {
+    pub encoder: &'a E,
+    pub mmcs: &'a MT,
+}
+
+impl<F, E, MT> CodewordCommitter<F, MT> for HostCommitter<'_, E, MT>
+where
+    F: Field,
+    E: Encoder<F>,
+    MT: Mmcs<F>,
+{
+    fn commit_message(
+        &self,
+        message: RowMajorMatrixView<'_, F>,
+        log_inv_rate: usize,
+    ) -> (MT::Commitment, MT::ProverData<DenseMatrix<F>>) {
+        let codeword_height = message.height() << log_inv_rate;
+        let encoded = info_span!("encode", height = codeword_height, width = message.width)
+            .in_scope(|| self.encoder.encode_batch_borrowed(message, log_inv_rate));
+        info_span!("commit_matrix").in_scope(|| self.mmcs.commit_matrix(encoded))
+    }
+}
+
+/// [`commit_base`] through `committer`.
+pub fn commit_base_with<F, MT, K>(
+    committer: &K,
+    num_variables: usize,
+    folding: usize,
+    starting_log_inv_rate: usize,
+    write_message: impl FnOnce(&mut [F]),
+) -> (MT::Commitment, MT::ProverData<DenseMatrix<F>>)
+where
+    F: Field,
+    MT: Mmcs<F>,
+    K: CodewordCommitter<F, MT>,
+{
+    let width = 1 << folding;
+    let message_height = 1 << (num_variables - folding);
+    let mut values = F::zero_vec(message_height * width);
+    write_message(&mut values);
+    committer.commit_message(RowMajorMatrixView::new(&values, width), starting_log_inv_rate)
+}
+
 pub fn commit_base<F, E, MT>(
     encoder: &E,
     mmcs: &MT,

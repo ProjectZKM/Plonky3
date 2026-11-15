@@ -11,7 +11,7 @@ use p3_air::symbolic::{BaseEntry, BaseLeaf, ExtEntry, ExtLeaf, SymbolicExpr, Sym
 use p3_air::{Air, BaseAir, BoundaryEnd};
 use p3_bus::{BusActivation, BusBoundary, BusDirection, BusSymbolicBuilder};
 use p3_field::{ExtensionField, Field, RawDataSerializable};
-use p3_lookup::{InteractionSymbolicBuilder, TraceWindow};
+use p3_lookup::{IndexedPosition, InteractionSymbolicBuilder, TraceWindow};
 
 /// Write everything one table fixes into a fresh byte string.
 ///
@@ -156,7 +156,13 @@ where
     arena.count(reads.len());
     for read in reads {
         arena.text(&read.table);
-        arena.count(read.position);
+        match &read.position {
+            IndexedPosition::Column(column) => arena.count(*column),
+            IndexedPosition::Bits(bits) => {
+                arena.count(usize::MAX);
+                arena.indices(bits);
+            }
+        }
         arena.indices(&read.payload);
     }
 

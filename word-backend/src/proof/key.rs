@@ -5,26 +5,35 @@ use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 
 use p3_field::Field;
+use p3_maybe_rayon::prelude::*;
 use p3_multilinear_util::point::Point;
 use p3_security::SecurityTerm;
 use p3_security::word::WordProofSecurityModel;
 use p3_sumcheck::PrescribedOpeningSecurity;
 use p3_word::Word;
+use serde::{Deserialize, Serialize};
 
 use super::error::WordProofError;
 use super::relation::{BASE_TERMS, OPERAND_EVALUATIONS, PRODUCT_TERMS, ZEROCHECK_DEGREE};
 use super::transcript::TranscriptShape;
 use crate::integer_mul::{IntegerMulReduction, OperandClaim};
 use crate::statement::Statement;
-use crate::{KeyCompileError, Packed, PackedWitness, PackedWord, ShiftClaim, ShiftReductionKey};
+use crate::{
+    KeyCompileError, Packed, PackedWitness, PackedWord, PortRouting, ShiftClaim,
+    ShiftReductionKey,
+};
 
 /// A checked word system compiled into a complete proving key.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct WordProofKey<W: Word> {
     /// Reduction from shifted operand claims to one committed-trace claim.
     pub(super) shift: ShiftReductionKey<W>,
     /// Reduction of every unsigned product to operand claims, when the statement declares one.
     pub(super) integer_mul: Option<IntegerMulReduction>,
+    /// Copy constraints between committed ports, when the statement routes any.
+    #[serde(default)]
+    pub(super) ports: Option<PortRouting>,
 }
 
 impl<W: Word> WordProofKey<W> {
@@ -40,7 +49,28 @@ impl<W: Word> WordProofKey<W> {
         Ok(Self {
             shift: ShiftReductionKey::new(statement)?,
             integer_mul: IntegerMulReduction::new(products, Self::bit_variables()),
+            ports: None,
         })
+    }
+
+    /// [`Self::new`] with the copy constraints `routing` between committed ports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the system is too large for the compact key representation.
+    pub fn with_ports(
+        statement: impl Into<Statement<W>>,
+        routing: PortRouting,
+    ) -> Result<Self, KeyCompileError> {
+        let mut key = Self::new(statement)?;
+        key.ports = Some(routing);
+        Ok(key)
+    }
+
+    /// Returns the copy constraints between committed ports, if any.
+    #[inline]
+    pub const fn ports(&self) -> Option<&PortRouting> {
+        self.ports.as_ref()
     }
 
     /// Returns the checked statement represented by this key.
@@ -222,16 +252,6 @@ impl<W: Word> WordProofKey<W> {
             lift(&claims[2]),
         ]
     }
-
-    /// Returns the equality tables of the product points over the shared cube.
-    pub(super) fn product_weights<EF: Field>(
-        &self,
-        vanishing_point: &[EF],
-        claims: &[OperandClaim<EF>; 4],
-    ) -> [Vec<EF>; 4] {
-        self.product_points(vanishing_point, claims)
-            .map(|point| Point::new(point.as_slice()).equality_weights_msb())
-    }
 }
 
 impl<W: PackedWord> WordProofKey<W> {
@@ -243,9 +263,21 @@ impl<W: PackedWord> WordProofKey<W> {
     ) -> Vec<Packed<W>> {
         // Words above the declared segment are zero, so they move no opening.
         let words = commitment_variables - Self::bit_variables();
-        let mut trace = vec![W::pack(W::ZERO); 1 << words];
-        trace[..values.witness().len()].copy_from_slice(values.witness());
-        trace
+        let witness = values.witness();
+        assert!(witness.len() <= 1 << words, "the witness fits the commitment");
+        let zero = W::pack(W::ZERO);
+        (0..1usize << words)
+            .into_par_iter()
+            .map(|index| witness.get(index).copied().unwrap_or(zero))
+            .collect()
+    }
+
+    /// The routing words, padded as the trace is, when the key routes ports.
+    pub(super) fn routing_bits(&self, commitment_variables: usize) -> Option<Vec<Packed<W>>> {
+        let words = commitment_variables - Self::bit_variables();
+        self.ports
+            .as_ref()
+            .map(|routing| routing.words::<W>(words).into_iter().map(W::pack).collect())
     }
 }
 

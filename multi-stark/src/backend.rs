@@ -24,7 +24,9 @@ use p3_multilinear_util::poly::Poly;
 use crate::folder::{InteractionMultilinearFolder, MultilinearFolder, ProverAir};
 use crate::packed_ext::PackedRepr;
 use crate::rounds::sliced::SlicedStrategy;
+use crate::rounds::device::ZerocheckDevice;
 use crate::rounds::{AirOpenings, RoundStateBase, RoundStateExt};
+use p3_lookup::InteractionSymbolicBuilder;
 use crate::sliced::{SlicedFolder, SlicedQuadraticFolder};
 use crate::subfield::{SubfieldAcc, SubfieldVar};
 
@@ -53,26 +55,35 @@ mod private {
         /// Carry a representation-field value back into the challenge field.
         fn from_repr(value: Self::Repr) -> EF;
 
+        /// Whether the rounds read the equality suffix the prover keeps on the host; a device
+        /// keeps its own.
+        fn host_equality(&self) -> bool {
+            true
+        }
+
         /// Evaluate the first round polynomial of a newly activated stage.
-        fn round0(state: &mut RoundStateBase<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF>;
+        fn round0(&self, state: &mut RoundStateBase<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF>;
 
         /// Bind the first variable of a stage at `r`.
         fn fold0<'air, 'data>(
+            &self,
             state: RoundStateBase<'air, 'data, A, F, EF>,
             r: EF,
         ) -> RoundStateExt<'air, 'data, A, F, EF, Self::Repr>;
 
         /// Evaluate the round polynomial of a stage whose first variable is bound.
         fn round(
+            &self,
             state: &mut RoundStateExt<'_, '_, A, F, EF, Self::Repr>,
             eq_suffix: &Poly<EF>,
         ) -> Vec<EF>;
 
         /// Bind the next variable of a folded stage at `r`.
-        fn fold(state: &mut RoundStateExt<'_, '_, A, F, EF, Self::Repr>, r: EF);
+        fn fold(&self, state: &mut RoundStateExt<'_, '_, A, F, EF, Self::Repr>, r: EF);
 
         /// Split a fully bound stage into per-AIR openings, each tagged with its caller index.
         fn openings(
+            &self,
             state: RoundStateExt<'_, '_, A, F, EF, Self::Repr>,
         ) -> Vec<(usize, AirOpenings<EF>)>;
     }
@@ -98,7 +109,7 @@ pub trait ZerocheckBackend<F: Field, EF: ExtensionField<F>, A>:
 ///
 /// Both run the SIMD-packed kernel while half the residual rows fill a lane, and the scalar
 /// kernel after that.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct GenericBackend;
 
 /// A Boolean tensor for the first four rounds of eligible quadratic stages, followed by the
@@ -108,7 +119,7 @@ pub struct GenericBackend;
 /// packed Boolean tables and public values, and no lookups or successor reads. Dense tables,
 /// including periodic columns, use the generic kernels. An AIR constant outside `{0, 1}` also
 /// discards the tensor before any claim changes. Every fallback preserves the generic proof.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct BooleanTensorBackend;
 
 #[expect(private_interfaces)]
@@ -131,13 +142,14 @@ where
         value
     }
 
-    fn round0(state: &mut RoundStateBase<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
+    fn round0(&self, state: &mut RoundStateBase<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
         state
             .round_poly_boolean_tensor()
             .unwrap_or_else(|| state.round_poly(eq_suffix))
     }
 
     fn fold0<'air, 'data>(
+        &self,
         state: RoundStateBase<'air, 'data, A, F, EF>,
         r: EF,
     ) -> RoundStateExt<'air, 'data, A, F, EF> {
@@ -148,19 +160,19 @@ where
         }
     }
 
-    fn round(state: &mut RoundStateExt<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
+    fn round(&self, state: &mut RoundStateExt<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
         state
             .round_poly_tensor()
             .unwrap_or_else(|| state.round_poly(eq_suffix))
     }
 
-    fn fold(state: &mut RoundStateExt<'_, '_, A, F, EF>, r: EF) {
+    fn fold(&self, state: &mut RoundStateExt<'_, '_, A, F, EF>, r: EF) {
         if !state.fold_sliced(r) && !state.fold_boolean_boundary(r) {
             state.fold(r);
         }
     }
 
-    fn openings(state: RoundStateExt<'_, '_, A, F, EF>) -> Vec<(usize, AirOpenings<EF>)> {
+    fn openings(&self, state: RoundStateExt<'_, '_, A, F, EF>) -> Vec<(usize, AirOpenings<EF>)> {
         state.into_openings()
     }
 }
@@ -186,26 +198,27 @@ where
         value
     }
 
-    fn round0(state: &mut RoundStateBase<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
+    fn round0(&self, state: &mut RoundStateBase<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
         state.round_poly(eq_suffix)
     }
 
     fn fold0<'air, 'data>(
+        &self,
         state: RoundStateBase<'air, 'data, A, F, EF>,
         r: EF,
     ) -> RoundStateExt<'air, 'data, A, F, EF> {
         state.fold(r)
     }
 
-    fn round(state: &mut RoundStateExt<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
+    fn round(&self, state: &mut RoundStateExt<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
         state.round_poly(eq_suffix)
     }
 
-    fn fold(state: &mut RoundStateExt<'_, '_, A, F, EF>, r: EF) {
+    fn fold(&self, state: &mut RoundStateExt<'_, '_, A, F, EF>, r: EF) {
         state.fold(r);
     }
 
-    fn openings(state: RoundStateExt<'_, '_, A, F, EF>) -> Vec<(usize, AirOpenings<EF>)> {
+    fn openings(&self, state: RoundStateExt<'_, '_, A, F, EF>) -> Vec<(usize, AirOpenings<EF>)> {
         state.into_openings()
     }
 }
@@ -216,6 +229,59 @@ where
     EF: ExtensionField<F>,
     T: private::Dispatch<F, EF, A>,
 {
+}
+
+/// The zerocheck's stages on `device`, the explicit device that takes them: every stage's
+/// rounds, folds and openings run there, and none on the host.
+pub struct DeviceBackend<'a, F, EF>(pub &'a dyn ZerocheckDevice<F, EF>);
+
+#[expect(private_interfaces)]
+impl<F, EF, A> private::Dispatch<F, EF, A> for DeviceBackend<'_, F, EF>
+where
+    F: Field,
+    EF: ExtensionField<F>,
+    A: ProverAir<F, EF> + Air<InteractionSymbolicBuilder<F, EF>>,
+    EF::ExtensionPacking: From<EF> + From<F::Packing>,
+{
+    type Repr = EF;
+
+    #[inline]
+    fn to_repr(value: EF) -> EF {
+        value
+    }
+
+    #[inline]
+    fn from_repr(value: EF) -> EF {
+        value
+    }
+
+    fn host_equality(&self) -> bool {
+        false
+    }
+
+    fn round0(&self, state: &mut RoundStateBase<'_, '_, A, F, EF>, _eq_suffix: &Poly<EF>) -> Vec<EF> {
+        state.device_round0(self.0)
+    }
+
+    fn fold0<'air, 'data>(
+        &self,
+        state: RoundStateBase<'air, 'data, A, F, EF>,
+        r: EF,
+    ) -> RoundStateExt<'air, 'data, A, F, EF> {
+        state.fold0_device(r)
+    }
+
+    fn round(&self, state: &mut RoundStateExt<'_, '_, A, F, EF>, _eq_suffix: &Poly<EF>) -> Vec<EF> {
+        state.device_round()
+    }
+
+    fn fold(&self, state: &mut RoundStateExt<'_, '_, A, F, EF>, r: EF) {
+        state.fold_device(r);
+    }
+
+    fn openings(&self, state: RoundStateExt<'_, '_, A, F, EF>) -> Vec<(usize, AirOpenings<EF>)> {
+        state.device_openings()
+    }
 }
 
 /// The backend that evaluates a stage's first round inside the small subfield `S` when it fits.
@@ -247,6 +313,12 @@ where
 #[derive(Debug)]
 pub struct SubfieldBackend<S>(PhantomData<fn() -> S>);
 
+impl<S> Default for SubfieldBackend<S> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
 // The sealed kernels take the crate-private round states.
 #[expect(private_interfaces)]
 impl<F, EF, A, S> private::Dispatch<F, EF, A> for SubfieldBackend<S>
@@ -271,14 +343,17 @@ where
         value
     }
 
-    fn round0(state: &mut RoundStateBase<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
-        state
+    fn round0(&self, state: &mut RoundStateBase<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
+        let round_poly = state
             .round_poly_sliced::<S, EF>(eq_suffix)
             .or_else(|| state.round_poly_subfield::<S>(eq_suffix))
-            .unwrap_or_else(|| state.round_poly(eq_suffix))
+            .unwrap_or_else(|| state.round_poly(eq_suffix));
+        log_kernel(state);
+        round_poly
     }
 
     fn fold0<'air, 'data>(
+        &self,
         state: RoundStateBase<'air, 'data, A, F, EF>,
         r: EF,
     ) -> RoundStateExt<'air, 'data, A, F, EF> {
@@ -291,21 +366,21 @@ where
         }
     }
 
-    fn round(state: &mut RoundStateExt<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
+    fn round(&self, state: &mut RoundStateExt<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
         state.round_poly_sliced::<S>(eq_suffix).unwrap_or_else(|| {
             state.unslice_packed::<S>();
-            <GenericBackend as private::Dispatch<F, EF, A>>::round(state, eq_suffix)
+            GenericBackend.round(state, eq_suffix)
         })
     }
 
-    fn fold(state: &mut RoundStateExt<'_, '_, A, F, EF>, r: EF) {
+    fn fold(&self, state: &mut RoundStateExt<'_, '_, A, F, EF>, r: EF) {
         if !state.fold_sliced(r) {
-            <GenericBackend as private::Dispatch<F, EF, A>>::fold(state, r);
+            GenericBackend.fold(state, r);
         }
     }
 
-    fn openings(state: RoundStateExt<'_, '_, A, F, EF>) -> Vec<(usize, AirOpenings<EF>)> {
-        <GenericBackend as private::Dispatch<F, EF, A>>::openings(state)
+    fn openings(&self, state: RoundStateExt<'_, '_, A, F, EF>) -> Vec<(usize, AirOpenings<EF>)> {
+        GenericBackend.openings(state)
     }
 }
 
@@ -347,6 +422,12 @@ where
 #[derive(Debug)]
 pub struct ReprBackend<S, R, const LATE_MATERIALIZATION: bool = false>(PhantomData<fn() -> (S, R)>);
 
+impl<S, R, const LATE_MATERIALIZATION: bool> Default for ReprBackend<S, R, LATE_MATERIALIZATION> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
 // The sealed kernels take the crate-private round states.
 #[expect(private_interfaces)]
 impl<F, EF, A, S, R, const LATE_MATERIALIZATION: bool> private::Dispatch<F, EF, A>
@@ -379,19 +460,22 @@ where
         EF::from(value)
     }
 
-    fn round0(state: &mut RoundStateBase<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
+    fn round0(&self, state: &mut RoundStateBase<'_, '_, A, F, EF>, eq_suffix: &Poly<EF>) -> Vec<EF> {
         let strategy = if LATE_MATERIALIZATION {
             SlicedStrategy::TensorBoundaryLate
         } else {
             SlicedStrategy::TensorBoundary
         };
-        state
+        let round_poly = state
             .round_poly_sliced_with_strategy::<S, R>(eq_suffix, strategy)
             .or_else(|| state.round_poly_subfield::<S>(eq_suffix))
-            .unwrap_or_else(|| state.round_poly(eq_suffix))
+            .unwrap_or_else(|| state.round_poly(eq_suffix));
+        log_kernel(state);
+        round_poly
     }
 
     fn fold0<'air, 'data>(
+        &self,
         state: RoundStateBase<'air, 'data, A, F, EF>,
         r: EF,
     ) -> RoundStateExt<'air, 'data, A, F, EF, R> {
@@ -409,7 +493,7 @@ where
         }
     }
 
-    fn round(state: &mut RoundStateExt<'_, '_, A, F, EF, R>, eq_suffix: &Poly<EF>) -> Vec<EF> {
+    fn round(&self, state: &mut RoundStateExt<'_, '_, A, F, EF, R>, eq_suffix: &Poly<EF>) -> Vec<EF> {
         state
             .round_poly_sliced::<S>(eq_suffix)
             .or_else(|| {
@@ -424,7 +508,7 @@ where
             })
     }
 
-    fn fold(state: &mut RoundStateExt<'_, '_, A, F, EF, R>, r: EF) {
+    fn fold(&self, state: &mut RoundStateExt<'_, '_, A, F, EF, R>, r: EF) {
         if !(LATE_MATERIALIZATION && state.fold_late_boundary::<S>(r))
             && !state.fold_boundary::<S>(r)
             && !state.fold_sliced(r)
@@ -433,7 +517,25 @@ where
         }
     }
 
-    fn openings(state: RoundStateExt<'_, '_, A, F, EF, R>) -> Vec<(usize, AirOpenings<EF>)> {
+    fn openings(&self, state: RoundStateExt<'_, '_, A, F, EF, R>) -> Vec<(usize, AirOpenings<EF>)> {
         state.into_openings()
     }
+}
+
+/// Record which kernel took a stage's first round, and at what height.
+fn log_kernel<A: p3_air::BaseAir<F>, F: Field, EF: ExtensionField<F>>(
+    state: &RoundStateBase<'_, '_, A, F, EF>,
+) {
+    let kernel = if state.is_sliced() {
+        "sliced"
+    } else if state.fits_subfield() {
+        "subfield"
+    } else {
+        "generic"
+    };
+    tracing::info!(
+        num_vars = state.num_evals().trailing_zeros(),
+        kernel,
+        "zerocheck stage first round"
+    );
 }

@@ -368,7 +368,7 @@ fn boolean_tensor_fallback_is_transactional() {
     }
 }
 
-fn transcript<B: ZerocheckBackend<F, EF, BooleanAir>>(
+fn transcript<B: ZerocheckBackend<F, EF, BooleanAir> + Default>(
     air: &BooleanAir,
     table: &Table<F>,
 ) -> (Vec<u8>, F) {
@@ -381,6 +381,7 @@ fn transcript<B: ZerocheckBackend<F, EF, BooleanAir>>(
         &[&public],
         LookupRuntime::Inactive,
         3,
+        &B::default(),
         &mut challenger,
     );
     let bytes = postcard::to_allocvec(&(

@@ -86,7 +86,7 @@ pub const WORD_INTEGER_MUL_LABEL: &str = "word-integer-mul";
 /// Label for the row point the two exponent lifts are compared at.
 pub const WORD_INTEGER_MUL_POINT_LABEL: &str = "word-integer-mul-point";
 
-/// Label for the layer, line, and leaf checks of both product trees.
+/// Label for the tree layers, the selector, and the leaf batching draws.
 pub const WORD_INTEGER_MUL_PRODUCT_LABEL: &str = "word-integer-mul-product-check";
 
 /// Per-variable degree of every sumcheck the multiplication reduction runs.
@@ -123,24 +123,30 @@ impl WordIntegerMulSecurityModel {
         })
     }
 
-    /// Returns the error numerator of one product tree of the given depth.
+    /// Returns the error numerator of the layers of one product tree of the given depth.
     ///
     /// ```text
     ///     layer d      cubic sumcheck over m + d variables, then one line draw
-    ///     leaf check   cubic sumcheck over m + depth variables
     ///
-    ///     numerator = sum_{d < depth} (3 * (m + d) + 1) + 3 * (m + depth)
+    ///     numerator = sum_{d < depth} (3 * (m + d) + 1)
     /// ```
     const fn tree_numerator(&self, depth: usize) -> u128 {
         let rows = self.row_variables as u128;
         let depth = depth as u128;
 
         // The layer sum of 3 * (m + d) is 3 * (m * depth + depth * (depth - 1) / 2).
-        let layers = INTEGER_MUL_DEGREE * (rows * depth + depth * depth.saturating_sub(1) / 2);
-        layers + depth + INTEGER_MUL_DEGREE * (rows + depth)
+        INTEGER_MUL_DEGREE * (rows * depth + depth * depth.saturating_sub(1) / 2) + depth
     }
 
     /// Returns each algebraic error source for diagnostic reporting.
+    ///
+    /// ```text
+    ///     power tree    depth k
+    ///     selector      cubic sumcheck over m variables
+    ///     base tree     depth k
+    ///     result tree   depth k + 1
+    ///     four draws of k coordinates batching per-bit leaf claims
+    /// ```
     #[must_use]
     pub fn components(self) -> Vec<SecurityTerm> {
         let mut terms = Vec::with_capacity(2);
@@ -153,9 +159,11 @@ impl WordIntegerMulSecurityModel {
             ));
         }
 
-        // The factor tree spans two bit indices and the result tree one index over twice the width.
-        let numerator = self.tree_numerator(2 * self.bit_variables)
-            + self.tree_numerator(self.bit_variables + 1);
+        // Each batching draw weights its claims by a multilinear equality in k coordinates.
+        let numerator = 2 * self.tree_numerator(self.bit_variables)
+            + self.tree_numerator(self.bit_variables + 1)
+            + INTEGER_MUL_DEGREE * self.row_variables as u128
+            + 4 * self.bit_variables as u128;
         terms.push(SecurityTerm::new(
             WORD_INTEGER_MUL_PRODUCT_LABEL,
             error_from_numerator(self.field_bits, numerator),
@@ -462,11 +470,12 @@ mod tests {
     }
 
     #[test]
-    fn a_multiplication_reduction_charges_its_point_and_both_trees() {
+    fn a_multiplication_reduction_charges_its_point_trees_and_selector() {
         // Fixture state: eight padded rows of 64-bit products.
         //
-        //     factor tree   depth 12, layer d over 3 + d variables, leaf over 15
-        //     result tree   depth 7,  layer d over 3 + d variables, leaf over 10
+        //     power, base trees   depth 6, layer d over 3 + d variables
+        //     result tree         depth 7, layer d over 3 + d variables
+        //     selector            cubic over 3 variables
         let model = WordIntegerMulSecurityModel::new(128, 3, 6).unwrap();
         let components = model.components();
 
@@ -474,12 +483,13 @@ mod tests {
         assert_eq!(components[0].label, WORD_INTEGER_MUL_POINT_LABEL);
         assert_eq!(components[0].bits.bits(), 128.0 - libm::log2(3.0));
 
-        // Factor tree: 3 * (36 + 66) + 12 + 45 = 363.
-        // Result tree: 3 * (21 + 21) + 7 + 30 = 163.
+        // Power and base trees: 3 * (18 + 15) + 6 = 105 each.
+        // Result tree: 3 * (21 + 21) + 7 = 133.
+        // Selector 9, four batching draws 24: 105 * 2 + 133 + 9 + 24 = 376.
         assert_eq!(components[1].label, WORD_INTEGER_MUL_PRODUCT_LABEL);
-        assert_eq!(components[1].bits.bits(), 128.0 - libm::log2(526.0));
+        assert_eq!(components[1].bits.bits(), 128.0 - libm::log2(376.0));
 
-        // A single row needs no comparison point, but both trees still run.
+        // A single row needs no comparison point, but every tree still runs.
         let single = WordIntegerMulSecurityModel::new(128, 0, 6).unwrap();
         let components = single.components();
         assert_eq!(components.len(), 1);

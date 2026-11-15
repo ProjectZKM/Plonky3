@@ -10,7 +10,22 @@ const SEQUENCE_MASK: u32 = (1 << SEQUENCE_BITS) - 1;
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct KeyCode(u32);
 
+/// Every [`KeyCode`] is below this: three family tags above two nine-bit shifts.
+pub(super) const KEY_CODES: usize = 4 << SEQUENCE_BITS;
+
 impl KeyCode {
+    /// The code's place among the [`KEY_CODES`], ascending as the codes do.
+    #[inline]
+    pub(super) const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// The code at `index`, one [`Self::index`] returned.
+    #[inline]
+    pub(super) const fn from_index(index: usize) -> Self {
+        Self(index as u32)
+    }
+
     /// Encodes one checked operation and its shifts.
     #[inline]
     pub(super) fn new<W: Word>(operation: ConstraintKind, shifts: [Shift<W>; 2]) -> Self {

@@ -83,12 +83,11 @@ pub(super) enum BatchRole {
     ///
     /// Bus shares close at that same point, so they read this batch too.
     Air,
-    /// One reader's position column, at the point the reduction left its position claims.
+    /// An AIR's columns at the point the reduction left its position claims, which every
+    /// reader the AIR holds reads its position out of.
     Position {
-        /// Position of the table in plan order.
-        table: usize,
-        /// Position of the reader within that table.
-        reader: usize,
+        /// Position of the reading AIR in caller order.
+        air: usize,
     },
     /// One table's own columns, at the point the reduction left its table claims.
     TableColumns {
@@ -585,7 +584,9 @@ where
     ///
     /// A table the indexed reduction reaches opens further batches.
     ///
-    /// Those are taken at the points that reduction closes on.
+    /// Those are taken at the points that reduction closes on, and read the whole width
+    /// again: the commitment batches a table's openings only when each reads every column,
+    /// and falls back to one claim per column otherwise.
     ///
     /// The security assessment walks this same schedule, so the two cannot diverge.
     ///
@@ -617,23 +618,34 @@ where
             })
             .collect::<Vec<_>>();
 
-        // A reader's position column and a main-window table's columns both live here.
+        // A reader's position columns and a main-window table's columns both live here.
         if let Some(plan) = indexed {
-            for (table, planned) in plan.tables().iter().enumerate() {
-                for (reader, placement) in planned.readers.iter().enumerate() {
-                    let role = BatchRole::Position { table, reader };
-                    tables[placement.air].1.push((
-                        OpeningBatch::new(alloc::vec![placement.position], Vec::new()),
-                        Opening {
-                            role,
-                            against: against(role, placement.num_variables),
-                        },
-                    ));
+            let widths = self.widths();
+            let next_columns = self.next_columns();
+            let mut reading: Vec<usize> = Vec::new();
+            for planned in plan.tables() {
+                for placement in &planned.readers {
+                    if !reading.contains(&placement.air) {
+                        reading.push(placement.air);
+                    }
                 }
+            }
+            for air in reading {
+                let role = BatchRole::Position { air };
+                tables[air].1.push((
+                    OpeningBatch::new((0..widths[air]).collect(), next_columns[air].clone()),
+                    Opening {
+                        role,
+                        against: against(role, self.0[air].num_variables),
+                    },
+                ));
+            }
+            for (table, planned) in plan.tables().iter().enumerate() {
                 if planned.table.window == TraceWindow::Main {
                     let role = BatchRole::TableColumns { table };
-                    tables[planned.table.air].1.push((
-                        OpeningBatch::new(planned.table.columns.clone(), Vec::new()),
+                    let air = planned.table.air;
+                    tables[air].1.push((
+                        OpeningBatch::new((0..widths[air]).collect(), next_columns[air].clone()),
                         Opening {
                             role,
                             against: against(role, planned.table.num_variables),
@@ -700,8 +712,12 @@ where
                     .position(|&air| air == planned.table.air)
                     .expect("a preprocessed table's AIR commits preprocessed columns");
                 let role = BatchRole::TableColumns { table };
+                let instance = &self.0[planned.table.air];
                 tables[slot].1.push((
-                    OpeningBatch::new(planned.table.columns.clone(), Vec::new()),
+                    OpeningBatch::new(
+                        (0..instance.air.preprocessed_width()).collect(),
+                        instance.air.preprocessed_next_row_columns(),
+                    ),
                     Opening {
                         role,
                         against: against(role, planned.table.num_variables),

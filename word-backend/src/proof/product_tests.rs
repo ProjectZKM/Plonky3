@@ -481,35 +481,52 @@ fn every_multiplication_record_value_is_load_bearing() {
     // Each mutation perturbs one value the multiplication record carries.
     //
     // Each names the first check that sees it, so a deleted check moves the variant.
-    let mutations: [Mutation; 9] = [
+    let mutations: [Mutation; 13] = [
         ("root", IntegerMulError::EnteringClaim, |proof| {
             proof.integer_mul.as_mut().unwrap().root += EF::ONE;
         }),
-        ("factor leaf value", IntegerMulError::LeafClaim, |proof| {
-            proof.integer_mul.as_mut().unwrap().factor.values[1] += EF::ONE;
+        ("power leaf", IntegerMulError::LeafClaim, |proof| {
+            proof.integer_mul.as_mut().unwrap().power.leaves[1] += EF::ONE;
         }),
-        ("result leaf value", IntegerMulError::LeafClaim, |proof| {
-            proof.integer_mul.as_mut().unwrap().result.values[0] += EF::ONE;
+        ("base leaf", IntegerMulError::LeafClaim, |proof| {
+            proof.integer_mul.as_mut().unwrap().base.leaves[0] += EF::ONE;
         }),
-        ("factor leaf round", IntegerMulError::LeafClaim, |proof| {
-            proof.integer_mul.as_mut().unwrap().factor.leaf.round_polys[0][0] += EF::ONE;
+        ("result leaf", IntegerMulError::LeafClaim, |proof| {
+            proof.integer_mul.as_mut().unwrap().result.leaves[0] += EF::ONE;
         }),
-        ("result leaf sum", IntegerMulError::EnteringClaim, |proof| {
-            proof.integer_mul.as_mut().unwrap().result.leaf.claimed_sum += EF::ONE;
+        ("selector sum", IntegerMulError::EnteringClaim, |proof| {
+            proof.integer_mul.as_mut().unwrap().selector.claimed_sum += EF::ONE;
         }),
-        ("first factor half", IntegerMulError::LayerClaim, |proof| {
-            proof.integer_mul.as_mut().unwrap().factor.layers[0].halves[0] += EF::ONE;
+        ("selector round", IntegerMulError::SelectorClaim, |proof| {
+            proof.integer_mul.as_mut().unwrap().selector.round_polys[0][0] += EF::ONE;
+        }),
+        ("selected base", IntegerMulError::SelectorClaim, |proof| {
+            proof.integer_mul.as_mut().unwrap().selected[0] += EF::ONE;
+        }),
+        ("selected bit", IntegerMulError::SelectorClaim, |proof| {
+            proof.integer_mul.as_mut().unwrap().selected[3] += EF::ONE;
+        }),
+        ("first power half", IntegerMulError::LayerClaim, |proof| {
+            proof.integer_mul.as_mut().unwrap().power.layers[0].halves[0] += EF::ONE;
         }),
         ("last result half", IntegerMulError::LayerClaim, |proof| {
             let layers = &mut proof.integer_mul.as_mut().unwrap().result.layers;
             layers.last_mut().unwrap().halves[1] += EF::ONE;
         }),
         (
-            "last factor layer round",
+            "last base layer round",
             IntegerMulError::LayerClaim,
             |proof| {
-                let layers = &mut proof.integer_mul.as_mut().unwrap().factor.layers;
+                let layers = &mut proof.integer_mul.as_mut().unwrap().base.layers;
                 layers.last_mut().unwrap().sumcheck.round_polys[0][2] += EF::ONE;
+            },
+        ),
+        (
+            "first base layer sum",
+            IntegerMulError::EnteringClaim,
+            |proof| {
+                let layers = &mut proof.integer_mul.as_mut().unwrap().base.layers;
+                layers[0].sumcheck.claimed_sum += EF::ONE;
             },
         ),
         (
@@ -586,13 +603,13 @@ fn a_multiplication_record_must_match_the_statement() {
 
     // A record with one layer too few is refused before its transcript is replayed.
     let mut shallow = proof;
-    shallow.integer_mul.as_mut().unwrap().factor.layers.pop();
+    shallow.integer_mul.as_mut().unwrap().power.layers.pop();
     assert!(matches!(
         fixture.check(&commitment, &shallow),
         Err(WordProofError::IntegerMul(IntegerMulError::TreeDepth {
-            tree: "factor",
-            expected: 10,
-            actual: 9,
+            tree: "power",
+            expected: 5,
+            actual: 4,
         }))
     ));
 }

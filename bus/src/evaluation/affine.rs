@@ -201,6 +201,82 @@ where
     }
 }
 
+/// A cell an affine form reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AffineCell {
+    /// Current-row main column at this index.
+    Main(usize),
+    /// Current-row preprocessed column at this index.
+    Preprocessed(usize),
+    /// Current-row periodic column at this index.
+    Periodic(usize),
+    /// The first-row, last-row or transition selector.
+    Boundary(usize),
+}
+
+/// An affine expression of a row's cells: a constant, and a coefficient per cell it reads.
+///
+/// The flat form of a [`BusAffineExpression`], for a backend that walks the cells of a row.
+#[derive(Clone, Debug)]
+pub struct AffineForm<EF> {
+    /// The expression where every cell is zero.
+    pub constant: EF,
+    /// Each cell read, with its coefficient.
+    pub terms: Vec<(AffineCell, EF)>,
+}
+
+impl<EF: Field> AffineForm<EF> {
+    /// The form of `expression + shift`.
+    #[must_use]
+    pub fn of(expression: &BusAffineExpression<EF>, shift: EF) -> Self {
+        let boundary = [
+            expression.first_row,
+            expression.last_row,
+            expression.transition,
+        ];
+        let terms = expression
+            .main
+            .iter()
+            .map(|&(column, c)| (AffineCell::Main(column), c))
+            .chain(
+                expression
+                    .preprocessed
+                    .iter()
+                    .map(|&(column, c)| (AffineCell::Preprocessed(column), c)),
+            )
+            .chain(
+                expression
+                    .periodic
+                    .iter()
+                    .map(|&(column, c)| (AffineCell::Periodic(column), c)),
+            )
+            .chain(
+                boundary
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(_, c)| c != EF::ZERO)
+                    .map(|(which, c)| (AffineCell::Boundary(which), c)),
+            )
+            .collect();
+        Self {
+            constant: expression.constant + shift,
+            terms,
+        }
+    }
+
+    /// The factor `1 + factor_minus_one` and its activation, as forms.
+    #[must_use]
+    pub fn of_factor(factor: &BusAffineFactor<EF>) -> (Self, Option<Self>) {
+        (
+            Self::of(&factor.factor_minus_one, EF::ONE),
+            factor
+                .activation
+                .as_ref()
+                .map(|activation| Self::of(activation, EF::ZERO)),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::string::ToString;

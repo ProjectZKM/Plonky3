@@ -74,10 +74,12 @@
 //! A single claim plays the one-claim reduction, transcript and all.
 //! Its batch draws no `lambda` and its proof carries the same messages.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::any::TypeId;
 use core::borrow::Borrow;
 
-use p3_binary_field::{BitCoordinates, TowerLevel};
+use p3_binary_field::{BinaryField128, BitCoordinates, TowerLevel};
 use p3_challenger::fs::TranscriptField;
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{ExtensionField, Field};
@@ -96,7 +98,10 @@ use super::transcript::{
     BitRingSwitchClaimsProverTranscript, BitRingSwitchClaimsShape,
     BitRingSwitchClaimsVerifierTranscript, ClaimStatement, ClaimsDraws,
 };
+use super::device::{PackingRounds, PackingRoundsDevice, from_pattern, pattern, patterns};
+use super::equality::FactoredEquality;
 use crate::data::SumcheckData;
+use crate::transcript::{ProverTranscript, SumcheckShape};
 use crate::strategy::{Basis, FromTable, IntoTranscriptField, ReprSumcheckProver, VariableOrder};
 
 /// Several claims about one packing, each at a point of its own, reduced together.
@@ -294,6 +299,28 @@ where
         Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
         S: Borrow<[F]>,
     {
+        self.prove_on::<R, _, _>(packing, None, challenger)
+    }
+
+    /// [`Self::prove`] with a batch's weights and rounds on `device` when given, which the
+    /// transcript cannot tell apart.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::prove`], and on a device unless both fields are `GF(2^128)`.
+    pub fn prove_on<R, Challenger, S>(
+        &self,
+        packing: &BitPacking<F, S>,
+        device: Option<&dyn PackingRoundsDevice>,
+        challenger: &mut Challenger,
+    ) -> (BitRingSwitchClaimsProof<F, EF>, Point<EF>, EF)
+    where
+        F: Send + Sync,
+        EF: Send + Sync,
+        R: IntoTranscriptField<EF> + FromTable<F> + Sync,
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+        S: Borrow<[F]>,
+    {
         // A batch of one is the one-claim reduction, its compact rounds included.
         if let [reduction] = self.reductions.as_slice() {
             let (proof, point, value) = reduction.prove::<R, _, _>(packing, challenger);
@@ -314,15 +341,16 @@ where
             .iter()
             .map(BitRingSwitch::support)
             .collect::<Vec<_>>();
-        let claims = self
-            .reductions
-            .iter()
-            .zip(&supports)
-            .map(|(reduction, (_, offset, equality))| ClaimElements {
-                tensor: BitRingSwitch::tensor_over(packing, *offset, equality),
-                successor: reduction.successor_tensors_over(packing, *offset, equality),
-            })
-            .collect::<Vec<_>>();
+        let claims = tracing::info_span!("claim tensors").in_scope(|| {
+            self.reductions
+                .iter()
+                .zip(&supports)
+                .map(|(reduction, (_, offset, equality))| ClaimElements {
+                    tensor: BitRingSwitch::tensor_over(packing, *offset, equality),
+                    successor: reduction.successor_tensors_over(packing, *offset, equality),
+                })
+                .collect::<Vec<_>>()
+        });
 
         let mut transcript =
             BitRingSwitchClaimsProverTranscript::<Challenger, F, EF>::new(challenger, self.shape());
@@ -337,7 +365,34 @@ where
         let slot = 1usize << rounds;
         let slot_offset = address * slot;
 
+        if let Some(device) = device {
+            let values = &packing.poly().as_slice()[slot_offset..slot_offset + slot];
+            let held = tracing::info_span!("device packing").in_scope(|| {
+                assert!(
+                    TypeId::of::<F>() == TypeId::of::<BinaryField128>(),
+                    "a packing device runs over GF(2^128)"
+                );
+                // SAFETY: `F` is `BinaryField128`, which is `repr(transparent)` over `u128`.
+                let values = unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u128>(), slot) };
+                device.begin(values)
+            });
+            let (sumcheck, r_prime, final_eval) =
+                Self::device_rounds(held, &batches, &supports, &weights, slot_offset, rounds, &mut transcript);
+            transcript.surviving_claim(final_eval);
+            transcript.finish();
+            return (
+                BitRingSwitchClaimsProof {
+                    claims,
+                    sumcheck,
+                    final_eval,
+                },
+                self.restore_prefix(prefix, &r_prime),
+                final_eval,
+            );
+        }
+
         // sum_i lambda^i * A_i, each A_i written into the sub-slot its own prefix selects.
+        let weights_span = tracing::info_span!("claim weights").entered();
         let mut table = Poly::<R>::zero(rounds);
         for ((batch, (_, offset, equality)), &weight) in batches.iter().zip(&supports).zip(&weights)
         {
@@ -350,16 +405,21 @@ where
             );
         }
         let initial_sum = Self::batched_sum(&batches, &claims, &weights);
+        drop(weights_span);
 
-        let mut prover = ReprSumcheckProver::<F, EF, R>::from_repr_tables(
-            VariableOrder::Prefix,
-            slot_packing(packing, slot_offset, slot),
-            table,
-            initial_sum,
-        );
+        let mut prover = tracing::info_span!("packing table").in_scope(|| {
+            ReprSumcheckProver::<F, EF, R>::from_repr_tables(
+                VariableOrder::Prefix,
+                slot_packing(packing, slot_offset, slot),
+                table,
+                initial_sum,
+            )
+        });
         let mut sumcheck = SumcheckData::default();
-        let r_prime = transcript.batched_sumcheck(|challenger| {
-            prover.compute_sumcheck_polynomials(&mut sumcheck, challenger, rounds, 0)
+        let r_prime = tracing::info_span!("packing rounds", rounds).in_scope(|| {
+            transcript.batched_sumcheck(|challenger| {
+                prover.compute_sumcheck_polynomials(&mut sumcheck, challenger, rounds, 0)
+            })
         });
 
         // The rounds folded the packing down to its value at the point they ended on.
@@ -376,6 +436,133 @@ where
             self.restore_prefix(prefix, &r_prime),
             final_eval,
         )
+    }
+
+    /// [`Self::prove_on`] over the message `device` committed and holds, the packing never on
+    /// the host: each claim's element and the batch's rounds there, which the transcript cannot
+    /// tell apart.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a batch of one claim, and unless both fields are `GF(2^128)`.
+    pub fn prove_held<Challenger>(
+        &self,
+        device: &dyn PackingRoundsDevice,
+        challenger: &mut Challenger,
+    ) -> (BitRingSwitchClaimsProof<F, EF>, Point<EF>, EF)
+    where
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        assert!(self.reductions.len() > 1, "a held message opens a batch of claims");
+        assert!(
+            TypeId::of::<F>() == TypeId::of::<BinaryField128>(),
+            "a packing device runs over GF(2^128)"
+        );
+        let supports = self
+            .reductions
+            .iter()
+            .map(BitRingSwitch::support)
+            .collect::<Vec<_>>();
+        let claims = tracing::info_span!("device claim tensors").in_scope(|| {
+            self.reductions
+                .iter()
+                .zip(&supports)
+                .map(|(reduction, (_, offset, equality))| {
+                    let column = reduction.successor_column();
+                    let columns = device
+                        .held_tensor(*offset, &patterns(equality.outer()), &patterns(equality.inner()), column)
+                        .into_iter()
+                        .map(from_pattern::<EF>)
+                        .collect::<Vec<_>>();
+                    let (tensor, successor) = columns.split_at(128);
+                    ClaimElements {
+                        tensor: BitTensor::from_columns(tensor),
+                        successor: column.map(|_| SuccessorTensors {
+                            carry: BitTensor::from_columns(&successor[..128]),
+                            last: BitTensor::from_columns(&successor[128..]),
+                        }),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let mut transcript =
+            BitRingSwitchClaimsProverTranscript::<Challenger, F, EF>::new(challenger, self.shape());
+        let statements = self.statements(&claims);
+        let draws = transcript.statement(&statements);
+        let batches = self.batches(&draws);
+        let weights = claim_weights(draws.lambda, self.reductions.len());
+
+        let (prefix, address) = self.common_prefix();
+        let rounds = self.num_variables() - prefix;
+        let slot = 1usize << rounds;
+        let slot_offset = address * slot;
+        let held = tracing::info_span!("device packing")
+            .in_scope(|| device.begin_held(slot_offset, slot));
+        let (sumcheck, r_prime, final_eval) =
+            Self::device_rounds(held, &batches, &supports, &weights, slot_offset, rounds, &mut transcript);
+        transcript.surviving_claim(final_eval);
+        transcript.finish();
+        (
+            BitRingSwitchClaimsProof {
+                claims,
+                sumcheck,
+                final_eval,
+            },
+            self.restore_prefix(prefix, &r_prime),
+            final_eval,
+        )
+    }
+
+    /// The batch's weights and rounds on the device rounds `held`, over the slot of
+    /// `2^rounds` packed elements from `slot_offset`: the rounds' data, their point, and the
+    /// packing's value there.
+    fn device_rounds<Challenger>(
+        mut held: Box<dyn PackingRounds + '_>,
+        batches: &[BitRingSwitchBatch<'_, F, EF>],
+        supports: &[(usize, usize, FactoredEquality<EF>)],
+        weights: &[EF],
+        slot_offset: usize,
+        rounds: usize,
+        transcript: &mut BitRingSwitchClaimsProverTranscript<'_, Challenger, F, EF>,
+    ) -> (SumcheckData<F, EF>, Point<EF>, EF)
+    where
+        Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F>,
+    {
+        tracing::info_span!("device claim weights").in_scope(|| {
+            for ((batch, (_, offset, equality)), &weight) in batches.iter().zip(supports).zip(weights) {
+                if weight == EF::ZERO {
+                    continue;
+                }
+                let (tables, successor) = batch.device_weights(weight);
+                held.add_weights(
+                    offset - slot_offset,
+                    &patterns(equality.outer()),
+                    &patterns(equality.inner()),
+                    &patterns(&tables),
+                    successor.map(|(column, alpha)| (column, pattern(alpha))),
+                );
+            }
+        });
+        let mut sumcheck = SumcheckData::default();
+        let r_prime = tracing::info_span!("device packing rounds", rounds).in_scope(|| {
+            transcript.batched_sumcheck(|challenger| {
+                let shape = SumcheckShape::new(rounds, 0, Basis::Evaluation);
+                let mut rounds_transcript = ProverTranscript::<Challenger, F, EF>::new(challenger, shape);
+                let challenges = (0..rounds)
+                    .map(|_| {
+                        let [c_a, c_inf] = held.round().map(from_pattern::<EF>);
+                        let r = sumcheck.observe_and_sample(&mut rounds_transcript, c_a, c_inf);
+                        held.fold(pattern(r));
+                        r
+                    })
+                    .collect();
+                rounds_transcript.finish();
+                Point::new(challenges)
+            })
+        });
+        let final_eval = from_pattern::<EF>(held.last());
+        (sumcheck, r_prime, final_eval)
     }
 
     /// Replay the batch and return the one claim it leaves behind, as a point and a value.
