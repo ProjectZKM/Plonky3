@@ -151,6 +151,8 @@ pub struct ZerocheckProof<F, EF> {
     pub preprocessed_local: Vec<Vec<EF>>,
     /// Repeat-last preprocessed successor values, grouped by input AIR order.
     pub preprocessed_next: Vec<Vec<EF>>,
+    /// whir-gc experiment: the challenges and point a column-sumcheck closing reads.
+    pub closing: crate::closing::ClosingChallenges<EF>,
 }
 
 /// The binary-bus family one zerocheck run folds into its sumcheck.
@@ -1119,6 +1121,13 @@ impl<'a, A> AirZerocheck<'a, A> {
                 next,
                 preprocessed_local,
                 preprocessed_next,
+                closing: crate::closing::ClosingChallenges {
+                    alpha,
+                    beta,
+                    lambda,
+                    tau: tau.as_slice().to_vec(),
+                    point: Point::new(challenges.clone()),
+                },
             },
             Point::new(challenges),
         )

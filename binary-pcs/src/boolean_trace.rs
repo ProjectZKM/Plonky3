@@ -83,6 +83,7 @@ mod gather;
 
 pub use evaluate::{HELD_LOW_VARIABLES, HeldColumns, row_weight_factors};
 pub use gather::GatherSlot;
+mod closing;
 mod plan;
 
 use alloc::vec;
@@ -103,8 +104,8 @@ use p3_sumcheck::CodewordCommitter;
 use p3_sumcheck::layout::{Table, TablePlacement};
 use p3_sumcheck::ring_switch::bits::BitRingSwitch;
 use p3_sumcheck::{
-    OpeningEvals, OpeningProtocol, PairCheck, PairOpening, PrescribedOpeningSecurity,
-    PrescribedPointPcs, TableShape,
+    ClosingRelation, OpeningEvals, OpeningProtocol, PairCheck, PairOpening,
+    PrescribedOpeningSecurity, PrescribedPointPcs, TableShape,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -549,6 +550,11 @@ pub enum BooleanTraceCommitmentError<E> {
         actual: usize,
     },
 
+    /// whir-gc experiment: a closed pair opening's column sumcheck does not close on the
+    /// caller's target, or the relation does not describe the protocol's tables.
+    #[error("the closing column sumcheck does not close")]
+    ClosingSumcheck,
+
     /// whir-gc experiment: a packed batch's column sumcheck does not close.
     #[error("the packed columns of batch {batch} do not close their sumcheck")]
     PackedColumns {
@@ -885,6 +891,107 @@ where
             opening_evals(first_side.protocol, &first_columns),
             opening_evals(second_side.protocol, &second_columns),
         ))
+    }
+
+    fn open_pair_closed(
+        &self,
+        second: &Self,
+        first_side: PairOpening<'_, Self::ProverData, EF>,
+        second_side: PairOpening<'_, &Self::ProverData, EF>,
+        closing: &dyn ClosingRelation<EF>,
+        challenger: &mut Challenger,
+    ) -> Result<(Self::Proof, Self::Proof), Self::ProverError>
+    where
+        Self::ProverData: Clone,
+    {
+        let BooleanTraceCommitmentData {
+            inner: first_inner,
+            tables: first_tables,
+        } = first_side.prover_data;
+        let BooleanTraceCommitmentData {
+            inner: second_inner,
+            tables: second_tables,
+        } = second_side.prover_data;
+        // Every shape, point and supplied run of both sides is checked before either moves.
+        self.check_open(&first_tables, first_side.protocol, first_side.points, first_side.known)?;
+        second.check_open(
+            second_tables,
+            second_side.protocol,
+            second_side.points,
+            second_side.known,
+        )?;
+        let (main_values, preprocessed_values, openings, expected) = self.close_pair(
+            second,
+            [first_side.protocol, second_side.protocol],
+            [first_side.points, second_side.points],
+            [&first_tables, second_tables],
+            first_side.known,
+            closing,
+            challenger,
+        )?;
+        drop(first_tables);
+        let [main_openings, preprocessed_openings] = openings;
+        let ((first_readings, first_opening), (second_readings, second_opening)) = self
+            .inner
+            .open_readings_pair(
+                &second.inner,
+                (first_inner, &main_openings),
+                (second_inner, &preprocessed_openings),
+                challenger,
+            )
+            .map_err(BooleanTraceCommitmentError::Boolean)?;
+        if first_readings != expected[0] || second_readings != expected[1] {
+            return Err(BooleanTraceCommitmentError::ColumnBatchValueMismatch { batch: 0 });
+        }
+        Ok((
+            BooleanTraceCommitmentProof {
+                values: main_values,
+                opening: first_opening,
+            },
+            BooleanTraceCommitmentProof {
+                values: preprocessed_values,
+                opening: second_opening,
+            },
+        ))
+    }
+
+    fn verify_pair_closed(
+        &self,
+        second: &Self,
+        first_side: PairCheck<'_, Self::Commitment, Self::Proof, EF>,
+        second_side: PairCheck<'_, Self::Commitment, Self::Proof, EF>,
+        closing: &dyn ClosingRelation<EF>,
+        challenger: &mut Challenger,
+    ) -> Result<(), Self::Error> {
+        // Every shape and point is checked before the transcript moves.
+        self.validate_opening(first_side.protocol, first_side.points)?;
+        second.validate_opening(second_side.protocol, second_side.points)?;
+        let (openings, readings) = self.check_closed_pair(
+            second,
+            [first_side.protocol, second_side.protocol],
+            [first_side.points, second_side.points],
+            [&first_side.proof.values, &second_side.proof.values],
+            closing,
+            challenger,
+        )?;
+        self.inner
+            .verify_readings_pair(
+                &second.inner,
+                ReadingsCheck {
+                    commitment: first_side.commitment,
+                    openings: &openings[0],
+                    readings: &readings[0],
+                    proof: &first_side.proof.opening,
+                },
+                ReadingsCheck {
+                    commitment: second_side.commitment,
+                    openings: &openings[1],
+                    readings: &readings[1],
+                    proof: &second_side.proof.opening,
+                },
+                challenger,
+            )
+            .map_err(BooleanTraceCommitmentError::Boolean)
     }
 
     fn prescribed_pair_security(

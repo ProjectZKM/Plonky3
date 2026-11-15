@@ -18,6 +18,7 @@ extern crate alloc;
 
 pub mod backend;
 mod bus;
+pub mod closing;
 pub mod config;
 pub mod contract;
 pub mod folder;

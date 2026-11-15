@@ -475,6 +475,187 @@ where
     }
 }
 
+const CLOSING_NAME: &[u8] = b"p3-boolean-trace-closing-sumcheck";
+const CLOSING_ROUND: &str = "closing_round";
+const CLOSING_CHALLENGE: &str = "closing_challenge";
+const MAIN_FOLDS: &str = "main_folds";
+const PREPROCESSED_FOLDS: &str = "preprocessed_folds";
+
+/// whir-gc experiment: public shape of the column sumcheck that closes a closed pair
+/// opening (see `boolean_trace::closing`).
+///
+/// It runs three degree-two sumchecks back to back over the widest table's column space,
+/// one per slot, each round sending two values and drawing one coordinate, and then binds
+/// each side's folds: one per column block of each table at each of the three points.
+#[derive(Clone, Debug)]
+pub(crate) struct ClosingSumcheckShape {
+    /// Coordinates of each of the three column points.
+    pub(crate) column_variables: usize,
+    /// Main-side folds over all three points.
+    pub(crate) main_folds: usize,
+    /// Preprocessed-side folds over all three points.
+    pub(crate) preprocessed_folds: usize,
+    /// Each table's main and preprocessed widths, bound as instance data.
+    pub(crate) widths: Vec<(usize, usize)>,
+}
+
+impl ClosingSumcheckShape {
+    /// Rounds the three sumchecks run in all.
+    pub(crate) const fn rounds(&self) -> usize {
+        3 * self.column_variables
+    }
+
+    fn pattern<F, EF>(&self) -> InteractionPattern
+    where
+        F: TranscriptField,
+        EF: Field + AlgebraIdentity<F>,
+    {
+        let mut steps = Vec::with_capacity(2 + 2 * self.rounds());
+        for _ in 0..self.rounds() {
+            steps.push(Interaction::algebra::<F, EF>(
+                Hierarchy::Atomic,
+                Kind::Message,
+                CLOSING_ROUND,
+                Length::Fixed(2),
+            ));
+            steps.push(Interaction::algebra::<F, EF>(
+                Hierarchy::Atomic,
+                Kind::Challenge,
+                CLOSING_CHALLENGE,
+                Length::Scalar,
+            ));
+        }
+        steps.push(Interaction::algebra::<F, EF>(
+            Hierarchy::Atomic,
+            Kind::Message,
+            MAIN_FOLDS,
+            Length::Fixed(self.main_folds),
+        ));
+        steps.push(Interaction::algebra::<F, EF>(
+            Hierarchy::Atomic,
+            Kind::Message,
+            PREPROCESSED_FOLDS,
+            Length::Fixed(self.preprocessed_folds),
+        ));
+        InteractionPattern::new(steps).expect("flat closing sumcheck transcript is valid")
+    }
+
+    fn separator<F, EF>(&self) -> DomainSeparator<Alphabet<F>>
+    where
+        F: TranscriptField,
+        EF: Field + AlgebraIdentity<F>,
+    {
+        let mut separator = DomainSeparator::new(VERSION, CLOSING_NAME, self.pattern::<F, EF>());
+        separator
+            .instance(&(self.column_variables as u64).to_be_bytes())
+            .instance(&(self.widths.len() as u64).to_be_bytes());
+        for &(main, preprocessed) in &self.widths {
+            separator
+                .instance(&(main as u64).to_be_bytes())
+                .instance(&(preprocessed as u64).to_be_bytes());
+        }
+        separator
+    }
+}
+
+/// Prover side of [`ClosingSumcheckShape`].
+pub(crate) struct ClosingSumcheckProverTranscript<'a, F: TranscriptField, EF, C> {
+    state: ProverState<&'a mut C, Alphabet<F>>,
+    _challenge: PhantomData<EF>,
+}
+
+impl<'a, F, EF, C> ClosingSumcheckProverTranscript<'a, F, EF, C>
+where
+    F: Field + TranscriptField + AlgebraIdentity<F>,
+    EF: ExtensionField<F>,
+    C: CanObserve<F> + CanSample<F> + CanSampleUniformBits<F> + GrindingChallenger<Witness = F>,
+{
+    pub(crate) fn new(challenger: &'a mut C, shape: &ClosingSumcheckShape) -> Self {
+        let separator = shape.separator::<F, EF>();
+        Self {
+            state: ProverState::new(challenger, &separator),
+            _challenge: PhantomData,
+        }
+    }
+
+    pub(crate) fn round(&mut self, coefficients: [EF; 2]) -> EF {
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(CLOSING_ROUND, &coefficients);
+        self.state
+            .challenge_extension::<F, EF, FieldToFieldCodec<F>>(CLOSING_CHALLENGE)
+            .into_inner()
+    }
+
+    pub(crate) fn folds(&mut self, main: &[EF], preprocessed: &[EF]) {
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(MAIN_FOLDS, main);
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(PREPROCESSED_FOLDS, preprocessed);
+    }
+
+    pub(crate) fn finish(self) {
+        assert!(
+            self.state.finalize().is_empty(),
+            "closing sumcheck transcript carries no wire values",
+        );
+    }
+}
+
+/// Verifier side of [`ClosingSumcheckShape`].
+pub(crate) struct ClosingSumcheckVerifierTranscript<'a, F: TranscriptField, EF, C> {
+    state: VerifierState<'static, &'a mut C, Alphabet<F>>,
+    _challenge: PhantomData<EF>,
+}
+
+impl<'a, F, EF, C> ClosingSumcheckVerifierTranscript<'a, F, EF, C>
+where
+    F: Field + TranscriptField + AlgebraIdentity<F>,
+    EF: ExtensionField<F>,
+    C: CanObserve<F> + CanSample<F> + CanSampleUniformBits<F> + GrindingChallenger<Witness = F>,
+{
+    pub(crate) fn new(challenger: &'a mut C, shape: &ClosingSumcheckShape) -> Self {
+        let separator = shape.separator::<F, EF>();
+        Self {
+            state: VerifierState::new(challenger, &separator, &[]),
+            _challenge: PhantomData,
+        }
+    }
+
+    pub(crate) fn round(
+        &mut self,
+        coefficients: [EF; 2],
+    ) -> Result<EF, p3_challenger::fs::TranscriptError> {
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(CLOSING_ROUND, &coefficients)?;
+        Ok(self
+            .state
+            .challenge_extension::<F, EF, FieldToFieldCodec<F>>(CLOSING_CHALLENGE)
+            .into_inner())
+    }
+
+    pub(crate) fn folds(
+        &mut self,
+        main: &[EF],
+        preprocessed: &[EF],
+    ) -> Result<(), p3_challenger::fs::TranscriptError> {
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(MAIN_FOLDS, main)?;
+        self.state
+            .observe_extensions::<F, EF, FieldToFieldCodec<F>>(PREPROCESSED_FOLDS, preprocessed)?;
+        Ok(())
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.state.abort();
+    }
+
+    pub(crate) fn finish(self) {
+        self.state
+            .finalize()
+            .expect("closing sumcheck transcript is complete");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::format;

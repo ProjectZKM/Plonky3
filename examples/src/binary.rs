@@ -762,6 +762,7 @@ pub trait BinaryAir:
     + for<'a> Air<
         InteractionMultilinearFolder<'a, F, PackedRepr<F, Ghash128>, PackedRepr<F, Ghash128>>,
     >
+    + p3_multi_stark::closing::ClosingAir<F, F>
 {
 }
 
@@ -784,6 +785,7 @@ impl<A> BinaryAir for A where
         + for<'a> Air<
             InteractionMultilinearFolder<'a, F, PackedRepr<F, Ghash128>, PackedRepr<F, Ghash128>>,
         >
+    + p3_multi_stark::closing::ClosingAir<F, F>
 {
 }
 

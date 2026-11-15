@@ -171,6 +171,7 @@ pub trait CubicAir:
     + ProverAir<Val, Challenge>
     + for<'a> Air<MultilinearFolder<'a, Val, Challenge, Challenge>>
     + for<'a> Air<InteractionMultilinearFolder<'a, Val, Challenge, Challenge>>
+    + p3_multi_stark::closing::ClosingAir<Val, Challenge>
 {
 }
 
@@ -194,6 +195,7 @@ impl<A> CubicAir for A where
         + ProverAir<Val, Challenge>
         + for<'a> Air<MultilinearFolder<'a, Val, Challenge, Challenge>>
         + for<'a> Air<InteractionMultilinearFolder<'a, Val, Challenge, Challenge>>
+    + p3_multi_stark::closing::ClosingAir<Val, Challenge>
 {
 }
 
@@ -229,6 +231,7 @@ pub trait CubicAir:
     + for<'a> Air<
         InteractionMultilinearFolder<'a, Val, PackedExt<Val, Challenge>, PackedExt<Val, Challenge>>,
     >
+    + p3_multi_stark::closing::ClosingAir<Val, Challenge>
 {
 }
 
@@ -263,6 +266,7 @@ impl<A> CubicAir for A where
                 PackedExt<Val, Challenge>,
             >,
         >
+    + p3_multi_stark::closing::ClosingAir<Val, Challenge>
 {
 }
 

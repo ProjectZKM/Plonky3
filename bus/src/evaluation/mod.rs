@@ -275,6 +275,73 @@ where
     }
 }
 
+impl<F, EF> BusFactorPlan<'_, F, EF>
+where
+    F: Field,
+    EF: Field + Algebra<F>,
+{
+    /// whir-gc experiment: the leaf factor less one over any ring holding the values, the
+    /// tuple weights and shift lifted into it by `lift`.
+    ///
+    /// The terminal composition reads exactly this, so a closing check that splits values
+    /// by degree evaluates it over the split values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the supplied evaluation view omits a referenced value.
+    pub fn factor_minus_one_over<V>(
+        &self,
+        scratch: &mut Vec<V>,
+        values: BusEvaluation<'_, F, V>,
+        lift: impl Fn(EF) -> V,
+    ) -> Result<V, BusEvaluationError>
+    where
+        V: Algebra<F> + Copy,
+    {
+        scratch.clear();
+        scratch.reserve(self.nodes.len());
+        for node in &self.nodes {
+            let value = match *node {
+                BusNode::Main(column) => *values
+                    .main
+                    .get(column)
+                    .ok_or(BusEvaluationError::MainColumn { column })?,
+                BusNode::Preprocessed(column) => *values
+                    .preprocessed
+                    .get(column)
+                    .ok_or(BusEvaluationError::PreprocessedColumn { column })?,
+                BusNode::Public(index) => values
+                    .public
+                    .get(index)
+                    .copied()
+                    .map(V::from)
+                    .ok_or(BusEvaluationError::PublicValue { index })?,
+                BusNode::Periodic(column) => *values
+                    .periodic
+                    .get(column)
+                    .ok_or(BusEvaluationError::PeriodicColumn { column })?,
+                BusNode::IsFirstRow => values.is_first_row,
+                BusNode::IsLastRow => values.is_last_row,
+                BusNode::IsTransition => values.is_transition,
+                BusNode::Constant(value) => V::from(value),
+                BusNode::Add(x, y) => scratch[x] + scratch[y],
+                BusNode::Sub(x, y) => scratch[x] - scratch[y],
+                BusNode::Neg(x) => -scratch[x],
+                BusNode::Mul(x, y) => scratch[x] * scratch[y],
+            };
+            scratch.push(value);
+        }
+        let mut fingerprint = V::ZERO;
+        for (&node, &weight) in self.payload.iter().zip(self.payload_weights) {
+            fingerprint += lift(weight) * scratch[node];
+        }
+        let factor_minus_one = lift(self.shifted_offset - EF::ONE) - fingerprint;
+        Ok(self
+            .activation
+            .map_or(factor_minus_one, |node| factor_minus_one * scratch[node]))
+    }
+}
+
 impl BusPlan {
     /// Settle one declaration's slot placement against the sampled tuple weights.
     ///

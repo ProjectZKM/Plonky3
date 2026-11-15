@@ -41,6 +41,10 @@ where
     /// The zerocheck reduction or its closing constraint check failed.
     #[error("zerocheck: {0}")]
     Zerocheck(ZerocheckError),
+    /// whir-gc experiment: the column-sumcheck closing is on for a batch it cannot close:
+    /// one without a pair opening, or with a lookup or an indexed read.
+    #[error("the column-sumcheck closing cannot close this batch")]
+    UnsupportedClosing,
     /// The lookup reduction is absent, unexpected, or failed its own checks.
     #[error("lookup: {0}")]
     Lookup(LookupError),
@@ -484,6 +488,78 @@ where
             return Err(VerificationError::UnexpectedIndexedReduction);
         }
     };
+
+    // whir-gc experiment: a closed pair opening proves the closing check itself, by a
+    // column sumcheck over the committed columns, and sends no opened value.
+    if crate::closing::closing_sumcheck() {
+        // Only the pair route, with no lookup and no indexed read, closes this way.
+        if !transcript.pairs() || indexed.is_some() || lookup.is_some() {
+            transcript.abort();
+            return Err(VerificationError::UnsupportedClosing);
+        }
+        let points = RunPoints::new(&reduction.point, None);
+        let main_schedule = instances.main_schedule(indexed_plan.as_ref(), |role, rows| {
+            trace_suffix(points.at(role), rows)
+        });
+        let preprocessed_schedule = instances
+            .preprocessed_schedule(indexed_plan.as_ref(), |role, rows| {
+                trace_suffix(points.at(role), rows)
+            });
+        let main_against = main_schedule.against();
+        let preprocessed_against = preprocessed_schedule.against();
+        let fingerprint_weights = bus_family
+            .map(|family| family.output.challenges.fingerprint_weights())
+            .unwrap_or_default();
+        let challenges = crate::closing::ClosingChallenges {
+            alpha: reduction.alpha,
+            beta: reduction.beta,
+            lambda: reduction.lambda,
+            tau: reduction.tau.clone(),
+            point: reduction.point.clone(),
+        };
+        let relation = match crate::closing::AirClosing::new(
+            &airs,
+            &log_heights,
+            &challenges,
+            &public_values,
+            bus_family,
+            &fingerprint_weights,
+            Some(reduction.final_sum),
+        ) {
+            Ok(relation) => relation,
+            Err(error) => {
+                transcript.abort();
+                return Err(VerificationError::Zerocheck(error));
+            }
+        };
+        let commitment = preprocessed_commitment
+            .expect("a described preprocessed commitment is checked before the replay");
+        let opening = proof
+            .preprocessed_opening
+            .as_ref()
+            .expect("missing preprocessed opening rejected before verification");
+        let opened = transcript.pair_opening(|challenger| {
+            config.pcs().verify_pair_closed(
+                config.preprocessed_pcs(),
+                PairCheck {
+                    commitment: &proof.commitment,
+                    proof: &proof.opening,
+                    protocol: main_schedule.protocol(),
+                    points: &main_against,
+                },
+                PairCheck {
+                    commitment,
+                    proof: opening,
+                    protocol: preprocessed_schedule.protocol(),
+                    points: &preprocessed_against,
+                },
+                &relation,
+                challenger,
+            )
+        });
+        transcript.finish();
+        return opened.map_err(VerificationError::Opening);
+    }
 
     // Invariant: a return between here and the driver's `finish` must release the driver first.
     //

@@ -32,6 +32,7 @@ pub trait VerifierAir<F, EF>:
     + Air<BusSymbolicBuilder<F, EF>>
     + for<'a> Air<MultilinearFolder<'a, F, EF, EF>>
     + for<'a> Air<InteractionMultilinearFolder<'a, F, EF, EF>>
+    + crate::closing::ClosingAir<F, EF>
 where
     F: Field,
     EF: ExtensionField<F>,
@@ -46,7 +47,8 @@ where
         + Air<InteractionSymbolicBuilder<F, EF>>
         + Air<BusSymbolicBuilder<F, EF>>
         + for<'a> Air<MultilinearFolder<'a, F, EF, EF>>
-        + for<'a> Air<InteractionMultilinearFolder<'a, F, EF, EF>>,
+        + for<'a> Air<InteractionMultilinearFolder<'a, F, EF, EF>>
+        + crate::closing::ClosingAir<F, EF>,
 {
 }
 

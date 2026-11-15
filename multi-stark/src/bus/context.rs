@@ -478,6 +478,77 @@ where
         Ok(terminal)
     }
 
+    /// whir-gc experiment: the terminal composition's shares, for a closing check that
+    /// evaluates them over values split by degree.
+    ///
+    /// Each share comes with its AIR, the weight its `factor - 1` carries in the composition,
+    /// its compiled factor, and the boundary selectors of its row point; `weights` are the
+    /// output's fingerprint weights, which the compiled factors borrow.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn closing_shares<'s>(
+        &self,
+        output: &p3_bus::BusReductionOutput<EF>,
+        weights: &'s [EF],
+        direction_challenge: EF,
+        point: &Point<EF>,
+    ) -> Result<
+        Vec<(usize, EF, BusFactorPlan<'s, F, EF>, crate::selectors::BoundaryEvals<EF>)>,
+        BusBindingError,
+    > {
+        if point.num_variables() < self.max_num_variables() {
+            return Err(BusBindingError::CompositionPointDimension {
+                expected: self.max_num_variables(),
+                actual: point.num_variables(),
+            });
+        }
+        let expected_product_dimension = self.plan.product_shape().log_height();
+        if output.product.point.len() != expected_product_dimension {
+            return Err(BusBindingError::ProductPointDimension {
+                expected: expected_product_dimension,
+                actual: output.product.point.len(),
+            });
+        }
+        let mut shares = Vec::new();
+        for direction in [BusDirection::Push, BusDirection::Pull] {
+            let direction_weight = match direction {
+                BusDirection::Push => EF::ONE,
+                BusDirection::Pull => direction_challenge,
+            };
+            for share in self.plan.terminal_shares(direction) {
+                let row_point = &point.as_slice()[point.num_variables() - share.row_variables..];
+                let block_weight = share.prefix_weight(&output.product.point).ok_or(
+                    BusBindingError::ProductPointDimension {
+                        expected: expected_product_dimension,
+                        actual: output.product.point.len(),
+                    },
+                )?;
+                let row_suffix = &output.product.point[share.prefix_variables..];
+                if row_suffix.len() != row_point.len() {
+                    return Err(BusBindingError::ProductPointDimension {
+                        expected: share.prefix_variables + share.row_variables,
+                        actual: output.product.point.len(),
+                    });
+                }
+                let unused = &point.as_slice()[..point.num_variables() - share.row_variables];
+                let fixed_all_one_selector = unused.iter().copied().product::<EF>();
+                let row_weight = fixed_all_one_selector * Point::eval_eq(row_suffix, row_point);
+                let factor = self.plan.compile_factor(
+                    share.bus,
+                    self.interaction(share.owner),
+                    weights,
+                    output.challenges.offset,
+                )?;
+                shares.push((
+                    share.owner.air,
+                    direction_weight * block_weight * row_weight,
+                    factor,
+                    crate::selectors::BoundaryEvals::at(row_point),
+                ));
+            }
+        }
+        Ok(shares)
+    }
+
     /// Materialize both direction-specific product prefixes from committed tables.
     ///
     /// `periodic` holds the tables [`Self::periodic_tables`] returns.

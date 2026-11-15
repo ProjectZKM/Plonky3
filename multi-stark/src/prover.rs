@@ -9,7 +9,7 @@ use p3_commit::MultilinearPcs;
 use p3_field::PrimeCharacteristicRing;
 use p3_field::{ExtensionField, Field};
 use p3_lookup::InteractionSymbolicBuilder;
-use p3_sumcheck::{OpeningEvals, PairOpening, PrescribedPointPcs};
+use p3_sumcheck::{ClosingRelation, OpeningEvals, PairOpening, PrescribedPointPcs};
 
 use crate::ProverInstances;
 use p3_sumcheck::layout::Table;
@@ -67,6 +67,13 @@ pub enum ProvingError<E> {
     /// The bus composition statement could not be derived.
     #[error("binary-bus commitment binding failed: {0}")]
     BusBinding(#[from] BusBindingError),
+    /// whir-gc experiment: the column-sumcheck closing is on for a batch it cannot close:
+    /// one without a pair opening, or with a lookup or an indexed read.
+    #[error("the column-sumcheck closing cannot close this batch")]
+    UnsupportedClosing,
+    /// whir-gc experiment: the column-sumcheck closing could not be built.
+    #[error("the column-sumcheck closing failed: {0}")]
+    Closing(crate::zerocheck::ZerocheckError),
 }
 
 /// Prove only when the complete statement's security assessment meets `target_bits`.
@@ -221,7 +228,8 @@ where
     ProverData<C>: Clone,
     A: BaseAir<C::Val>
         + Air<InteractionSymbolicBuilder<C::Val, C::Challenge>>
-        + Air<p3_bus::BusSymbolicBuilder<C::Val, C::Challenge>>,
+        + Air<p3_bus::BusSymbolicBuilder<C::Val, C::Challenge>>
+        + crate::closing::ClosingAir<C::Val, C::Challenge>,
     B: ZerocheckBackend<C::Val, C::Challenge, A> + Default,
 {
     prove_on::<C, A, B, HostProver>(
@@ -260,7 +268,8 @@ where
     ProverData<C>: Clone,
     A: BaseAir<C::Val>
         + Air<InteractionSymbolicBuilder<C::Val, C::Challenge>>
-        + Air<p3_bus::BusSymbolicBuilder<C::Val, C::Challenge>>,
+        + Air<p3_bus::BusSymbolicBuilder<C::Val, C::Challenge>>
+        + crate::closing::ClosingAir<C::Val, C::Challenge>,
     Z: ZerocheckBackend<C::Val, C::Challenge, A>,
     P: ProverBackend<C, A> + ?Sized,
 {
@@ -318,6 +327,37 @@ pub trait ProverBackend<C: MultiStarkConfig, A> {
         config
             .pcs()
             .open_pair_at(config.preprocessed_pcs(), first, second, challenger)
+    }
+
+    /// whir-gc experiment: [`open_pair`](Self::open_pair) closing the shared sumcheck by a
+    /// column sumcheck, as [`crate::closing`] describes.
+    ///
+    /// # Errors
+    /// Returns the commitment scheme's error.
+    #[allow(clippy::type_complexity)]
+    fn open_pair_closed(
+        &self,
+        config: &C,
+        first: PairOpening<'_, ProverData<C>, C::Challenge>,
+        second: PairOpening<'_, &ProverData<C>, C::Challenge>,
+        closing: &dyn ClosingRelation<C::Challenge>,
+        challenger: &mut C::Challenger,
+    ) -> Result<(PcsProof<C>, PcsProof<C>), PcsProverError<C>>
+    where
+        C::Pcs: PrescribedPointPcs<C::Challenge, C::Challenger>,
+        C::Challenger: FieldChallenger<C::Val>
+            + GrindingChallenger
+            + CanSampleUniformBits<C::Val>
+            + CanObserve<Commitment<C>>,
+        ProverData<C>: Clone,
+    {
+        config.pcs().open_pair_closed(
+            config.preprocessed_pcs(),
+            first,
+            second,
+            closing,
+            challenger,
+        )
     }
 
     /// The device that holds the committed tables and runs the bus family inside the
@@ -383,7 +423,8 @@ where
     ProverData<C>: Clone,
     A: BaseAir<C::Val>
         + Air<InteractionSymbolicBuilder<C::Val, C::Challenge>>
-        + Air<p3_bus::BusSymbolicBuilder<C::Val, C::Challenge>>,
+        + Air<p3_bus::BusSymbolicBuilder<C::Val, C::Challenge>>
+        + crate::closing::ClosingAir<C::Val, C::Challenge>,
     Z: ZerocheckBackend<C::Val, C::Challenge, A>,
     P: ProverBackend<C, A> + ?Sized,
 {
@@ -779,6 +820,38 @@ where
     }
     let main_against = main_schedule.against();
 
+    // whir-gc experiment: the closing check proved by a column sumcheck inside the pair
+    // opening, which then sends no opened value.
+    let closing = crate::closing::closing_sumcheck();
+    if closing && (!transcript.pairs() || indexed_round.is_some() || lookup_proof.is_some()) {
+        transcript.abort();
+        return Err(ProvingError::UnsupportedClosing);
+    }
+    let fingerprint_weights = bus_family
+        .filter(|_| closing)
+        .map(|family| family.output.challenges.fingerprint_weights())
+        .unwrap_or_default();
+    let log_heights = instances.num_variables();
+    let relation = if closing {
+        match crate::closing::AirClosing::new(
+            &airs,
+            &log_heights,
+            &zerocheck_proof.closing,
+            &public_values,
+            bus_family,
+            &fingerprint_weights,
+            None,
+        ) {
+            Ok(relation) => Some(relation),
+            Err(error) => {
+                transcript.abort();
+                return Err(ProvingError::Closing(error));
+            }
+        }
+    } else {
+        None
+    };
+
     // 8 and 9 as one step: both traces under one opening, the main side first.
     let (opening, preprocessed_opening) = if transcript.pairs() {
         let preprocessed = proving_key
@@ -791,22 +864,24 @@ where
         let against = schedule.against();
         let none = alloc::vec![None; schedule.protocol().num_openings()];
         let opened = transcript.pair_opening(|challenger| {
-            prover.open_pair(
-                config,
-                PairOpening {
-                    prover_data,
-                    protocol: main_schedule.protocol(),
-                    points: &main_against,
-                    known: &known,
-                },
-                PairOpening {
-                    prover_data: &preprocessed.prover_data,
-                    protocol: schedule.protocol(),
-                    points: &against,
-                    known: &none,
-                },
-                challenger,
-            )
+            let first = PairOpening {
+                prover_data,
+                protocol: main_schedule.protocol(),
+                points: &main_against,
+                known: &known,
+            };
+            let second = PairOpening {
+                prover_data: &preprocessed.prover_data,
+                protocol: schedule.protocol(),
+                points: &against,
+                known: &none,
+            };
+            match &relation {
+                Some(relation) => {
+                    prover.open_pair_closed(config, first, second, relation, challenger)
+                }
+                None => prover.open_pair(config, first, second, challenger),
+            }
         });
         let (opening, preprocessed_opening) =
             opened

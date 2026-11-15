@@ -368,6 +368,60 @@ where
         Ok((first, second))
     }
 
+    /// whir-gc experiment: a pair opening that sends none of the opened values.
+    ///
+    /// `closing` is the caller's closing check as a polynomial of the values, table by
+    /// table; the scheme proves the check holds of the committed columns at the opening
+    /// points instead of returning the values.  See [`ClosingRelation`].
+    ///
+    /// The default refuses: a scheme opts in by overriding both closed methods.
+    ///
+    /// # Errors
+    ///
+    /// As [`open_pair_at`](PrescribedPointPcs::open_pair_at).
+    ///
+    /// # Panics
+    ///
+    /// The default panics.
+    #[allow(clippy::type_complexity)]
+    fn open_pair_closed(
+        &self,
+        second: &Self,
+        first_side: PairOpening<'_, Self::ProverData, Challenge>,
+        second_side: PairOpening<'_, &Self::ProverData, Challenge>,
+        closing: &dyn ClosingRelation<Challenge>,
+        challenger: &mut Challenger,
+    ) -> Result<(Self::Proof, Self::Proof), Self::ProverError>
+    where
+        Self::ProverData: Clone,
+    {
+        let _ = (second, first_side, second_side, closing, challenger);
+        unimplemented!("this commitment scheme has no closed pair opening")
+    }
+
+    /// whir-gc experiment: verify what
+    /// [`open_pair_closed`](PrescribedPointPcs::open_pair_closed) produced.
+    ///
+    /// # Errors
+    ///
+    /// A proof of the wrong shape, a column sumcheck that does not close on the caller's
+    /// target, or a failed opening.
+    ///
+    /// # Panics
+    ///
+    /// The default panics.
+    fn verify_pair_closed(
+        &self,
+        second: &Self,
+        first_side: PairCheck<'_, Self::Commitment, Self::Proof, Challenge>,
+        second_side: PairCheck<'_, Self::Commitment, Self::Proof, Challenge>,
+        closing: &dyn ClosingRelation<Challenge>,
+        challenger: &mut Challenger,
+    ) -> Result<(), Self::Error> {
+        let _ = (second, first_side, second_side, closing, challenger);
+        unimplemented!("this commitment scheme has no closed pair opening")
+    }
+
     /// Soundness evidence for one pair opening, one report per side.
     ///
     /// The default prices each side as its own opening.
@@ -382,6 +436,31 @@ where
             second.prescribed_security(second_protocol)?,
         ))
     }
+}
+
+/// whir-gc experiment: the caller's closing check, as a closed pair opening proves it.
+///
+/// The check is a polynomial of degree at most three in the opened values, a sum of one
+/// polynomial per table, each in that table's main and preprocessed values at its point:
+///
+/// ```text
+///     target  =  sum_t Phi_t(main_t, preprocessed_t)
+/// ```
+///
+/// Each `Phi_t` is split by degree into forms over three slots, each slot one copy of the
+/// table's values: `c + L(s0) + Q(s0, s1) + T(s0, s1, s2)`, each form multilinear, one factor
+/// per slot, and agreeing with `Phi_t` when every slot holds the values.
+pub trait ClosingRelation<EF>: Sync {
+    /// Per table, in the caller's order: main width, then preprocessed width.
+    fn widths(&self) -> Vec<(usize, usize)>;
+
+    /// The value the sum takes at the committed values: the verifier's, or `None` for a
+    /// prover, which reads it off the values.
+    fn target(&self) -> Option<EF>;
+
+    /// Table `table`'s forms with the three slots holding `slots`, each a main then a
+    /// preprocessed vector of the table's widths: `[c, L(s0), Q(s0, s1), T(s0, s1, s2)]`.
+    fn evaluate(&self, table: usize, slots: [(&[EF], &[EF]); 3]) -> [EF; 4];
 }
 
 /// One side of a pair opening, as the prover holds it.
