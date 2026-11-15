@@ -1079,7 +1079,7 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitch<F, EF>
     }
 
     /// Check that something names the variables this reduction runs over.
-    fn check_width(&self, actual: usize) -> Result<(), BitRingSwitchError> {
+    pub(super) fn check_width(&self, actual: usize) -> Result<(), BitRingSwitchError> {
         if actual == self.num_variables() {
             Ok(())
         } else {
@@ -1550,6 +1550,12 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitchBatch<'
         let mut equality = self.reduction.equality_element(r_prime);
         equality.scale_columns(scale);
         Ok(self.batch_rows(&equality))
+    }
+
+    /// The batching rows of a closing element: the merged batch reads the weighted sum of all
+    /// its claims' equality elements once (see [`Self::closing_weight_scaled`]).
+    pub(super) fn closing_rows(&self, element: &BitTensor<EF, EF>) -> EF {
+        self.batch_rows(element)
     }
 
     /// The rows of an element, batched against the batching challenge.

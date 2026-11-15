@@ -84,6 +84,7 @@ use p3_challenger::fs::TranscriptField;
 use p3_challenger::{FieldChallenger, GrindingChallenger};
 use p3_field::{ExtensionField, Field};
 use p3_multilinear_util::point::Point;
+use p3_maybe_rayon::prelude::*;
 use p3_multilinear_util::poly::Poly;
 use serde::{Deserialize, Serialize};
 
@@ -237,7 +238,7 @@ impl<F: TowerLevel, EF: BitCoordinates + ExtensionField<F>> BitRingSwitchClaims<
     /// multilinear of `W` ties them to the packing, `r''` drawn after `T` is
     /// bound.  A wrong reading survives only if `sum_i mu^i err_i = 0`, at most
     /// `(k - 1) / |EF|`, the same term `lambda` adds to an unmerged batch.
-    fn merged(&self) -> bool {
+    pub fn merged(&self) -> bool {
         let absorbed = |reduction: &BitRingSwitch<F, EF>| {
             let point = reduction.point().as_slice();
             point[point.len() - BitRingSwitch::<F, EF>::ABSORBED..].to_vec()
@@ -1106,18 +1107,13 @@ where
             return Err(BitRingSwitchProofError::ClaimMismatch);
         }
         let batching_point = transcript.merged_rows(claim.tensor.rows());
-        let batches = self
-            .reductions
-            .iter()
-            .map(|reduction| {
-                reduction
-                    .batch_drawn(&batching_point, None)
-                    .expect("a merged batch sends no successor elements")
-            })
-            .collect::<Vec<_>>();
+        // The batching rows depend on the batching point alone, so one batch reads every claim.
+        let batch = self.reductions[0]
+            .batch_drawn(&batching_point, None)
+            .expect("a merged batch sends no successor elements");
 
         // The starting sum is derived from the element's rows, never taken from the prover.
-        let mut sum = batches[0].initial_sum(&claim.tensor, None);
+        let mut sum = batch.initial_sum(&claim.tensor, None);
         let replay = transcript.batched_sumcheck(|challenger| {
             proof
                 .sumcheck
@@ -1134,18 +1130,93 @@ where
         transcript.finish();
 
         // The rounds close on the weight multilinear of W at r', times the surviving value.
-        let mut closing = EF::ZERO;
-        for ((reduction, batch), &weight) in self.reductions.iter().zip(&batches).zip(&weights) {
-            let own = reduction.fixed_prefix().0 - prefix;
-            let (selected, rest) = r_prime.as_slice().split_at(own);
-            let gate = boolean_equality(&reduction.high()[prefix..prefix + own], selected);
-            let inside = batch.closing_weight_scaled(&Point::new(rest.to_vec()), weight)?;
-            closing += gate * inside;
-        }
+        let closing = self.merged_closing(&batch, &r_prime, prefix, &weights)?;
         if sum != closing * proof.final_eval {
             return Err(BitRingSwitchProofError::FinalCheck);
         }
         Ok((self.restore_prefix(prefix, &r_prime), proof.final_eval))
+    }
+
+    /// The merged batch's closing weight at `r_prime`:
+    ///
+    /// ```text
+    ///     sum_c  gate_c * rows(weight_c * E_c),     E_c = prod_{k >= fixed_c} eq(high_c[k], r'[k - prefix])
+    /// ```
+    ///
+    /// with `gate_c` the claim's Boolean slot coordinates against `r'`, and `E_c` lifted into the
+    /// tensor algebra one factor per coordinate, as [`BitRingSwitchBatch::closing_weight_scaled`]
+    /// forms it for one claim.
+    ///
+    /// # Algorithm
+    ///
+    /// Every claim pairs coordinate `k` with the same `r'[k - prefix]`, and the factors commute,
+    /// so claims that agree on a tail of their coordinates agree on its factors. The claims'
+    /// tails, read from the last coordinate down, form a trie; each node holds one factor. The
+    /// sum is folded up the trie, Horner fashion:
+    ///
+    /// ```text
+    ///     S(node) = sum_{c ends at node} weight_c ⊗ gate_c  +  sum_{child} factor(child) * S(child)
+    /// ```
+    ///
+    /// Each distinct factor is applied once, and the rows are batched once, at the root.
+    /// Claims at one point share most of their coordinates, so the trie is far smaller than the
+    /// claims' factor counts summed.
+    ///
+    /// Two coordinates share a node only when their values are equal; a recording verifier
+    /// records each comparison as the condition it enforces.
+    fn merged_closing(
+        &self,
+        batch: &BitRingSwitchBatch<'_, F, EF>,
+        r_prime: &Point<EF>,
+        prefix: usize,
+        weights: &[EF],
+    ) -> Result<EF, BitRingSwitchProofError> {
+        let width = self.num_variables();
+        let r = r_prime.as_slice();
+        // Each node: its parent, its coordinate, and that coordinate's value; node 0 is the
+        // empty tail. Children are created after their parents.
+        let mut nodes: Vec<(usize, usize, EF)> = alloc::vec![(0, width, EF::ZERO)];
+        let mut children: Vec<Vec<usize>> = alloc::vec![Vec::new()];
+        let mut sums: Vec<Option<BitTensor<EF, EF>>> = alloc::vec![None];
+        for (reduction, &weight) in self.reductions.iter().zip(weights) {
+            let fixed = reduction.fixed_prefix().0;
+            reduction.check_width(prefix + r.len())?;
+            let high = reduction.high();
+            let gate = boolean_equality(&high[prefix..fixed], &r[..fixed - prefix]);
+            let mut node = 0;
+            for k in (fixed..width).rev() {
+                let value = high[k];
+                let found = children[node].iter().copied().find(|&child| nodes[child].2 == value);
+                node = found.unwrap_or_else(|| {
+                    let child = nodes.len();
+                    nodes.push((node, k, value));
+                    children.push(Vec::new());
+                    sums.push(None);
+                    children[node].push(child);
+                    child
+                });
+            }
+            // weight ⊗ gate: the first leg's basis carries the weight, the second leg the gate.
+            let mut own = BitTensor::<EF, EF>::one();
+            own.scale_columns(weight);
+            own.scale_rows(gate);
+            match &mut sums[node] {
+                Some(total) => *total += own,
+                slot => *slot = Some(own),
+            }
+        }
+        for node in (1..nodes.len()).rev() {
+            let (parent, k, value) = nodes[node];
+            let Some(mut sum) = sums[node].take() else {
+                continue;
+            };
+            sum.mul_equality_factor(value, r[k - prefix]);
+            match &mut sums[parent] {
+                Some(total) => *total += sum,
+                slot => *slot = Some(sum),
+            }
+        }
+        Ok(sums[0].take().map_or(EF::ZERO, |total| batch.closing_rows(&total)))
     }
 
     /// What every claim binds, borrowed from the claims and their elements.
@@ -1869,12 +1940,12 @@ mod tests {
         let distinct = [point.clone(), Point::rand(&mut rng, 9)];
         let repeated = [point.clone(), point];
 
-        // One point used twice merges into one element, which a row error moves alone
-        // (`a_merged_element_with_a_forged_row_is_rejected`).
-        assert!(batch(&repeated.clone().map(|point| Claim { point, successor: None })).merged());
+        // Merging asked for, one point used twice merges into one element, which a row error
+        // moves alone (`a_merged_element_with_a_forged_row_is_rejected`).
+        assert!(merging(&repeated.clone().map(|point| Claim { point, successor: None })).merged());
 
-        // Two plain claims at distinct points.
-        for points in [distinct] {
+        // Two plain claims at distinct points, then at one point used twice.
+        for points in [distinct, repeated] {
             let claims = points.map(|point| Claim {
                 point,
                 successor: None,
